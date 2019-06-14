@@ -4688,8 +4688,11 @@ class DataFrameLocal(DataFrame):
         df.units.update(self.units)
         df.variables.update(self.variables)
         df._categories.update(self._categories)
-        column_names = column_names or self.get_column_names(hidden=True)
         all_column_names = self.get_column_names(hidden=True)
+        column_names = column_names or all_column_names
+        for column_name in column_names:
+            if column_name not in all_column_names:
+                raise KeyError('Column %r does not exist' % column_name)
 
         # put in the selections (thus filters) in place
         # so drop moves instead of really dropping it
