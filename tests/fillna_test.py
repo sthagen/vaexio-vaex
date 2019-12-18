@@ -50,3 +50,78 @@ def test_fillna_virtual():
     df['r'] = df.r.fillna(value=0xdeadbeef)
     assert df.r.tolist()[:4] == [0.0, 0.6931471805599453, 1.0986122886681098, 1.6094379124341003]
     assert df.r.tolist()[4:7] == [0xdeadbeef, 0xdeadbeef, 0xdeadbeef]
+
+def test_fillna_missing():
+    # Create test data
+    x = np.array(['A', 'B', -1, 0, 2, '', '', None, None, None, np.nan, np.nan, np.nan, np.nan])
+    df = vaex.from_arrays(x=x)
+    # Assert the correctness of the fillna
+    assert df.x.fillna(value=-5).tolist() == ['A', 'B', -1, 0, 2, '', '', -5, -5, -5, -5, -5, -5, -5]
+
+# equivalent of isna_test
+def test_fillmissing():
+    s = vaex.string_column(["aap", None, "noot", "mies"])
+    o = ["aap", None, "noot", np.nan]
+    x = np.arange(4, dtype=np.float64)
+    x[2] = x[3] = np.nan
+    m = np.ma.array(x, mask=[0, 1, 0, 1])
+    df = vaex.from_arrays(x=x, m=m, s=s, o=o)
+    x = df.x.fillmissing(9).tolist()
+    assert (9 not in x)
+    assert np.any(np.isnan(x)), "nan is not a missing value"
+    m = df.m.fillmissing(9).tolist()
+    assert (m[:2] == [0, 9])
+    assert np.isnan(m[2])
+    assert m[3] == 9
+    assert (df.s.fillmissing('kees').tolist() == ["aap", "kees", "noot", "mies"])
+    assert (df.o.fillmissing({'a':1}).tolist()[:3] == ["aap", {'a':1}, "noot"])
+    assert np.isnan(df.o.fillmissing([1]).tolist()[3])
+
+# equivalent of isna_test
+def test_fillnan():
+    s = vaex.string_column(["aap", None, "noot", "mies"])
+    o = ["aap", None, "noot", np.nan]
+    x = np.arange(4, dtype=np.float64)
+    x[2] = x[3] = np.nan
+    m = np.ma.array(x, mask=[0, 1, 0, 1])
+    df = vaex.from_arrays(x=x, m=m, s=s, o=o)
+    x = df.x.fillnan(9).tolist()
+    assert x == [0, 1, 9, 9]
+    m = df.m.fillnan(9).tolist()
+    assert m == [0, None, 9, None]
+    assert (df.s.fillnan('kees').tolist() == ["aap", None, "noot", "mies"])
+    assert (df.o.fillnan({'a':1}).tolist() == ["aap", None, "noot", {'a':1}])
+
+def test_fillna():
+    s = vaex.string_column(["aap", None, "noot", "mies"])
+    o = ["aap", None, "noot", np.nan]
+    x = np.arange(4, dtype=np.float64)
+    x[2] = x[3] = np.nan
+    m = np.ma.array(x, mask=[0, 1, 0, 1])
+    df = vaex.from_arrays(x=x, m=m, s=s, o=o)
+    x = df.x.fillna(9).tolist()
+    assert x == [0, 1, 9, 9]
+    m = df.m.fillna(9).tolist()
+    assert m == [0, 9, 9, 9]
+    assert (df.s.fillna('kees').tolist() == ["aap", "kees", "noot", "mies"])
+    assert (df.o.fillna({'a':1}).tolist() == ["aap", {'a': 1}, "noot", {'a':1}])
+
+def test_fillna_array():
+    x = np.array([1, 2, 3, np.nan])
+    df = vaex.from_arrays(x=x)
+
+    # fillna should take scalar arrays, so you can pass directly the result of df.x.mean() for instance
+    df['x_2'] = df.x.fillna(np.array(2.0))
+    assert df.x_2.tolist() == [1, 2, 3, 2]
+
+def test_fillna_dataframe():
+    x = np.array([3, 1, np.nan, 10, np.nan])
+    y = np.array([None, 1, True, '10street', np.nan], dtype='object')
+    z = np.ma.array(data=[5, 7, 3, 1, -10], mask=[False, False, True, False, True])
+    df = vaex.from_arrays(x=x, y=y, z=z)
+
+    df_filled = df.fillna(value=-1)
+
+    assert df_filled.x.tolist() == [3, 1, -1, 10, -1]
+    assert df_filled.y.tolist() == [-1, 1, True, '10street', -1]
+    assert df_filled.z.tolist() == [5, 7, -1, 1, -1]

@@ -22,7 +22,7 @@ url = 'https://www.github.com/maartenbreddels/vaex'
 # TODO: would be nice to have astropy only as dep in vaex-astro
 install_requires_core = ["numpy>=1.11", "astropy>=2", "aplus", "tabulate>=0.8.3",
                          "future>=0.15.2", "pyyaml", "progressbar2", "psutil>=1.2.1",
-                         "requests", "six", "cloudpickle"]
+                         "requests", "six", "cloudpickle", "pandas", "dask[array]"]
 if sys.version_info[0] == 2:
     install_requires_core.append("futures>=2.2.0")
 install_requires_viz = ["matplotlib>=1.3.1", ]
@@ -108,6 +108,8 @@ extension_superutils = Extension("vaex.superutils", [
 
 extension_superagg = Extension("vaex.superagg", [
         os.path.relpath(os.path.join(dirname, "src/superagg.cpp")),
+        os.path.relpath(os.path.join(dirname, "src/agg_hash_string.cpp")),
+        os.path.relpath(os.path.join(dirname, "src/agg_hash_primitive.cpp")),
     ],
     include_dirs=[
         get_numpy_include(), get_pybind_include(),
@@ -134,6 +136,7 @@ setup(name=name + '-core',
       zip_safe=False,
       entry_points={
           'console_scripts': ['vaex = vaex.__main__:main'],
-          'gui_scripts': ['vaexgui = vaex.__main__:main']  # sometimes in osx, you need to run with this
+          'gui_scripts': ['vaexgui = vaex.__main__:main'],  # sometimes in osx, you need to run with this
+          'vaex.dataframe.accessor': ['geo = vaex.geo:DataFrameAccessorGeo']
       }
       )

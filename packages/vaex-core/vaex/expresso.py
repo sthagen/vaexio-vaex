@@ -19,7 +19,7 @@ valid_binary_operators = [_ast.Add, _ast.Sub, _ast.Mult, _ast.Pow,
                           _ast.Div, _ast.FloorDiv, _ast.BitAnd, _ast.BitOr, _ast.BitXor, _ast.Mod]
 valid_compare_operators = [_ast.Lt, _ast.LtE,
                            _ast.Gt, _ast.GtE, _ast.Eq, _ast.NotEq]
-valid_unary_operators = [_ast.USub, _ast.UAdd]
+valid_unary_operators = [_ast.USub, _ast.UAdd, _ast.Invert]
 valid_id_characters = string.ascii_letters + string.digits + "_"
 valid_functions = "sin cos".split()
 
@@ -301,6 +301,11 @@ class ExpressionString(ast.NodeVisitor):
                 return "-{}".format(self.visit(node.operand))  # prettier
             else:
                 return "-({})".format(self.visit(node.operand))
+        if isinstance(node.op, ast.Invert):
+            if isinstance(node.operand, (ast.Name, ast.Num)):
+                return "~{}".format(self.visit(node.operand))  # prettier
+            else:
+                return "~({})".format(self.visit(node.operand))
         # elif isinstance(node.op, ast.UAdd):
         #     return "{}".format(self.visit(self.operatand))
         else:
@@ -437,6 +442,23 @@ class Translator(ast.NodeTransformer):
         return node
 
 
+class NameCollector(ast.NodeTransformer):
+    def __init__(self):
+        self.names = {}
+
+    def visit_Call(self, node):
+        # we skip visiting node.id
+        node.args = [self.visit(k) for k in node.args]
+        if hasattr(node, 'keywords'):
+            node.keywords = [self.visit(k) for k in node.keywords]
+        return node
+
+    def visit_Name(self, node):
+        if node.id not in self.names:
+            self.names[node.id] = []
+        self.names[node.id].append(node)
+        return node
+
 class GraphBuiler(ast.NodeVisitor):
     def __init__(self):
         self.dependencies = []
@@ -481,8 +503,11 @@ def simplify(expression_string):
     return node_to_string(node)
 
 
-def derivative(expression_string, variable_name, simplify=True):
-    node = parse_expression(expression_string)
+def derivative(expression, variable_name, simplify=True):
+    if isinstance(expression, str):
+        node = parse_expression(expression)
+    else:
+        node = expression
     node = Derivative(variable_name).visit(node)
     if simplify:
         node = SimplifyExpression().visit(node)
@@ -490,9 +515,22 @@ def derivative(expression_string, variable_name, simplify=True):
 
 
 def translate(expression, translator):
-    node = parse_expression(expression)
+    if isinstance(expression, str):
+        node = parse_expression(expression)
+    else:
+        node = expression
     node = Translator(translator).visit(node)
     return node_to_string(node)
+
+
+def names(expression):
+    if isinstance(expression, str):
+        node = parse_expression(expression)
+    else:
+        node = expression
+    nc = NameCollector()
+    nc.visit(node)
+    return nc.names
 
 
 def parse_expression(expression_string):

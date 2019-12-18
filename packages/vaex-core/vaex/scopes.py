@@ -25,7 +25,15 @@ import vaex.expression
 
 logger = logging.getLogger('vaex.scopes')
 
-class UnitScope(object):
+
+class ScopeBase(object):
+    def get(self, attr, default=None):  # otherwise pdb crashes during pytest
+        if attr == "__tracebackhide__":
+            return False
+        return default
+
+
+class UnitScope(ScopeBase):
     def __init__(self, df, value=None):
         self.df = df
         self.value = value
@@ -43,7 +51,7 @@ class UnitScope(object):
             raise KeyError("unkown variable %s" % variable)
 
 
-class _BlockScope(object):
+class _BlockScope(ScopeBase):
     def __init__(self, df, i1, i2, mask=None, **variables):
         """
 
@@ -72,6 +80,9 @@ class _BlockScope(object):
         self.i1 = int(i1)
         self.i2 = int(i2)
         self.values = dict(self.variables)
+
+    def __contains__(self, name):  # otherwise pdb crashes during pytest
+        return name in self.buffers  # not sure this should also include varibles, columns and virtual columns
 
     def _ensure_buffer(self, column):
         if column not in self.buffers:
@@ -106,7 +117,7 @@ class _BlockScope(object):
         try:
             if variable in self.values:
                 return self.values[variable]
-            elif variable in self.df.get_column_names(virtual=False, hidden=True):
+            elif variable in self.df.columns:
                 offset = self.df._index_start
                 # if self.df._needs_copy(variable):
                     # self._ensure_buffer(variable)
@@ -138,13 +149,14 @@ class _BlockScope(object):
             raise
 
 
-class _BlockScopeSelection(object):
-    def __init__(self, df, i1, i2, selection=None, cache=False):
+class _BlockScopeSelection(ScopeBase):
+    def __init__(self, df, i1, i2, selection=None, cache=False, filter_mask=None):
         self.df = df
         self.i1 = i1
         self.i2 = i2
         self.selection = selection
         self.store_in_cache = cache
+        self.filter_mask = filter_mask
 
     def evaluate(self, expression):
         if expression is True:
@@ -158,6 +170,8 @@ class _BlockScopeSelection(object):
             raise
 
     def __getitem__(self, variable):
+        if variable == "__tracebackhide__":  # required for tracebacks
+            return False
         # logger.debug("getitem for selection: %s", variable)
         try:
             selection = self.selection
@@ -174,28 +188,42 @@ class _BlockScopeSelection(object):
 
                 # logger.debug("mask for %r is %r", variable, mask)
                 if selection_in_cache == selection:
+                    if self.filter_mask is not None:
+                        return mask[self.filter_mask]
                     return mask
                 # logger.debug("was not cached")
                 if variable in self.df.variables:
                     return self.df.variables[variable]
-                mask_values = selection.evaluate(self.df, variable, self.i1, self.i2)
+                mask_values = selection.evaluate(self.df, variable, self.i1, self.i2, self.filter_mask)
+                    
                 # get a view on a subset of the mask
                 sub_mask = full_mask.view(self.i1, self.i2)
                 sub_mask_array = np.asarray(sub_mask)
                 # and update it
-                sub_mask_array[:] = mask_values
+                if self.filter_mask is not None:  # if we have a mask, the selection we evaluated is also filtered
+                    sub_mask_array[:] = 0
+                    sub_mask_array[:][self.filter_mask] = mask_values
+                else:
+                    sub_mask_array[:] = mask_values
                 # logger.debug("put selection in mask with key %r" % (key,))
                 if self.store_in_cache:
                     cache[key] = selection, sub_mask_array
                     # cache[key] = selection, mask_values
-                return sub_mask_array
+                if self.filter_mask is not None:
+                    return sub_mask_array[self.filter_mask]
+                else:
+                    return sub_mask_array
                 # return mask_values
             else:
                 offset = self.df._index_start
                 if variable in expression_namespace:
                     return expression_namespace[variable]
                 elif variable in self.df.get_column_names(hidden=True, virtual=False):
-                    return self.df.columns[variable][offset+self.i1:offset+self.i2]
+                    values = self.df.columns[variable][offset+self.i1:offset+self.i2]
+                    if self.filter_mask is not None:
+                        return values[self.filter_mask]
+                    else:
+                        return values
                 elif variable in self.df.variables:
                     return self.df.variables[variable]
                 elif variable in list(self.df.virtual_columns.keys()):

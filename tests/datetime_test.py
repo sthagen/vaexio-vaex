@@ -60,8 +60,11 @@ def test_datetime_stats():
 
 
 def test_timedelta_arithmetics():
-    x = np.array(['2019-01-04T21:23:00', '2019-02-04T05:00:10', '2019-03-04T15:15:15'], dtype=np.datetime64)
-    y = np.array(['2018-06-14T12:11:00', '2019-02-02T22:19:00', '2017-11-18T10:11:19'], dtype=np.datetime64)
+    x = np.array(['2019-01-04T21:23:00', '2019-02-04T05:00:10', '2019-03-04T15:15:15', '2019-06-21T10:31:15'],
+                 dtype=np.datetime64)
+    y = np.array(['2018-06-14T12:11:00', '2019-02-02T22:19:00', '2017-11-18T10:11:19', '2019-07-12T11:00:00'],
+                 dtype=np.datetime64)
+
     df = vaex.from_arrays(x=x, y=y)
     df['diff'] = df.x-df.y
     df['diff_dev_hours'] = df.diff / np.timedelta64(1, 'h')
@@ -75,3 +78,51 @@ def test_timedelta_arithmetics():
     # compare vaex to numerical results
     assert diff_dev_hours.tolist() == df['diff_dev_hours'].values.tolist()
     assert diff_add_days.tolist() == df['diff_add_days'].values.tolist()
+
+    # check the min/max values for the TimeDelta column
+    assert df.diff.min() == df.diff.values.min()
+    assert df.diff.max() == df.diff.values.max()
+
+
+def test_datetime_binary_operations():
+    x = np.array(['2019-01-04T21:23:00', '2019-02-04T05:00:10', '2019-03-04T15:15:15', '2019-06-21T10:31:15'],
+                 dtype=np.datetime64)
+    y = np.array(['2018-06-14T12:11:00', '2019-02-02T22:19:00', '2017-11-18T10:11:19', '2019-07-12T11:00:00'],
+                 dtype=np.datetime64)
+
+    sample_date = np.datetime64('2019-03-15')
+    df = vaex.from_arrays(x=x, y=y)
+
+    # Try simple binary operations
+    assert (df.x > sample_date).tolist() == list(df.x.values > sample_date)
+    assert (df.x <= sample_date).tolist() == list(df.x.values <= sample_date)
+    assert (df.x > df.y).tolist() == list(df.x.values > df.y.values)
+
+
+@pytest.mark.skipif(vaex.utils.osname == 'windows',
+                    reason="windows' snprintf seems buggy")
+def test_create_datetime64_column_from_ints():
+    year = np.array([2015, 2015, 2017])
+    month = np.array([1, 2, 10])
+    day = np.array([1, 3, 22])
+    time = np.array([945, 1015, 30])
+    df = vaex.from_arrays(year=year, month=month, day=day, time=time)
+
+    df['hour'] = (df.time // 100 % 24).format('%02d')
+    df['minute'] = (df.time % 100).format('%02d')
+
+    expr = df.year.format('%4d') + '-' + df.month.format('%02d') + '-' + df.day.format('%02d') + 'T' + df.hour + ':' + df.minute
+    assert expr.values.astype(np.datetime64).tolist() == expr.astype('datetime64').tolist()
+
+
+def test_create_datetime64_column_from_str():
+    year = np.array(['2015', '2015', '2017'])
+    month = np.array(['01', '02', '10'])
+    day = np.array(['01', '03', '22'])
+    hour = np.array(['09', '10', '00'])
+    minute = np.array(['45', '15', '30'])
+    df = vaex.from_arrays(year=year, month=month, day=day, hour=hour, minute=minute)
+
+    expr = df.year + '-' + df.month + '-' + df.day + 'T' + df.hour + ':' + df.minute
+    assert expr.values.astype(np.datetime64).tolist() == expr.astype('datetime64').tolist()
+    assert expr.values.astype('datetime64[ns]').tolist() == expr.astype('datetime64[ns]').tolist()

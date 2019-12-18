@@ -1,39 +1,12 @@
+#include "agg.hpp"
 #include <stdint.h>
 #include <limits>
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
 #include <Python.h>
 #include "superstring.hpp"
-namespace py = pybind11;
 
-const int INDEX_BLOCK_SIZE = 1024;
-const int MAX_DIM = 16;
-
-typedef uint64_t default_index_type;
-
-class Binner {
-public:
-    Binner(std::string expression) : expression(expression) { }
-    virtual ~Binner() {}
-    virtual void to_bins(uint64_t offset, default_index_type* output, uint64_t length, uint64_t stride) = 0;
-    virtual uint64_t size() = 0;
-    virtual uint64_t shape() = 0;
-    std::string expression;
-};
-
-template<class T>
-T _to_native(T value_non_native) {
-	unsigned char* bytes = (unsigned char*)&value_non_native;
-	T result;
-	unsigned char* result_bytes = (unsigned char*)&result;
-	for(size_t i = 0; i < sizeof(T); i++)
-		result_bytes[sizeof(T)-1-i] = bytes[i];
-	return result;
-}
-
+using namespace vaex;
 
 template<class T=double, class BinIndexType=default_index_type, bool FlipEndian=false>
 class BinnerScalar : public Binner {
@@ -202,130 +175,10 @@ public:
     uint64_t data_mask_size;
 };
 
-class Aggregator {
-public:
-    virtual ~Aggregator() {}
-    virtual void aggregate(default_index_type* indices1d, size_t length, uint64_t offset) = 0;
-    virtual bool can_release_gil() {
-        return true;
-    };
-};
-
-template<class IndexType=default_index_type>
-class Grid {
-public:
-    using index_type = IndexType;
-    Grid(std::vector<Binner*> binners) : binners(binners) {
-        indices1d = (IndexType*)malloc(INDEX_BLOCK_SIZE * sizeof(IndexType));
-        dimensions = binners.size();
-        shapes = new uint64_t[dimensions];
-        strides = new uint64_t[dimensions];
-        length1d = 1;
-        for(size_t i =  0; i < dimensions; i++) {
-            shapes[i] = binners[i]->shape();
-            length1d *= shapes[i];
-        }
-        if(dimensions > 0) {
-            strides[0] = 1;
-            for(size_t i = 1; i < dimensions; i++) {
-                strides[i] = strides[i-1] * shapes[i-1];
-            }
-        }
-    }
-    virtual ~Grid() {
-        free(indices1d);
-        delete[] strides;
-        delete[] shapes;
-    }
-    void bin(std::vector<Aggregator*> aggregators) {
-        if(binners.size() == 0) {
-            throw std::runtime_error("no binners set and no length given");
-        } else {
-            uint64_t length = binners[0]->size();
-            this->bin(aggregators, length);
-        }
-    }
-    void bin(std::vector<Aggregator*> aggregators, size_t length) {
-            std::vector<Aggregator*> aggregators_no_gil;
-            std::vector<Aggregator*> aggregators_gil;
-            for(auto agg : aggregators) {
-                if(agg->can_release_gil()) {
-                    aggregators_no_gil.push_back(agg);
-                } else {
-                    aggregators_gil.push_back(agg);
-                }
-            }
-            {
-                if(aggregators_no_gil.size() > 0) {
-                    py::gil_scoped_release release;
-                    this->bin_(aggregators_no_gil, length);
-                }
-            }
-            {
-                if(aggregators_gil.size() > 0) {
-                    this->bin_(aggregators_gil, length);
-                }
-            }
-    }
-    void bin_(std::vector<Aggregator*> aggregators, size_t length) {
-        size_t binner_count = binners.size();
-        size_t aggregator_count = aggregators.size();
-        uint64_t offset = 0;
-        bool done = false;
-        while(!done) {
-            uint64_t leftover = length - offset;
-            if(leftover < INDEX_BLOCK_SIZE) {
-                std::fill(indices1d, indices1d+leftover, 0);
-                for(size_t i = 0; i < binner_count; i++) {
-                    binners[i]->to_bins(offset, indices1d, leftover, this->strides[i]);
-                }
-            } else {
-                std::fill(indices1d, indices1d+INDEX_BLOCK_SIZE, 0);
-                for(size_t i = 0; i < binner_count; i++) {
-                    binners[i]->to_bins(offset, indices1d, INDEX_BLOCK_SIZE, this->strides[i]);
-                }
-            }
-            if(leftover < INDEX_BLOCK_SIZE) {
-                for(size_t i = 0; i < aggregator_count; i++) {
-                    aggregators[i]->aggregate(indices1d, leftover, offset);
-                }
-            } else {
-                for(size_t i = 0; i < aggregator_count; i++) {
-                    aggregators[i]->aggregate(indices1d, INDEX_BLOCK_SIZE, offset);
-                }
-            }
-            offset += (leftover < INDEX_BLOCK_SIZE) ? leftover :  INDEX_BLOCK_SIZE;
-            done = offset == length;
-        }
-    }
-    std::vector<Binner*> binners;
-    index_type *indices1d;
-    uint64_t* strides;
-    uint64_t* shapes;
-    uint64_t dimensions;
-    size_t length1d;
-};
-
-template<class GridType=double, class IndexType=default_index_type>
-class Agg : public Aggregator {
-public:
-    using index_type = IndexType;
-    using grid_type = GridType;
-    Agg(Grid<IndexType>* grid) : grid(grid) {
-        grid_data = (grid_type*)malloc(sizeof(grid_type) * grid->length1d);
-        std::fill(grid_data, grid_data+grid->length1d, 0);
-    }
-    virtual ~Agg() {
-        free(grid_data);
-    }
-    Grid<IndexType>* grid;
-    grid_type* grid_data;
-};
-
 template<class GridType=uint64_t, class IndexType=default_index_type>
-class AggBaseObject : public Agg<IndexType> {
+class AggBaseObject : public AggregatorBase<IndexType> {
 public:
-    using Base = Agg<IndexType>;
+    using Base = AggregatorBase<IndexType>;
     using typename Base::index_type;
     using data_type = PyObject*;
     AggBaseObject(Grid<IndexType>* grid) : Base(grid), objects(nullptr), data_mask_ptr(nullptr) {
@@ -379,14 +232,16 @@ public:
             for(size_t j = 0; j < length; j++) {
                 PyObject* obj = this->objects[j+offset];
                 bool none = (obj == Py_None);
-                this->grid_data[indices1d[j]] += none ? 0 : 1;
+                bool _isnan = PyFloat_Check(obj) && isnan(PyFloat_AsDouble(obj));
+                this->grid_data[indices1d[j]] += (none || _isnan ? 0 : 1);
             }
         } else {
             for(size_t j = 0; j < length; j++) {
                 PyObject* obj = this->objects[j+offset];
                 bool none = (obj == Py_None);
+                bool _isnan = PyFloat_Check(obj) && isnan(PyFloat_AsDouble(obj));
                 bool masked = this->data_mask_ptr[j+offset] == 0;
-                this->grid_data[indices1d[j]] += none || masked ? 0 : 1;
+                this->grid_data[indices1d[j]] += (none || masked || _isnan ? 0 : 1);
             }
         }
     }
@@ -395,32 +250,6 @@ public:
     };
 };
 
-
-template<class GridType=uint64_t, class IndexType=default_index_type>
-class AggBaseString : public Agg<IndexType> {
-public:
-    using Base = Agg<IndexType>;
-    using typename Base::index_type;
-    using data_type = StringSequence;
-    AggBaseString(Grid<IndexType>* grid) : Base(grid), string_sequence(nullptr), data_mask_ptr(nullptr) {
-    }
-    ~AggBaseString() {
-    }
-    void set_data(StringSequence* string_sequence, size_t index) {
-        this->string_sequence = string_sequence;
-    }
-    void set_data_mask(py::buffer ar) {
-        py::buffer_info info = ar.request();
-        if(info.ndim != 1) {
-            throw std::runtime_error("Expected a 1d array");
-        }
-        this->data_mask_ptr = (uint8_t*)info.ptr;
-        this->data_mask_size = info.shape[0];
-    }
-    StringSequence* string_sequence;
-    uint8_t* data_mask_ptr;
-    uint64_t data_mask_size;
-};
 
 
 template<class GridType=uint64_t, class IndexType=default_index_type>
@@ -464,9 +293,9 @@ public:
 };
 
 template<class DataType=double, class GridType=DataType, class IndexType=default_index_type>
-class AggBase : public Agg<GridType, IndexType> {
+class AggBase : public AggregatorBase<GridType, IndexType> {
 public:
-    using Base = Agg<GridType, IndexType>;
+    using Base = AggregatorBase<GridType, IndexType>;
     using typename Base::index_type;
     using data_type = DataType;
     AggBase(Grid<IndexType>* grid) : Base(grid), data_ptr(nullptr), data_mask_ptr(nullptr) {
@@ -538,6 +367,12 @@ public:
     using Base = AggBase<StorageType, StorageType, IndexType>;
     using Type = AggMax<StorageType, IndexType, FlipEndian>;
     using Base::Base;
+    AggMax(Grid<IndexType>* grid) : Base(grid){
+        typedef std::numeric_limits<StorageType> limit_type;
+        // TODO: avoid double fill, since we also call it in the base ctor
+        StorageType fill_value = limit_type::has_infinity ? -limit_type::infinity() : limit_type::min();
+        std::fill(this->grid_data, this->grid_data+this->grid->length1d, fill_value);
+    }
     virtual void reduce(std::vector<Type*> others) {
         for(auto other: others) {
             for(size_t i = 0; i < this->grid->length1d; i++) {
@@ -564,6 +399,8 @@ public:
         } else {
             for(size_t j = 0; j < length; j++) {
                 StorageType value = this->data_ptr[offset + j];
+                if(FlipEndian)
+                    value = _to_native(value);
                 if(value == value) // nan check
                     this->grid_data[indices1d[j]] = std::max(value, this->grid_data[indices1d[j]]);
             }
@@ -577,6 +414,12 @@ public:
     using Base = AggBase<StorageType, StorageType, IndexType>;
     using Type = AggMin<StorageType, IndexType, FlipEndian>;
     using Base::Base;
+    AggMin(Grid<IndexType>* grid) : Base(grid){
+        typedef std::numeric_limits<StorageType> limit_type;
+        StorageType fill_value = limit_type::has_infinity ? limit_type::infinity() : limit_type::max();
+        // TODO: avoid double fill, since we also call it in the base ctor
+        std::fill(this->grid_data, this->grid_data+this->grid->length1d, fill_value);
+    }
     virtual void reduce(std::vector<Type*> others) {
         for(auto other: others) {
             for(size_t i = 0; i < this->grid->length1d; i++) {
@@ -604,6 +447,8 @@ public:
         } else {
             for(size_t j = 0; j < length; j++) {
                 StorageType value = this->data_ptr[offset + j];
+                if(FlipEndian)
+                    value = _to_native(value);
                 if(value == value) // nan check
                     this->grid_data[indices1d[j]] = std::min(value, this->grid_data[indices1d[j]]);
             }
@@ -611,10 +456,70 @@ public:
     }
 };
 
+template<class T>
+struct upcast {
+};
+
+template<>
+struct upcast<float> {
+    typedef double type;
+};
+
+template<>
+struct upcast<double> {
+    typedef double type;
+};
+
+template<>
+struct upcast<bool> {
+    typedef int64_t type;
+};
+
+template<>
+struct upcast<int8_t> {
+    typedef int64_t type;
+};
+
+template<>
+struct upcast<int16_t> {
+    typedef int64_t type;
+};
+
+template<>
+struct upcast<int32_t> {
+    typedef int64_t type;
+};
+
+template<>
+struct upcast<int64_t> {
+    typedef int64_t type;
+};
+
+template<>
+struct upcast<uint8_t> {
+    typedef uint64_t type;
+};
+
+template<>
+struct upcast<uint16_t> {
+    typedef uint64_t type;
+};
+
+template<>
+struct upcast<uint32_t> {
+    typedef uint64_t type;
+};
+
+template<>
+struct upcast<uint64_t> {
+    typedef uint64_t type;
+};
+
+
 template<class StorageType=double, class IndexType=default_index_type, bool FlipEndian=false>
-class AggSum : public AggBase<StorageType, StorageType, IndexType> {
+class AggSum : public AggBase<StorageType, typename upcast<StorageType>::type, IndexType> {
 public:
-    using Base = AggBase<StorageType, StorageType, IndexType>;
+    using Base = AggBase<StorageType, typename upcast<StorageType>::type, IndexType>;
     using Type = AggSum<StorageType, IndexType, FlipEndian>;
     using Base::Base;
     virtual void reduce(std::vector<Type*> others) {
@@ -651,6 +556,51 @@ public:
             }
         }
     }
+};
+
+template<class StorageType=double, class IndexType=default_index_type, bool FlipEndian=false>
+class AggSumMoment : public AggBase<StorageType, typename upcast<StorageType>::type, IndexType> {
+public:
+    using Base = AggBase<StorageType, typename upcast<StorageType>::type, IndexType>;
+    using Type = AggSumMoment<StorageType, IndexType, FlipEndian>;
+    using Base::Base;
+    AggSumMoment(Grid<IndexType>* grid, uint32_t moment) : Base(grid), moment(moment) {
+    }
+    virtual void reduce(std::vector<Type*> others) {
+        for(auto other: others) {
+            for(size_t i = 0; i < this->grid->length1d; i++) {
+                this->grid_data[i] = this->grid_data[i] + other->grid_data[i];
+            }
+        }
+    }
+    virtual void aggregate(default_index_type* indices1d, size_t length, uint64_t offset) {
+        if(this->data_ptr == nullptr) {
+            throw std::runtime_error("data not set");
+        }
+
+        if(this->data_mask_ptr) {
+            for(size_t j = 0; j < length; j++) {
+                // if not masked
+                if(this->data_mask_ptr[j+offset] == 1) {
+                    typename Base::grid_type value = this->data_ptr[j+offset];
+                    if(FlipEndian)
+                        value = _to_native(value);
+                    if(value != value) // nan
+                        continue;
+                    this->grid_data[indices1d[j]] += pow(value, moment);
+                }
+            }
+        } else {
+            for(size_t j = 0; j < length; j++) {
+                typename Base::grid_type value = this->data_ptr[offset + j];
+                if(FlipEndian)
+                    value = _to_native(value);
+                if(value == value) // nan check
+                    this->grid_data[indices1d[j]] += pow(value, moment);
+            }
+        }
+    }
+    size_t moment;
 };
 
 template<class StorageType=double, class IndexType=default_index_type, bool FlipEndian=false>
@@ -759,6 +709,35 @@ void add_agg(Module m, Base& base, const char* class_name) {
     ;
 }
 
+
+template<class Agg, class Base, class Module, class A>
+void add_agg_arg(Module m, Base& base, const char* class_name) {
+    py::class_<Agg>(m, class_name, py::buffer_protocol(), base)
+        .def(py::init<Grid<>*, A>(), py::keep_alive<1, 2>())
+        .def_buffer([](Agg &agg) -> py::buffer_info {
+            std::vector<ssize_t> strides(agg.grid->dimensions);
+            std::vector<ssize_t> shapes(agg.grid->dimensions);
+            std::copy(&agg.grid->shapes[0], &agg.grid->shapes[agg.grid->dimensions], &shapes[0]);
+            std::transform(&agg.grid->strides[0], &agg.grid->strides[agg.grid->dimensions], &strides[0], [](uint64_t x) { return x*sizeof(typename Agg::grid_type); } );
+            return py::buffer_info(
+                agg.grid_data,                               /* Pointer to buffer */
+                sizeof(typename Agg::grid_type),                 /* Size of one scalar */
+                py::format_descriptor<typename Agg::grid_type>::format(), /* Python struct-style format descriptor */
+                agg.grid->dimensions,                       /* Number of dimensions */
+                shapes,                 /* Buffer dimensions */
+                strides
+            );
+        })
+        .def_property_readonly("grid", [](const Agg &agg) {
+                return agg.grid;
+            }
+        )
+        .def("set_data", &Agg::set_data)
+        .def("set_data_mask", &Agg::set_data_mask)
+        .def("reduce", &Agg::reduce)
+    ;
+}
+
 template<class T, class Base, class Module, bool FlipEndian=false>
 void add_agg_primitives_(Module m, Base& base, std::string postfix) {
     add_agg<AggCount<T, default_index_type, FlipEndian>, Base, Module>(m, base, ("AggCount_" + postfix).c_str());
@@ -766,6 +745,7 @@ void add_agg_primitives_(Module m, Base& base, std::string postfix) {
     add_agg<AggMax<T, default_index_type, FlipEndian>, Base, Module>(m, base, ("AggMax_" + postfix).c_str());
     add_agg<AggSum<T, default_index_type, FlipEndian>, Base, Module>(m, base, ("AggSum_" + postfix).c_str());
     add_agg<AggFirst<T, default_index_type, FlipEndian>, Base, Module>(m, base, ("AggFirst_" + postfix).c_str());
+    add_agg_arg<AggSumMoment<T, default_index_type, FlipEndian>, Base, Module, uint32_t>(m, base, ("AggSumMoment_" + postfix).c_str());
 }
 
 template<class T, class Base, class Module>
@@ -812,18 +792,24 @@ void add_binner_scalar_(Module m, Base& base, std::string postfix) {
     ;
 }
 
+
 template<class T, class Base, class Module>
 void add_binner_scalar(Module m, Base& base, std::string postfix) {
     add_binner_scalar_<T, Base, Module, false>(m, base, postfix);
     add_binner_scalar_<T, Base, Module, true>(m, base, postfix+"_non_native");
 }
 
+namespace vaex {
+    void add_agg_nunique_string(py::module& m, py::class_<Aggregator>& base);
+    void add_agg_nunique_primitives(py::module& m, py::class_<Aggregator>& base);
+};
+
 PYBIND11_MODULE(superagg, m) {
     _import_array();
 
     m.doc() = "fast statistics/aggregation on grids";
     py::class_<Aggregator> aggregator(m, "Aggregator");
-    py::class_<Agg<>> agg(m, "Agg", aggregator);
+    py::class_<AggregatorBase<>> agg(m, "Agg", aggregator);
     py::class_<Binner> binner(m, "Binner");
 
     {
@@ -839,6 +825,8 @@ PYBIND11_MODULE(superagg, m) {
         ;
     }
 
+    vaex::add_agg_nunique_string(m, aggregator);
+    vaex::add_agg_nunique_primitives(m, aggregator);
     add_agg<AggStringCount<>>(m, agg, "AggCount_string");
     add_agg<AggObjectCount<>>(m, agg, "AggCount_object");
     add_agg_primitives<double>(m, agg, "float64");

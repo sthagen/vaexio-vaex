@@ -27,9 +27,15 @@ import tornado.escape
 from cachetools import Cache, LRUCache
 import sys
 
+from . import remote
+
 logger = logging.getLogger("vaex.webserver")
 job_index = 0
 
+
+allowed_statistical_method_names = "count cov correlation covariance mean std minmax min max sum var".split()
+allowed_method_names = []
+allowed_method_names.extend(remote.forwarded_method_names)
 
 class JobFlexible(object):
     def __init__(self, cost, fn=None, args=None, kwargs=None, index=None):
@@ -320,7 +326,7 @@ class QueueHandler(tornado.web.RequestHandler):
 
 
 def exception(exception):
-    logger.exception("handled exception at server, all fine")
+    logger.exception("handled exception at server, all fine: %r", exception)
     return ({"exception": {"class": str(exception.__class__.__name__), "msg": str(exception)}})
 
 
@@ -329,6 +335,13 @@ def error(msg):
 
 
 def process(webserver, user_id, path, fraction=None, progress=None, **arguments):
+    token = arguments.pop("token", None)
+    token_trusted = arguments.pop("token_trusted", None)
+    trusted = token_trusted == webserver.token_trusted and token_trusted
+
+    if not ((token == webserver.token) or (webserver.token_trusted and token_trusted == webserver.token_trusted)):
+        return exception(ValueError('No token provided, not authorized'))
+
     if not hasattr(webserver.thread_local, "executor"):
         logger.debug("creating thread pool and executor")
         webserver.thread_local.thread_pool = vaex.multithreading.ThreadPoolIndex(max_workers=webserver.threads_per_job)
@@ -385,7 +398,7 @@ def process(webserver, user_id, path, fraction=None, progress=None, **arguments)
                         if dataset.mask is not None:
                             logger.debug("selection: %r", dataset.mask.sum())
                         if 'state' in arguments:
-                            dataset.state_set(arguments['state'], use_active_range=True)
+                            dataset.state_set(arguments['state'], use_active_range=True, trusted=trusted)
                         if expressions:
                             for expression in expressions:
                                 try:
@@ -418,7 +431,7 @@ def process(webserver, user_id, path, fraction=None, progress=None, **arguments)
                                     for name in "job_id state auto_fraction expressions active_fraction selection selections variables virtual_columns active_start_index active_end_index".split():
                                         arguments.pop(name, None)
                             logger.debug("subspace: %r", subspace)
-                            if subspace is None and method_name in "count cov correlation covariance mean std minmax min max sum var".split():
+                            if subspace is None and method_name in allowed_statistical_method_names:
                                 grid = task_invoke(dataset, method_name, **arguments)
                                 return grid
                             elif method_name in ["minmax", "image_rgba_url", "var", "mean", "sum", "limits_sigma", "nearest", "correlation", "mutual_information"]:
@@ -458,6 +471,9 @@ def process(webserver, user_id, path, fraction=None, progress=None, **arguments)
                                 if dataset.dtype(arguments['expression']) == vaex.column.str_type:
                                     result = result.astype(vaex.column.str_type)
                                 return result
+                            elif method_name in allowed_method_names:
+                                result = task_invoke(dataset, method_name, **arguments)
+                                return {"result": result}
                             else:
                                 logger.error("unknown method: %r", method_name)
                                 return error("unknown method: " + method_name)
@@ -475,6 +491,7 @@ GB = MB * 1024
 
 class WebServer(threading.Thread):
     def __init__(self, address="localhost", port=9000, webserver_thread_count=2, cache_byte_size=500 * MB,
+                 token=None, token_trusted=None,
                  cache_selection_byte_size=500 * MB, datasets=[], compress=True, development=False, threads_per_job=4):
         threading.Thread.__init__(self)
         self.setDaemon(True)
@@ -482,6 +499,8 @@ class WebServer(threading.Thread):
         self.port = port
         self.started = threading.Event()
         self.set_datasets(datasets)
+        self.token = token
+        self.token_trusted = token_trusted
 
         self.webserver_thread_count = webserver_thread_count
         self.threads_per_job = threads_per_job
@@ -624,6 +643,8 @@ def main(argv):
     parser.add_argument('--compress', help="compress larger replies (default: %(default)s)", default=True, action='store_true')
     parser.add_argument('--no-compress', dest="compress", action='store_false')
     parser.add_argument('--development', default=False, action='store_true', help="enable development features (auto reloading)")
+    parser.add_argument('--token', default=None, help="optionally protect server access by a token")
+    parser.add_argument('--token-trusted', default=None, help="when using this token, the server allows more deserialization (e.g. pickled function)")
     parser.add_argument('--threads-per-job', default=4, type=int, help="threads per job (default: %(default)s)")
     # config = layeredconfig.LayeredConfig(defaults, env, layeredconfig.Commandline(parser=parser, commandline=argv[1:]))
     config = parser.parse_args(argv[1:])
@@ -650,6 +671,7 @@ def main(argv):
     for dataset in datasets:
         logger.info("\thttp://%s:%d/%s or ws://%s:%d/%s", config.address, config.port, dataset.name, config.address, config.port, dataset.name)
     server = WebServer(datasets=datasets, address=config.address, port=config.port, cache_byte_size=config.cache,
+                       token=config.token, token_trusted=config.token_trusted,
                        compress=config.compress, development=config.development,
                        threads_per_job=config.threads_per_job)
     server.serve()

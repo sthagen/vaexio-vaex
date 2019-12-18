@@ -31,7 +31,7 @@ class Task(vaex.promise.Promise):
     :type: signal_progress: Signal
     """
 
-    def __init__(self, df=None, expressions=[], name="task"):
+    def __init__(self, df=None, expressions=[], pre_filter=False, name="task"):
         vaex.promise.Promise.__init__(self)
         self.df = df
         self.expressions = expressions
@@ -41,6 +41,7 @@ class Task(vaex.promise.Promise):
         self.signal_progress.connect(self._set_progress)
         self.cancelled = False
         self.name = name
+        self.pre_filter = pre_filter
 
     def _set_progress(self, fraction):
         self.progress_fraction = fraction
@@ -70,11 +71,11 @@ class TaskBase(Task):
             expressions = [expressions]
         # edges include everything outside at index 1 and -1, and nan's at index 0, so we add 3 to each dimension
         self.selection_waslist, [self.selections, ] = vaex.utils.listify(selection)
-        Task.__init__(self, df, expressions, name=name)
+        Task.__init__(self, df, expressions, name=name, pre_filter=df.filtered)
         self.to_float = to_float
         self.dtype = dtype
 
-    def map(self, thread_index, i1, i2, *blocks):
+    def map(self, thread_index, i1, i2, filter_mask, *blocks):
         class Info(object):
             pass
         info = Info()
@@ -99,7 +100,7 @@ class TaskBase(Task):
             blocks = [as_flat_float(block) for block in blocks]
 
         for i, selection in enumerate(self.selections):
-            if selection or self.df.filtered:
+            if selection:
                 selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True)  # TODO
                 if selection_mask is None:
                     raise ValueError("performing operation on selection while no selection present")
@@ -128,8 +129,8 @@ class TaskBase(Task):
 
 class TaskMapReduce(Task):
     def __init__(self, df, expressions, map, reduce, converter=lambda x: x, info=False, to_float=False,
-                 to_numpy=True, ordered_reduce=False, skip_masked=False, ignore_filter=False, name="task"):
-        Task.__init__(self, df, expressions, name=name)
+                 to_numpy=True, ordered_reduce=False, skip_masked=False, ignore_filter=False, selection=None, pre_filter=False, name="task"):
+        Task.__init__(self, df, expressions, name=name, pre_filter=pre_filter)
         self._map = map
         self._reduce = reduce
         self.converter = converter
@@ -139,8 +140,11 @@ class TaskMapReduce(Task):
         self.to_numpy = to_numpy
         self.skip_masked = skip_masked
         self.ignore_filter = ignore_filter
+        if self.pre_filter and self.ignore_filter:
+            raise ValueError("Cannot pre filter and also ignore the filter")
+        self.selection = selection
 
-    def map(self, thread_index, i1, i2, *blocks):
+    def map(self, thread_index, i1, i2, filter_mask, *blocks):
         if self.to_numpy:
             blocks = [block if isinstance(block, np.ndarray) else block.to_numpy() for block in blocks]
         if self.to_float:
@@ -157,10 +161,17 @@ class TaskMapReduce(Task):
                 blocks = [block[~mask] for block in blocks]
 
         if not self.ignore_filter:
-            selection = None
-            if selection or self.df.filtered:
-                selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True)
-                blocks = [block[selection_mask] for block in blocks]
+            selection = self.selection
+            if self.pre_filter:
+                if selection:
+                    selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True)
+                    blocks = [block[selection_mask] for block in blocks]
+            else:
+                if selection or self.df.filtered:
+                    selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True, pre_filtered=False)
+                    if filter_mask is not None:
+                        selection_mask = selection_mask & filter_mask
+                    blocks = [block[selection_mask] for block in blocks]
         if self.info:
             return self._map(thread_index, i1, i2, *blocks)
         else:
@@ -326,7 +337,7 @@ class TaskStatistic(Task):
         self.selection_waslist, [self.selections, ] = vaex.utils.listify(selection)
         self.op = op
         self.edges = edges
-        Task.__init__(self, df, expressions, name="statisticNd")
+        Task.__init__(self, df, expressions, name="statisticNd", pre_filter=df.filtered)
         #self.dtype = np.int64 if self.op == OP_ADD1 else np.float64 # TODO: use int64 fir count and ADD1
         self.dtype = np.float64
         self.masked = masked
@@ -356,7 +367,7 @@ class TaskStatistic(Task):
         return "<%s(df=%r, expressions=%r, shape=%r, limits=%r, weights=%r, selections=%r, op=%r)> instance at 0x%x" % (name, self.df, self.expressions, self.shape, self.limits, self.weights, self.selections, self.op, id(self))
 
 
-    def map(self, thread_index, i1, i2, *blocks):
+    def map(self, thread_index, i1, i2, filter_mask, *blocks):
         class Info(object):
             pass
         info = Info()
@@ -396,7 +407,7 @@ class TaskStatistic(Task):
 
         this_thread_grid = self.grid[thread_index]
         for i, selection in enumerate(self.selections):
-            if selection or self.df.filtered:
+            if selection:
                 selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True)  # TODO
                 if selection_mask is None:
                     raise ValueError("performing operation on selection while no selection present")
@@ -476,7 +487,7 @@ class TaskStatistic(Task):
 class TaskAggregate(Task):
     def __init__(self, df, grid):
         expressions = [binner.expression for binner in grid.binners]
-        Task.__init__(self, df, expressions, name="statisticNd")
+        Task.__init__(self, df, expressions, name="statisticNd", pre_filter=df.filtered)
 
         self.df = df
         self.parent_grid = grid
@@ -497,11 +508,18 @@ class TaskAggregate(Task):
         self.expressions_all.extend(aggregator_descriptor.expressions)
         self.expressions_all = list(set(self.expressions_all))
         self.dtypes = {expr: self.df.dtype(expr) for expr in self.expressions_all}
+        def chain_reject(x):
+            task.reject(x)
+            return x
+        self.then(None, chain_reject)
         return task
 
-    def map(self, thread_index, i1, i2, *blocks):
+    def check(self):
         if not self.aggregations:
             raise RuntimeError('Aggregation tasks started but nothing to do, maybe adding operations failed?')
+
+    def map(self, thread_index, i1, i2, filter_mask, *blocks):
+        self.check()
         grid = self.grids[thread_index]
         def check_array(x, dtype):
             if dtype == str_type:
@@ -534,8 +552,13 @@ class TaskAggregate(Task):
                 agg = aggregation2d[thread_index][selection_index]
                 all_aggregators.append(agg)
                 selection_mask = None
-                if selection or self.df.filtered:
+                if selection:
                     selection_mask = self.df.evaluate_selection_mask(selection, i1=i1, i2=i2, cache=True)  # TODO
+                    references.append(selection_mask)
+                    # some aggregators make a distiction between missing value and no value
+                    # like nunique, they need to know if they should take the value into account or not
+                    if hasattr(agg, 'set_selection_mask'):
+                        agg.set_selection_mask(selection_mask)
                 if agg_desc.expressions:
                     assert len(agg_desc.expressions) in [1,2], "only length 1 or 2 supported for now"
                     dtype_ref = block = block_map[agg_desc.expressions[0]].dtype
@@ -560,22 +583,23 @@ class TaskAggregate(Task):
                 if selection_mask is not None:
                     agg.set_data_mask(selection_mask)
                     references.extend([selection_mask])
-        grid.bin(all_aggregators, i2-i1)
+        N = i2 - i1
+        if filter_mask is not None:
+            N = filter_mask.astype(np.uint8).sum()
+        grid.bin(all_aggregators, N)
 
     def reduce(self, results):
         results = []
         for agg_desc, selections, aggregation2d, selection_waslist, edges, task in self.aggregations:
             grids = []
             for selection_index, selection in enumerate(selections):
-                agg0 = aggregation2d[0][selection_index]
-                agg0.reduce([k[selection_index] for k in aggregation2d[1:]])
-                grid = np.asarray(agg0)
-                if not edges:
-                    grid = vaex.utils.extract_central_part(grid)
+                aggs = [k[selection_index] for k in aggregation2d]
+                grid = agg_desc.reduce(aggs, edges=edges)
                 grids.append(grid)
             result = np.asarray(grids) if selection_waslist else grids[0]
-            dtype_out = vaex.utils.to_native_dtype(agg_desc.dtype_out)
-            result = result.view(dtype_out)
+            if agg_desc.dtype_out != str_type:
+                dtype_out = vaex.utils.to_native_dtype(agg_desc.dtype_out)
+                result = result.view(dtype_out)
             task.fulfill(result)
             results.append(result)
         return results

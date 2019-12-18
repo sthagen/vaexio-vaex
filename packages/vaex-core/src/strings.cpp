@@ -98,6 +98,8 @@ class StringSequenceBase : public StringSequence {
     }
     virtual StringSequenceBase* capitalize();
     virtual StringSequenceBase* concat(StringSequenceBase* other);
+    virtual StringSequenceBase* concat2(std::string other);
+    virtual StringSequenceBase* concat_reverse(std::string other);
     virtual StringSequenceBase* pad(int width, std::string fillchar, bool left, bool right);
     virtual StringSequenceBase* lower();
     virtual StringSequenceBase* upper();
@@ -271,7 +273,7 @@ class StringSequenceBase : public StringSequence {
         }
         return std::move(matches);
     }
-     py::object match(const std::string pattern) {
+    py::object match(const std::string pattern) {
          // same as search, but stricter (full regex should match)
         py::array_t<bool> matches(length);
         auto m = matches.mutable_unchecked<1>();
@@ -296,6 +298,108 @@ class StringSequenceBase : public StringSequence {
                     bool match = regex_match(str, rex);
                 #endif
                 m(i) = match;
+            }
+        }
+        return std::move(matches);
+    }
+    py::object equals(const std::string other) {
+        py::array_t<bool> matches(length);
+        auto m = matches.mutable_unchecked<1>();
+        {
+            py::gil_scoped_release release;
+            if(has_null()){
+                for(size_t i = 0; i < length; i++) {
+                    if(is_null(i)) {
+                        m(i) = false;
+                    } else {
+                        #if defined(_MSC_VER)
+                            auto str = get(i);
+                            bool match = str == other;
+                        #else
+                            auto str = view(i);
+                            bool match = str == other;
+                        #endif
+                        m(i) = match;
+                    }
+                }
+            } else {
+                for(size_t i = 0; i < length; i++) {
+                    #if defined(_MSC_VER)
+                        auto str = get(i);
+                        bool match = str == other;
+                    #else
+                        auto str = view(i);
+                        bool match = str == other;
+                    #endif
+                    m(i) = match;
+                }
+            }
+        }
+        return std::move(matches);
+    }
+    py::object equals2(const StringSequence* others) {
+        py::array_t<bool> matches(length);
+        if(length != others->length) {
+            throw pybind11::index_error("equals should have equal string array lengths");
+        }
+        auto m = matches.mutable_unchecked<1>();
+        {
+            py::gil_scoped_release release;
+            if(has_null() || others->has_null()) {
+                for(size_t i = 0; i < length; i++) {
+                    if(is_null(i) || others->is_null(i)) {
+                        m(i) = false;
+                    } else {
+                        auto str = view(i);
+                        auto other = others->view(i);
+                        bool match = str == other;
+                        m(i) = match;
+                    }
+                }
+            } else {
+                for(size_t i = 0; i < length; i++) {
+                    auto str = view(i);
+                    auto other = others->view(i);
+                    bool match = str == other;
+                    m(i) = match;
+                }
+            }
+        }
+        return std::move(matches);
+    }
+    py::object isin(const StringSequence* others) {
+        py::array_t<bool> matches(length);
+        auto m = matches.mutable_unchecked<1>();
+        {
+            py::gil_scoped_release release;
+            if(has_null() || others->has_null()) {
+                for(size_t i = 0; i < length; i++) {
+                    bool found = false;
+                    if(is_null(i)) {
+                        auto str = view(i);
+                        for(size_t j = 0; j < others->length; j++) {
+                            if(others->is_null(j)) {
+                                auto other = others->view(j);
+                                found = str == other;
+                                if(found)
+                                    break;
+                            }
+                        }
+                    }
+                    m(i) = found;
+                }
+            } else {
+                for(size_t i = 0; i < length; i++) {
+                    auto str = view(i);
+                    bool found = false;
+                    for(size_t j = 0; j < others->length; j++) {
+                        auto other = others->view(j);
+                        found = str == other;
+                        if(found)
+                            break;
+                    }
+                    m(i) = found;
+                }
             }
         }
         return std::move(matches);
@@ -856,7 +960,7 @@ StringSequenceBase* _apply_seq(StringSequenceBase* _this, W word_transform) {
         list->indices[i] = target - list->bytes;
         string_view source = _this->view(i);
         word_transform(source, target);
-        if(_this->is_null(i)) {
+        if(!list->null_bitmap && _this->is_null(i)) { // if _this a StringArray, we did not copy the nullmap
             list->ensure_null_bitmap();
             list->set_null(i);
         }
@@ -1049,7 +1153,7 @@ StringSequenceBase* _apply2(StringSequenceBase* _this, W word_transform) {
         list->indices[i] = appender.offset();
         string_view source = _this->view(i);
         word_transform(source, appender);
-        if(_this->is_null(i)) {
+        if(!list->null_bitmap && _this->is_null(i)) { // if _this a StringArray, we did not copy the nullmap
             list->ensure_null_bitmap();
             list->set_null(i);
         }
@@ -1216,6 +1320,53 @@ StringSequenceBase* StringSequenceBase::concat(StringSequenceBase* other) {
             byte_offset += str1.length();
             std::copy(str2.begin(), str2.end(), sl->bytes + byte_offset);
             byte_offset += str2.length();
+        }
+    }
+    sl->indices[length] = byte_offset;
+    return sl;
+}
+
+
+StringSequenceBase* StringSequenceBase::concat2(std::string other) {
+    py::gil_scoped_release release;
+    size_t other_length = other.length();
+    StringList64* sl = new StringList64(this->byte_size() + other_length * length, length);
+    size_t byte_offset = 0;
+    for(size_t i = 0; i < length; i++) {
+        sl->indices[i] = byte_offset;
+        if(this->is_null(i)) {
+            if(sl->null_bitmap == nullptr)
+                sl->add_null_bitmap();
+            sl->set_null(i);
+        } else {
+            string_view str1 = this->view(i);
+            std::copy(str1.begin(), str1.end(), sl->bytes + byte_offset);
+            byte_offset += str1.length();
+            std::copy(other.begin(), other.end(), sl->bytes + byte_offset);
+            byte_offset += other_length;
+        }
+    }
+    sl->indices[length] = byte_offset;
+    return sl;
+}
+
+StringSequenceBase* StringSequenceBase::concat_reverse(std::string other) {
+    py::gil_scoped_release release;
+    size_t other_length = other.length();
+    StringList64* sl = new StringList64(this->byte_size() + other_length * length, length);
+    size_t byte_offset = 0;
+    for(size_t i = 0; i < length; i++) {
+        sl->indices[i] = byte_offset;
+        if(this->is_null(i)) {
+            if(sl->null_bitmap == nullptr)
+                sl->add_null_bitmap();
+            sl->set_null(i);
+        } else {
+            std::copy(other.begin(), other.end(), sl->bytes + byte_offset);
+            byte_offset += other_length;
+            string_view str1 = this->view(i);
+            std::copy(str1.begin(), str1.end(), sl->bytes + byte_offset);
+            byte_offset += str1.length();
         }
     }
     sl->indices[length] = byte_offset;
@@ -1502,7 +1653,7 @@ const char* empty = "";
 
 class StringArray : public StringSequenceBase {
 public:
-    StringArray(PyObject** object_array, size_t length) : StringSequenceBase(length), _byte_size(0), _has_null(false) {
+    StringArray(PyObject** object_array, size_t length, uint8_t* byte_mask=nullptr) : StringSequenceBase(length), _byte_size(0), _has_null(false) {
         #if PY_MAJOR_VERSION == 2
             utf8_objects = (PyObject**)malloc(length * sizeof(void*));
         #endif
@@ -1513,7 +1664,7 @@ public:
             objects[i] = object_array[i];
             Py_IncRef(objects[i]);
             #if PY_MAJOR_VERSION == 3
-                if(PyUnicode_CheckExact(object_array[i])) {
+                if(PyUnicode_CheckExact(object_array[i]) && ((byte_mask == nullptr) || (byte_mask[i] == 0))) {
                     // python37 declares as const
                     strings[i] = (char*)PyUnicode_AsUTF8AndSize(object_array[i], &sizes[i]);
                 } else {
@@ -1522,12 +1673,12 @@ public:
                     sizes[i] = 0;
                 }
             #else
-                if(PyUnicode_CheckExact(object_array[i])) {
+                if(PyUnicode_CheckExact(object_array[i]) && ((byte_mask == nullptr) || (byte_mask[i] == 0))) {
                     // if unicode, first convert to utf8
                     utf8_objects[i] = PyUnicode_AsUTF8String(object_array[i]);
                     sizes[i] = PyString_Size(utf8_objects[i]);
                     strings[i] = PyString_AsString(utf8_objects[i]);
-                } else if(PyString_CheckExact(object_array[i])) {
+                } else if(PyString_CheckExact(object_array[i]) && ((byte_mask == nullptr) || (byte_mask[i] == 0))) {
                     // otherwise directly use
                     utf8_objects[i] = 0;
                     sizes[i] = PyString_Size(object_array[i]);
@@ -1750,7 +1901,7 @@ void add_string_list(Module m, Base& base, const char* class_name) {
         )
         // same ctor, duplicate code, cannot make null_bitmap accept None
         .def(py::init([](py::buffer bytes, py::array_t<typename StringList::index_type, py::array::c_style>& indices, size_t string_count, size_t offset,
-                py::array_t<uint8_t, py::array::c_style> null_bitmap) {
+                py::array_t<uint8_t, py::array::c_style> null_bitmap, size_t null_offset) {
                 py::buffer_info bytes_info = bytes.request();
                 py::buffer_info indices_info = indices.request();
                 if(bytes_info.ndim != 1) {
@@ -1768,7 +1919,7 @@ void add_string_list(Module m, Base& base, const char* class_name) {
                     null_bitmap_ptr = (uint8_t*)null_bitmap_info.ptr;
                 }
                 return new StringList((char*)bytes_info.ptr, bytes_info.shape[0],
-                                   (typename StringList::index_type*)indices_info.ptr, string_count, offset, null_bitmap_ptr
+                                   (typename StringList::index_type*)indices_info.ptr, string_count, offset, null_bitmap_ptr, null_offset
                                   );
             }), py::keep_alive<1, 2>(), py::keep_alive<1, 3>() // keep a reference to the ndarrays
         )
@@ -1873,6 +2024,34 @@ StringList64* format(py::array_t<T, py::array::c_style> values_, const char* for
     }
 }
 
+StringList64* format_string(StringSequence* values, const char* format) {
+    size_t length = values->length;
+    {
+        py::gil_scoped_release release;
+        StringList64* sl = new StringList64(length*2, length);
+        size_t byte_offset = 0;
+        for(size_t i = 0; i < length; i++) {
+            sl->indices[i] = byte_offset;
+            bool done = false;
+            int ret;
+            while(!done) {
+                int64_t bytes_left = sl->byte_length - byte_offset;
+                auto value = values->get(i);
+                ret = snprintf(sl->bytes + byte_offset, bytes_left, format, value.c_str());
+                if(ret < 0) {
+                    throw std::runtime_error("Invalid format");
+                } else if(ret < bytes_left) {
+                    done = true;
+                    byte_offset += strlen(sl->bytes + byte_offset);
+                } else {
+                    sl->grow();
+                }
+            }
+        }
+        sl->indices[length] = byte_offset;
+        return sl;
+    }
+}
 
 PYBIND11_MODULE(superstrings, m) {
     _import_array();
@@ -1893,14 +2072,19 @@ PYBIND11_MODULE(superstrings, m) {
         .def("tolist", &StringSequenceBase::tolist)
         .def("capitalize", &StringSequenceBase::capitalize, py::keep_alive<0, 1>())
         .def("concat", &StringSequenceBase::concat)
+        .def("concat_reverse", &StringSequenceBase::concat_reverse)
+        .def("concat", &StringSequenceBase::concat2)
         .def("pad", &StringSequenceBase::pad)
         .def("search", &StringSequenceBase::search, "Tests if strings contains pattern", py::arg("pattern"), py::arg("regex"))//, py::call_guard<py::gil_scoped_release>())
         .def("count", &StringSequenceBase::count, "Count occurrences of pattern", py::arg("pattern"), py::arg("regex"))
         .def("upper", &StringSequenceBase::upper)
         .def("endswith", &StringSequenceBase::endswith)
         .def("find", &StringSequenceBase::find)
+        .def("isin", &StringSequenceBase::isin)
         .def("lower", &StringSequenceBase::lower)
         .def("match", &StringSequenceBase::match, "Tests if strings matches regex", py::arg("pattern"))
+        .def("equals", &StringSequenceBase::equals, "Tests if strings are equal")
+        .def("equals", &StringSequenceBase::equals2, "Tests if strings are equal")
         .def("lstrip", &StringSequenceBase::lstrip)
         .def("rstrip", &StringSequenceBase::rstrip)
         .def("repeat", &StringSequenceBase::repeat)
@@ -1963,6 +2147,20 @@ PYBIND11_MODULE(superstrings, m) {
                     new StringArray((PyObject**)info.ptr, info.shape[0]));
             }) // no need to keep a reference to the ndarrays
         )
+        .def(py::init([](py::buffer string_array, py::buffer mask_array) {
+                py::buffer_info info = string_array.request();
+                py::buffer_info mask_info = mask_array.request();
+                if(info.ndim != 1) {
+                    throw std::runtime_error("Expected a 1d byte buffer");
+                }
+                if(info.format != "O") {
+                    throw std::runtime_error("Expected an object array");
+                }
+                // std::cout << info.format << " format" << std::endl;
+                return std::unique_ptr<StringArray>(
+                    new StringArray((PyObject**)info.ptr, info.shape[0], (uint8_t*)mask_info.ptr));
+            }) // no need to keep a reference to the ndarrays
+        )
         .def("to_arrow", &StringArray::to_arrow) // nothing to keep alive, all a copy
         // .def("get", &StringArray::get_)
         // .def("get", (const std::string (StringArray::*)(int64_t))&StringArray::get)
@@ -1990,6 +2188,25 @@ PYBIND11_MODULE(superstrings, m) {
         ;
     m.def("to_string", &to_string<float>);
     m.def("to_string", &to_string<double>);
+    m.def("to_string", &to_string<int64_t>);
+    m.def("to_string", &to_string<int32_t>);
+    m.def("to_string", &to_string<int16_t>);
+    m.def("to_string", &to_string<int8_t>);
+    m.def("to_string", &to_string<uint64_t>);
+    m.def("to_string", &to_string<uint32_t>);
+    m.def("to_string", &to_string<uint16_t>);
+    m.def("to_string", &to_string<uint8_t>);
+    m.def("to_string", &to_string<bool>);
     m.def("format", &format<float>);
     m.def("format", &format<double>);
+    m.def("format", &format<int64_t>);
+    m.def("format", &format<int32_t>);
+    m.def("format", &format<int16_t>);
+    m.def("format", &format<int8_t>);
+    m.def("format", &format<uint64_t>);
+    m.def("format", &format<uint32_t>);
+    m.def("format", &format<uint16_t>);
+    m.def("format", &format<uint8_t>);
+    m.def("format", &format<bool>);
+    m.def("format", &format_string);
 }

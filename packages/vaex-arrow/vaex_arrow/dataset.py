@@ -23,19 +23,32 @@ class DatasetArrow(vaex.dataset.DatasetLocal):
 
     def _load(self):
         source = pa.memory_map(self.path)
-        reader = pa.ipc.open_stream(source)
-        table = pa.Table.from_batches([b for b in reader])
+        try:
+            # first we try if it opens as stream
+            reader = pa.ipc.open_stream(source)
+        except pa.lib.ArrowInvalid:
+            # if not, we open as file
+            reader = pa.ipc.open_file(source)
+            # for some reason this reader is not iterable
+            batches = [reader.get_batch(i) for i in range(reader.num_record_batches)]
+        else:
+            # if a stream, we're good
+            batches = reader  # this reader is iterable
+        table = pa.Table.from_batches(batches)
         self._load_table(table)
     
     def _load_table(self, table):
-        self._length_unfiltered =  self._length_original = table.num_rows
-        self._index_end =  self._length_original = table.num_rows
-        for col in table.columns:
-            name = col.name
+        self._length_unfiltered = self._length_original = table.num_rows
+        self._index_end = self._length_original = table.num_rows
+        for col, name in zip(table.columns, table.schema.names):
             # TODO: keep the arrow columns, and support and test chunks
-            arrow_array = col.data.chunks[0]
-            column = column_from_arrow_array(arrow_array)
-
+            arrow_array = col.chunk(0)
+            if isinstance(arrow_array.type, pa.DictionaryType):
+                column = column_from_arrow_array(arrow_array.indices)
+                labels = column_from_arrow_array(arrow_array.dictionary).tolist()
+                self._categories[name] = dict(labels=labels, N=len(labels))
+            else:
+                column = column_from_arrow_array(arrow_array)
             self.columns[name] = column
             self.column_names.append(name)
             self._save_assign_expression(name, vaex.expression.Expression(self, name))

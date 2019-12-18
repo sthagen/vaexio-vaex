@@ -1,9 +1,11 @@
+import ast
 import base64
 import cloudpickle as pickle
 import functools
 import operator
 import six
 import collections
+import weakref
 
 from future.utils import with_metaclass
 import numpy as np
@@ -89,24 +91,50 @@ class Meta(type):
                 def f(a, b):
                     self = a
                     # print(op, a, b)
-                    if isinstance(b, Expression):
-                        assert b.ds == a.ds
-                        b = b.expression
-                    elif isinstance(b, (np.timedelta64)):
-                        df = a.ds
-                        b = df.add_variable('var_time_delta', b, unique=True)
-                    expression = '({0} {1} {2})'.format(a.expression, op['code'], b)
+                    try:
+                        stringy = isinstance(b, str_type) or (isinstance(b, Expression) and b.dtype == str_type)
+                    except:
+                        # this can happen when expression is a literal, like '1' (used in propagate_unc)
+                        # which causes the dtype to fail
+                        stringy = False
+                    if stringy:
+                        if isinstance(b, str_type):
+                            b = repr(b)
+                        if op['code'] == '==':
+                            expression = 'str_equals({0}, {1})'.format(a.expression, b)
+                        elif op['code'] == '+':
+                            expression = 'str_cat({0}, {1})'.format(a.expression, b)
+                        else:
+                            raise ValueError('operand %r not supported for string comparison' % op['code'])
+                        return Expression(self.ds, expression=expression)
+                    else:
+                        if isinstance(b, Expression):
+                            assert b.ds == a.ds
+                            b = b.expression
+                        elif isinstance(b, (np.timedelta64)):
+                            df = a.ds
+                            b = df.add_variable('var_time_delta', b, unique=True)
+                        elif isinstance(b, (np.datetime64)):
+                            df = a.ds
+                            b = df.add_variable('var_date_time', b, unique=True)
+                        expression = '({0} {1} {2})'.format(a.expression, op['code'], b)
                     return Expression(self.ds, expression=expression)
                 attrs['__%s__' % op['name']] = f
                 if op['name'] in reversable:
                     def f(a, b):
                         self = a
-                        # print(op, a, b)
-                        if isinstance(b, Expression):
-                            assert b.ds == a.ds
-                            b = b.expression
-                        expression = '({2} {1} {0})'.format(a.expression, op['code'], b)
-                        return Expression(self.ds, expression=expression)
+                        if isinstance(b, str):
+                            if op['code'] == '+':
+                                expression = 'str_cat({1}, {0})'.format(a.expression, repr(b))
+                            else:
+                                raise ValueError('operand %r not supported for string comparison' % op['code'])
+                            return Expression(self.ds, expression=expression)
+                        else:
+                            if isinstance(b, Expression):
+                                assert b.ds == a.ds
+                                b = b.expression
+                            expression = '({2} {1} {0})'.format(a.expression, op['code'], b)
+                            return Expression(self.ds, expression=expression)
                     attrs['__r%s__' % op['name']] = f
 
             wrap(op)
@@ -122,60 +150,178 @@ class Meta(type):
 
 
 class DateTime(object):
-    """DateTime operations"""
+    """DateTime operations
+
+    Usually accessed using e.g. `df.birthday.dt.dayofweek`
+    """
+    def __init__(self, expression):
+        self.expression = expression
+
+
+class TimeDelta(object):
+    """TimeDelta operations
+
+    Usually accessed using e.g. `df.delay.td.days`
+    """
     def __init__(self, expression):
         self.expression = expression
 
 
 class StringOperations(object):
-    """String operations"""
+    """String operations.
+
+    Usually accessed using e.g. `df.name.str.lower()`
+    """
     def __init__(self, expression):
         self.expression = expression
 
 
 class StringOperationsPandas(object):
-    """String operations using Pandas Series"""
+    """String operations using Pandas Series (much slower)"""
     def __init__(self, expression):
         self.expression = expression
 
 
 class Expression(with_metaclass(Meta)):
     """Expression class"""
-    def __init__(self, ds, expression):
+    def __init__(self, ds, expression, ast=None):
         self.ds = ds
         assert not isinstance(ds, Expression)
         if isinstance(expression, Expression):
             expression = expression.expression
-        self.expression = expression
+        self._ast = ast
+        self._expression = expression
+        self.df._expressions.append(weakref.ref(self))
+        self._ast_names = None
+
+    def copy(self, df=None):
+        """Efficiently copies an expression.
+
+        Expression objects have both a string and AST representation. Creating
+        the AST representation involves parsing the expression, which is expensive.
+
+        Using copy will deepcopy the AST when the expression was already parsed.
+
+        :param df: DataFrame for which the expression will be evaluated (self.df if None)
+        """
+        # expression either has _expression or _ast not None
+        if df is None:
+            df = self.df
+        if self._expression is not None:
+            expression = Expression(df, self._expression)
+            if self._ast is not None:
+                expression._ast = copy.deepcopy(self._ast)
+        elif self._ast is not None:
+            expression = Expression(df, copy.deepcopy(self._ast))
+            if self._ast is not None:
+                expression._ast = self._ast
+        return expression
+
+    @property
+    def ast(self):
+        """Returns the abstract syntax tree (AST) of the expression"""
+        if self._ast is None:
+            self._ast = expresso.parse_expression(self.expression)
+        return self._ast
+
+    @property
+    def ast_names(self):
+        if self._ast_names is None:
+            self._ast_names = expresso.names(self.ast)
+        return self._ast_names
+
+    @property
+    def expression(self):
+        if self._expression is None:
+            self._expression = expresso.node_to_string(self.ast)
+        return self._expression
+
+    @expression.setter
+    def expression(self, value):
+        # if we reassign to expression, we clear the ast cache
+        if value != self._expression:
+            self._expression = value
+            self._ast = None
+
+
+    @property
+    def df(self):
+        # lets gradually move to using .df
+        return self.ds
+
+    @property
+    def dtype(self):
+        return self.ds.dtype(self.expression)
+
+    @property
+    def shape(self):
+        return self.df._shape_of(self)
+
+    def to_numpy(self):
+        """Return a numpy representation of the data"""
+        values = self.values
+        if hasattr(values, 'to_numpy'):  # e.g. ColumnString
+            values = values.to_numpy()
+        return values
+
+    def to_dask_array(self, chunks="auto"):
+        import dask.array as da
+        import uuid
+        dtype = self.dtype
+        chunks = da.core.normalize_chunks(chunks, shape=self.shape, dtype=dtype)
+        name = 'vaex-expression-%s' % str(uuid.uuid1())
+        def getitem(df, item):
+            assert len(item) == 1
+            item = item[0]
+            start, stop, step = item.start, item.stop, item.step
+            assert step in [None, 1]
+            return self.evaluate(start, stop, parallel=False)
+        dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype)
+        dsk[name] = self
+        return da.Array(dsk, name, chunks, dtype=dtype)
+
+    def to_pandas_series(self):
+        """Return a pandas.Series representation of the expression.
+
+        Note: Pandas is likely to make a memory copy of the data.
+        """
+        import pandas as pd
+        return pd.Series(self.values)
 
     def __getitem__(self, slice):
         return self.ds[slice][self.expression]
 
+    def __abs__(self):
+        """Returns the absolute value of the expression"""
+        return self.abs()
+
     @property
     def dt(self):
+        """Gives access to datetime operations via :py:class:`DateTime`"""
         return DateTime(self)
 
     @property
+    def td(self):
+        """Gives access to timedelta operations via :py:class:`TimeDelta`"""
+        return TimeDelta(self)
+
+    @property
     def str(self):
-        """Gives access to string operations"""
+        """Gives access to string operations via :py:class:`StringOperations`"""
         return StringOperations(self)
 
     @property
     def str_pandas(self):
-        """Gives access to string operations (using Pandas Series)"""
+        """Gives access to string operations via :py:class:`StringOperationsPandas` (using Pandas Series)"""
         return StringOperationsPandas(self)
 
     @property
     def values(self):
         return self.evaluate()
 
-    @property
-    def dtype(self):
-        return self.ds.dtype(self.expression)
-
     def derivative(self, var, simplify=True):
         var = _ensure_string_from_expression(var)
-        return self.__class__(self.ds, expresso.derivative(self.expression, var, simplify=simplify))
+        return self.__class__(self.ds, expresso.derivative(self.ast, var, simplify=simplify))
 
     def expand(self, stop=[]):
         """Expand the expression such that no virtual columns occurs, only normal columns.
@@ -192,10 +338,10 @@ class Expression(with_metaclass(Meta)):
         def translate(id):
             if id in self.ds.virtual_columns and id not in stop:
                 return self.ds.virtual_columns[id]
-        expr = expresso.translate(self.expression, translate)
+        expr = expresso.translate(self.ast, translate)
         return Expression(self.ds, expr)
 
-    def variables(self):
+    def variables(self, ourself=False, expand_virtual=True, include_virtual=True):
         """Return a set of variables this expression depends on.
 
         Example:
@@ -209,12 +355,15 @@ class Expression(with_metaclass(Meta)):
         def record(varname):
             # do this recursively for virtual columns
             if varname in self.ds.virtual_columns and varname not in variables:
-                expresso.translate(self.ds.virtual_columns[varname], record)
-            # we don't want to record ourself
-            if varname != self.expression:
+                if (include_virtual and (varname != self.expression)) or (varname == self.expression and ourself):
+                    variables.add(varname)
+                if expand_virtual:
+                    expresso.translate(self.ds.virtual_columns[varname], record)
+            # we usually don't want to record ourself
+            elif varname != self.expression or ourself:
                 variables.add(varname)
 
-        expresso.translate(self.expression, record)
+        expresso.translate(self.ast, record)
         return variables
 
     def _graph(self):
@@ -397,14 +546,16 @@ class Expression(with_metaclass(Meta)):
         """Alias to df.is_masked(expression)"""
         return self.ds.is_masked(self.expression)
 
-    def value_counts(self, dropna=False, dropnull=True, ascending=False, progress=False):
+    def value_counts(self, dropna=False, dropnan=False, dropmissing=False, ascending=False, progress=False):
         """Computes counts of unique values.
 
          WARNING:
           * If the expression/column is not categorical, it will be converted on the fly
           * dropna is False by default, it is True by default in pandas
 
-        :param dropna: when True, it will not report the missing values
+        :param dropna: when True, it will not report the NA (see :func:`Expression.isna`)
+        :param dropnan: when True, it will not report the nans(see :func:`Expression.isnan`)
+        :param dropmissing: when True, it will not report the missing values (see :func:`Expression.ismissing`)
         :param ascending: when False (default) it will report the most frequent occuring item first
         :returns: Pandas series containing the counts
         """
@@ -450,23 +601,71 @@ class Expression(with_metaclass(Meta)):
             order = order[::-1]
         counts = counts[order]
         index = index[order]
-        if not dropna or not dropnull:
+        # nan can already be present for dtype=object, remove it
+        nan_mask = index != index
+        if np.any(nan_mask):
+            index = index[~mask]
+            counts = index[~mask]
+        # nan can already be present for dtype=object, optionally remove it
+        none_mask = index == None
+        if np.any(none_mask):
             index = index.tolist()
             counts = counts.tolist()
-            if not dropna and counter0.nan_count:
+            i = index.index(None)
+            if (dropmissing or dropna):
+                del index[i]
+                del counts[i]
+            else:
+                index[i] = "missing"
+            index = np.array(index)
+            counts = np.array(counts)
+
+        if not dropna or not dropnan or not dropmissing:
+            index = index.tolist()
+            counts = counts.tolist()
+            if not (dropnan or dropna) and counter0.nan_count:
                 index = [np.nan] + index
                 counts = [counter0.nan_count] + counts
-            if not dropnull and counter0.null_count:
-                index = ['null'] + index
+            if not (dropmissing or dropna) and counter0.null_count:
+                index = ['missing'] + index
                 counts = [counter0.null_count] + counts
 
         return Series(counts, index=index)
 
-    def unique(self):
-        return self.ds.unique(self.expression)
+    def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, delay=False):
+        """Returns all unique values.
 
-    def evaluate(self, i1=None, i2=None, out=None, selection=None):
-        return self.ds.evaluate(self, i1, i2, out=out, selection=selection)
+        :param dropmissing: do not count missing values
+        :param dropnan: do not count nan values
+        :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        """
+        return self.ds.unique(self.expression, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, delay=delay)
+
+    def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, delay=False):
+        """Counts number of unique values, i.e. `len(df.x.unique()) == df.x.nunique()`.
+
+        :param dropmissing: do not count missing values
+        :param dropnan: do not count nan values
+        :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        """
+        return len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, delay=delay))
+
+    def countna(self):
+        """Returns the number of Not Availiable (N/A) values in the expression.
+        This includes missing values and np.nan values.
+        """
+        return self.isna().astype('int').sum().item()  # so the output is int, not array
+
+    def countnan(self):
+        """Returns the number of NaN values in the expression."""
+        return self.isnan().astype('int').sum().item()  # so the output is int, not array
+
+    def countmissing(self):
+        """Returns the number of missing values in the expression."""
+        return self.ismissing().astype('int').sum().item()  # so the output is int, not array
+
+    def evaluate(self, i1=None, i2=None, out=None, selection=None, parallel=True):
+        return self.ds.evaluate(self, i1, i2, out=out, selection=selection, parallel=parallel)
 
     # TODO: it is not so elegant we need to have a custom version of this
     # it now also misses the docstring, reconsider how the the meta class auto
@@ -478,25 +677,14 @@ class Expression(with_metaclass(Meta)):
         return self.ds.func.clip(self, lower, upper)
 
     def jit_numba(self, verbose=False):
-        import imp
-        import hashlib
-        names = []
-        funcs = set(expression_namespace.keys())
-        # if it's a virtual column, we probably want to optimize that
-        # TODO: fully extract the virtual columns, i.e. depending ones?
-        expression = self.expression
-        if expression in self.ds.virtual_columns:
-            expression = self.ds.virtual_columns[self.expression]
-        all_vars = self.ds.get_column_names(virtual=True, strings=True, hidden=True) + list(self.ds.variables.keys())
-        vaex.expresso.validate_expression(expression, all_vars, funcs, names)
-        arguments = list(set(names))
-        argument_dtypes = [self.ds.dtype(argument) for argument in arguments]
-        # argument_dtypes = [getattr(np, dtype_name) for dtype_name in dtype_names]
-
-        # TODO: for now only float64 output supported
-        f = FunctionSerializableNumba(expression, arguments, argument_dtypes, return_dtype=np.dtype(np.float64))
+        f = FunctionSerializableNumba.build(self.expression, df=self.ds, verbose=verbose, compile=self.ds.is_local())
         function = self.ds.add_function('_jit', f, unique=True)
-        return function(*arguments)
+        return function(*f.arguments)
+
+    def jit_cuda(self, verbose=False):
+        f = FunctionSerializableCuda.build(self.expression, df=self.ds, verbose=verbose, compile=self.ds.is_local())
+        function = self.ds.add_function('_jit', f, unique=True)
+        return function(*f.arguments)
 
     def jit_pythran(self, verbose=False):
         import logging
@@ -541,20 +729,90 @@ def f({0}):
         finally:
                 logger.setLevel(log_level)
 
-    def _rename(self, old, new):
-        def translate(id):
-            if id == old:
-                return new
-        expr = expresso.translate(self.expression, translate)
-        return Expression(self.ds, expr)
+    def _rename(self, old, new, inplace=False):
+        expression = self if inplace else self.copy()
+        if old in expression.ast_names:
+            for node in expression.ast_names[old]:
+                node.id = new
+            expression._expression = None  # resets the cached string representation
+        return expression
 
     def astype(self, dtype):
-        return self.ds.func.astype(self, str(dtype))
+        if dtype == str:
+            return self.ds.func.astype(self, 'str')
+        else:
+            return self.ds.func.astype(self, str(dtype))
+
+    def isin(self, values):
+        """Lazily tests if each value in the expression is present in values.
+
+        :param values: List/array of values to check
+        :return: :class:`Expression` with the lazy expression.
+        """
+        if self.dtype == str_type:
+            values = vaex.column._to_string_sequence(values)
+        else:
+            values = np.array(values, dtype=self.dtype)
+        var = self.df.add_variable('isin_values', values, unique=True)
+        return self.df['isin(%s, %s)' % (self, var)]
 
     def apply(self, f):
+        """Apply a function along all values of an Expression.
+
+        Example:
+
+        >>> df = vaex.example()
+        >>> df.x
+        Expression = x
+        Length: 330,000 dtype: float64 (column)
+        ---------------------------------------
+             0  -0.777471
+             1    3.77427
+             2    1.37576
+             3   -7.06738
+             4   0.243441
+
+        >>> def func(x):
+        ...     return x**2
+
+        >>> df.x.apply(func)
+        Expression = lambda_function(x)
+        Length: 330,000 dtype: float64 (expression)
+        -------------------------------------------
+             0   0.604461
+             1    14.2451
+             2    1.89272
+             3    49.9478
+             4  0.0592637
+
+
+        :param f: A function to be applied on the Expression values
+        :returns: A function that is lazily evaluated when called.
+        """
         return self.ds.apply(f, [self.expression])
 
-    def map(self, mapper, nan_value=None, null_value=None, default_value=None, allow_missing=False):
+    def dropmissing(self):
+        # TODO: df.dropna does not support inplace
+        # df = self.df if inplace else self.df.copy()
+        df = self.ds
+        df = df.dropmissing(column_names=[self.expression])
+        return df._expr(self.expression)
+
+    def dropnan(self):
+        # TODO: df.dropna does not support inplace
+        # df = self.df if inplace else self.df.copy()
+        df = self.ds
+        df = df.dropnan(column_names=[self.expression])
+        return df._expr(self.expression)
+
+    def dropna(self):
+        # TODO: df.dropna does not support inplace
+        # df = self.df if inplace else self.df.copy()
+        df = self.ds
+        df = df.dropna(column_names=[self.expression])
+        return df._expr(self.expression)
+
+    def map(self, mapper, nan_value=None, missing_value=None, default_value=None, allow_missing=False):
         """Map values of an expression or in memory column accoring to an input
         dictionary or a custom callable function.
 
@@ -596,7 +854,7 @@ def f({0}):
         5       4  unknown
         :param mapper: dict like object used to map the values from keys to values
         :param nan_value: value to be used when a nan is present (and not in the mapper)
-        :param null_value: value to use used when there is a missing value
+        :param missing_value: value to use used when there is a missing value
         :param default_value: value to be used when a value is not in the mapper (like dict.get(key, default))
         :param allow_missing: used to signal that values in the mapper should map to a masked array with missing values,
             assumed True when default_value is not None.
@@ -660,7 +918,7 @@ def f({0}):
             else:
                 choices = [nan_value] + choices
         if key_set.has_null:
-            choices = [null_value] + choices
+            choices = [missing_value] + choices
         choices = np.array(choices)
 
         key_set_name = df.add_variable('map_key_set', key_set, unique=True)
@@ -673,6 +931,10 @@ def f({0}):
         else:
             expr = '_choose(_ordinal_values({}, {}), {})'.format(self, key_set_name, choices_name)
         return Expression(df, expr)
+
+    @property
+    def is_masked(self):
+        return self.ds.is_masked(self.expression)
 
 
 class FunctionSerializable(object):
@@ -699,17 +961,19 @@ class FunctionSerializablePickle(FunctionSerializable):
         return dict(pickled=pickled)
 
     @classmethod
-    def state_from(cls, state):
+    def state_from(cls, state, trusted=True):
         obj = cls()
-        obj.state_set(state)
+        obj.state_set(state, trusted=trusted)
         return obj
 
-    def state_set(self, state):
+    def state_set(self, state, trusted=True):
         data = state['pickled']
         if vaex.utils.PY2:
             data = base64.decodestring(data)
         else:
             data = base64.decodebytes(data.encode('ascii'))
+        if trusted is False:
+            raise ValueError("Will not unpickle data when source is not trusted")
         self.f = self.unpickle(data)
 
     def __call__(self, *args, **kwargs):
@@ -717,33 +981,19 @@ class FunctionSerializablePickle(FunctionSerializable):
         return self.f(*args, **kwargs)
 
 
-@vaex.serialize.register
-class FunctionSerializableNumba(FunctionSerializable):
-    def __init__(self, expression, arguments, argument_dtypes, return_dtype, verbose=False):
+class FunctionSerializableJit(FunctionSerializable):
+    def __init__(self, expression, arguments, argument_dtypes, return_dtype, verbose=False, compile=True):
         self.expression = expression
         self.arguments = arguments
         self.argument_dtypes = argument_dtypes
         self.return_dtype = return_dtype
         self.verbose = verbose
-        import numba
-        argument_dtypes_numba = [getattr(numba, argument_dtype.name) for argument_dtype in argument_dtypes]
-        argstring = ", ".join(arguments)
-        code = '''
-from numpy import *
-def f({0}):
-    return {1}'''.format(argstring, expression)
-        if verbose:
-            print('Generated code:\n' + code)
-        scope = {}
-        exec(code, scope)
-        f = scope['f']
-        return_dtype_numba = getattr(numba, return_dtype.name)
-        vectorizer = numba.vectorize([return_dtype_numba(*argument_dtypes_numba)])
-        self.f = vectorizer(f)
-
-    def __call__(self, *args, **kwargs):
-        '''Forward the call to the numba function'''
-        return self.f(*args, **kwargs)
+        if compile:
+            self.f = self.compile()
+        else:
+            def placeholder(*args, **kwargs):
+                raise Exception('You chose not to compile this function (locally), but did invoke it')
+            self.f = placeholder
 
     def state_get(self):
         return dict(expression=self.expression,
@@ -753,12 +1003,86 @@ def f({0}):
                     verbose=self.verbose)
 
     @classmethod
-    def state_from(cls, state):
+    def state_from(cls, state, trusted=True):
         return cls(expression=state['expression'],
                    arguments=state['arguments'],
                    argument_dtypes=list(map(np.dtype, state['argument_dtypes'])),
                    return_dtype=np.dtype(state['return_dtype']),
                    verbose=state['verbose'])
+
+    @classmethod
+    def build(cls, expression, df=None, verbose=False, compile=True):
+        df = df or expression.df
+        # if it's a virtual column, we probably want to optimize that
+        # TODO: fully extract the virtual columns, i.e. depending ones?
+        expression = str(expression)
+
+        if expression in df.virtual_columns:
+            expression = df.virtual_columns[expression]
+
+        # function validation, and finding variable names
+        all_vars = df.get_column_names(hidden=True) + list(df.variables.keys())
+        funcs = set(list(expression_namespace.keys()) + list(df.functions.keys()))
+        names = []
+        vaex.expresso.validate_expression(expression, all_vars, funcs, names)
+        # TODO: can we do the above using the Expressio API?s
+
+        arguments = list(set(names))
+        argument_dtypes = [df.dtype(argument) for argument in arguments]
+        return_dtype = df[expression].dtype
+        return cls(str(expression), arguments, argument_dtypes, return_dtype, verbose, compile=compile)
+
+    def __call__(self, *args, **kwargs):
+        '''Forward the call to the numba function'''
+        return self.f(*args, **kwargs)
+
+
+@vaex.serialize.register
+class FunctionSerializableNumba(FunctionSerializableJit):
+    def compile(self):
+        import numba
+        argstring = ", ".join(self.arguments)
+        code = '''
+from numpy import *
+def f({0}):
+    return {1}'''.format(argstring, self.expression)
+        if self.verbose:
+            print('Generated code:\n' + code)
+        scope = {}
+        exec(code, scope)
+        f = scope['f']
+
+        # numba part
+        argument_dtypes_numba = [getattr(numba, argument_dtype.name) for argument_dtype in self.argument_dtypes]
+        return_dtype_numba = getattr(numba, self.return_dtype.name)
+        vectorizer = numba.vectorize([return_dtype_numba(*argument_dtypes_numba)])
+        return vectorizer(f)
+
+
+@vaex.serialize.register
+class FunctionSerializableCuda(FunctionSerializableJit):
+    def compile(self):
+        import cupy
+        # code generation
+        argstring = ", ".join(self.arguments)
+        code = '''
+from cupy import *
+import cupy
+@fuse()
+def f({0}):
+    return {1}
+'''.format(argstring, self.expression)#, ";".join(conversions))
+        if self.verbose:
+            print("generated code")
+            print(code)
+        scope = dict()#cupy=cupy)
+        exec(code, scope)
+        func = scope['f']
+        def wrapper(*args):
+            args = [vaex.utils.to_native_array(arg) if isinstance(arg, np.ndarray) else arg for arg in args]
+            args = [cupy.asarray(arg) if isinstance(arg, np.ndarray) else arg for arg in args]
+            return cupy.asnumpy(func(*args))
+        return wrapper
 
 
 # TODO: this is not the right abstraction, since this won't allow a

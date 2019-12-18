@@ -80,6 +80,26 @@ def test_count_1d_ordinal():
     assert grid.tolist() == [0, 2, 1, 1, 0, 0, 1, 1]
 
 
+def test_minmax():
+    x = np.arange(1, 10, 1)
+    df = vaex.from_arrays(x=x)
+    assert df.x.min() == 1
+    assert df.x.max() == 9
+
+    assert df[(df.x > 3) & (df.x < 7)]['x'].min() == (4)
+    assert df[(df.x > 3) & (df.x < 7)]['x'].max() == (6)
+
+    df = vaex.from_arrays(x=-x)
+    assert df.x.max() == -1
+    assert df.x.min() == -9
+
+
+def test_minmax_all_dfs(df):
+    vmin, vmax = df.minmax(df.x)
+    assert df.min(df.x) == vmin
+    assert df.max(df.x) == vmax
+
+
 def test_big_endian_binning():
     x = np.arange(10, dtype='>f8')
     y = np.zeros(10, dtype='>f8')
@@ -116,9 +136,94 @@ def test_expr():
     assert counts.tolist() == np.ones(10).tolist()
 
 
-def test_big_endian_binning():
-    x = np.arange(10, dtype='>f8')
-    y = np.zeros(10, dtype='>f8')
-    ds = vaex.from_arrays(x=x, y=y)
-    counts = ds.count(binby=[ds.x, ds.y], limits=[[-0.5, 9.5], [-0.5, 0.5]], shape=[10, 1])
-    assert counts.ravel().tolist() == np.ones(10).tolist()
+def test_nunique():
+    s = ['aap', 'aap', 'noot', 'mies', None, 'mies', 'kees', 'mies', 'aap']
+    x = [0,     0,     0,      0,      0,     1,      1,     1,      2]
+    df = vaex.from_arrays(x=x, s=s)
+    dfg = df.groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 4), (1, 2), (2, 1)]
+
+    dfg = df.groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s, dropmissing=True)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 3), (1, 2), (2, 1)]
+
+    # we just map the strings to floats, to have the same test for floats/primitives
+    mapping = {'aap': 1.2, 'noot': 2.5, 'mies': 3.7, 'kees': 4.8, None: np.nan}
+    s = np.array([mapping[k] for k in s], dtype=np.float64)
+    df = vaex.from_arrays(x=x, s=s)
+    dfg = df.groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 4), (1, 2), (2, 1)]
+
+    dfg = df.groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s, dropnan=True)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 3), (1, 2), (2, 1)]
+
+
+def test_nunique_filtered():
+    s = ['aap', 'aap', 'noot', 'mies', None, 'mies', 'kees', 'mies', 'aap']
+    x = [0,     0,     0,      0,      0,     1,      1,     1,      2]
+    y = [1,     1,     0,      1,      0,     0,      0,     1,      1]
+    df = vaex.from_arrays(x=x, s=s, y=y)
+    dfg = df[df.y==0].groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 2), (1, 2)]
+
+    # we just map the strings to floats, to have the same test for floats/primitives
+    mapping = {'aap': 1.2, 'noot': 2.5, 'mies': 3.7, 'kees': 4.8, None: np.nan}
+    s = np.array([mapping[k] for k in s], dtype=np.float64)
+    df = vaex.from_arrays(x=x, s=s, y=y)
+    dfg = df[df.y==0].groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items == [(0, 2), (1, 2)]
+
+
+def test_unique_missing_groupby():
+    s = ['aap', 'aap', 'noot', 'mies', None, 'mies', 'kees', 'mies', 'aap']
+    x = [0,     0,     0,      np.nan,      np.nan,     1,      1,     np.nan,      2]
+    df = vaex.from_arrays(x=x, s=s)
+    dfg = df.groupby(df.x, agg={'nunique': vaex.agg.nunique(df.s)}).sort(df.x)
+    items = list(zip(dfg.x.values, dfg.nunique.values))
+    assert items[:-1] == [(0, 2), (1, 2), (2, 1)]
+
+def test_agg_selections():
+    x = np.array([0, 0, 0, 1, 1, 2, 2])
+    y = np.array([1, 3, 5, 1, 7, 1, -1])
+    z = np.array([0, 2, 3, 4, 5, 6, 7])
+    w = np.array(['dog', 'cat', 'mouse', 'dog', 'dog', 'dog', 'cat'])
+
+    df = vaex.from_arrays(x=x, y=y, z=z, w=w)
+
+    df_grouped = df.groupby(df.x).agg({'count': vaex.agg.count(selection='y<=3'),
+                                   'z_sum_selected': vaex.agg.sum(expression=df.z, selection='y<=3'),
+                                   'z_mean_selected': vaex.agg.mean(expression=df.z, selection=df.y <= 3),
+                                   'w_nuniqe_selected': vaex.agg.nunique(expression=df.w, selection=df.y <= 3, dropna=True)
+                                  }).sort('x')
+
+    assert df_grouped['count'].tolist() == [2, 1, 2]
+    assert df_grouped['z_sum_selected'].tolist() == [2, 4, 13]
+    assert df_grouped['z_mean_selected'].tolist() == [1, 4, 6.5]
+    assert df_grouped['w_nuniqe_selected'].tolist() == [2, 1, 2]
+
+def test_upcast():
+    df = vaex.from_arrays(b=[False, True, True], i8=np.array([120, 121, 122], dtype=np.int8),
+        f4=np.array([1, 1e-13, 1], dtype=np.float32))
+    assert df.b.sum() == 2
+    assert df.i8.sum() == 120*3 + 3
+    assert df.f4.sum() == (2 + 1e-13)
+
+    assert abs(df.b.var() - (0.2222)) < 0.01
+
+
+def test_agg_filtered_df_invalid_data():
+    # Custom function to be applied to a filtered DataFrame
+    def custom_func(x):
+        assert 4 not in x; return x**2
+
+    df = vaex.from_arrays(x=np.arange(10))
+    df_filtered = df[df.x!=4]
+    df_filtered.add_function('custom_function', custom_func)
+    df_filtered['y'] = df_filtered.func.custom_function(df_filtered.x)
+    # assert df_filtered.y.tolist() == [0, 1, 4, 9, 25, 36, 49, 64, 81]
+    assert df_filtered.count(df_filtered.y) == 9

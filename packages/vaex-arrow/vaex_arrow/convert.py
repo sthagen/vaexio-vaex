@@ -8,15 +8,14 @@ def arrow_array_from_numpy_array(array):
     mask = None
     if np.ma.isMaskedArray(array):
         mask = array.mask
+        array = array.data
     if dtype.kind == 'S':
         type = pyarrow.binary(dtype.itemsize)
         arrow_array = pyarrow.array(array, type, mask=mask)
     else:
-        if dtype.isnative:
-            arrow_array = pyarrow.array(array, mask=mask)
-        else:
-            # TODO: we copy here, but I guess we should not... or give some warning
-            arrow_array = pyarrow.array(array.astype(dtype.newbyteorder('=')), mask=mask)
+        if not dtype.isnative:
+            array = array.astype(dtype.newbyteorder('='))
+        arrow_array = pyarrow.Array.from_pandas(array, mask=mask)
     return arrow_array
 
 from vaex.dataframe import Column
@@ -34,7 +33,10 @@ def column_from_arrow_array(arrow_array):
         else:
             null_bitmap = np.frombuffer(bitmap_buffer, 'uint8', len(bitmap_buffer))
         offsets = np.frombuffer(offsets, np.int32, len(offsets)//4)
-        string_bytes = np.frombuffer(string_bytes, 'S1', len(string_bytes))
+        if string_bytes is None:
+            string_bytes = np.array([], dtype='S1')
+        else:
+            string_bytes = np.frombuffer(string_bytes, 'S1', len(string_bytes))
         column = ColumnStringArrow(offsets, string_bytes, len(arrow_array), null_bitmap=null_bitmap)
         return column
     else:

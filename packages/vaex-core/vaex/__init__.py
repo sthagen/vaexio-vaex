@@ -118,8 +118,8 @@ def open(path, convert=False, shuffle=False, copy_index=True, *args, **kwargs):
 
     Example:
 
-    >>> ds = vaex.open('sometable.hdf5')
-    >>> ds = vaex.open('somedata*.csv', convert='bigdata.hdf5')
+    >>> df = vaex.open('sometable.hdf5')
+    >>> df = vaex.open('somedata*.csv', convert='bigdata.hdf5')
 
     :param str or list path: local or absolute path to file, or glob string, or list of paths
     :param convert: convert files to an hdf5 file for optimization, can also be a path
@@ -130,6 +130,24 @@ def open(path, convert=False, shuffle=False, copy_index=True, *args, **kwargs):
     :return: return a DataFrame on succes, otherwise None
     :rtype: DataFrame
 
+    S3 support:
+
+    Vaex supports streaming in hdf5 files from Amazon AWS object storage S3.
+    Files are by default cached in $HOME/.vaex/file-cache/s3 such that successive access
+    it as fast as native disk access. The following url parameters control S3 options:
+
+     * anon: Use anonymous access or not (false by default). (Allowed values are: true,True,1,false,False,0)
+     * use_cache: Use the disk cache or not, only set to false if the data should be accessed once. (Allowed values are: true,True,1,false,False,0)
+     * profile_name and other arguments are passed to :py:class:`s3fs.core.S3FileSystem`
+
+    All arguments can also be passed as kwargs, but then arguments such as `anon` can only be a boolean, not a string.
+
+    Examples:
+
+    >>> df = vaex.open('s3://vaex/taxi/yellow_taxi_2015_f32s.hdf5?anon=true')
+    >>> df = vaex.open('s3://vaex/taxi/yellow_taxi_2015_f32s.hdf5', anon=True)  # Note that anon is a boolean, not the string 'true'
+    >>> df = vaex.open('s3://mybucket/path/to/file.hdf5?profile_name=myprofile')
+
     """
     import vaex
     try:
@@ -137,6 +155,14 @@ def open(path, convert=False, shuffle=False, copy_index=True, *args, **kwargs):
             path = aliases[path]
         if path.startswith("http://") or path.startswith("ws://"):  # TODO: think about https and wss
             server, name = path.rsplit("/", 1)
+            url = urlparse(path)
+            if '?' in name:
+                name = name[:name.index('?')]
+            extra_args = {key: values[0] for key, values in parse_qs(url.query).items()}
+            if 'token' in extra_args:
+                kwargs['token'] = extra_args['token']
+            if 'token_trusted' in extra_args:
+                kwargs['token_trusted'] = extra_args['token_trusted']
             server = vaex.server(server, **kwargs)
             dataframe_map = server.datasets(as_dict=True)
             if name not in dataframe_map:
@@ -177,16 +203,16 @@ def open(path, convert=False, shuffle=False, copy_index=True, *args, **kwargs):
                     else:
                         ds = vaex.file.open(filename_hdf5, *args, **kwargs)
                 else:
-                    if ext == '.csv':  # special support for csv.. should probably approach it a different way
+                    if ext == '.csv' or naked_path.endswith(".csv.bz2"):  # special support for csv.. should probably approach it a different way
                         ds = from_csv(path, copy_index=copy_index, **kwargs)
                     else:
                         ds = vaex.file.open(path, *args, **kwargs)
-                    if convert:
+                    if convert and ds:
                         ds.export_hdf5(filename_hdf5, shuffle=shuffle)
                         ds = vaex.file.open(filename_hdf5) # argument were meant for pandas?
                 if ds is None:
                     if os.path.exists(path):
-                        raise IOError('Could not open file: {}, did you install vaex-hdf5?'.format(path))
+                        raise IOError('Could not open file: {}, did you install vaex-hdf5? Is the format supported?'.format(path))
                     if os.path.exists(path):
                         raise IOError('Could not open file: {}, it does not exist?'.format(path))
             elif len(filenames) > 1:
@@ -366,10 +392,14 @@ def from_pandas(df, name="pandas", copy_index=True, index_name="index"):
     :rtype: DataFrame
     """
     import six
+    import pandas as pd
+    import numpy as np
     vaex_df = vaex.dataframe.DataFrameArrays(name)
 
     def add(name, column):
         values = column.values
+        if isinstance(values, pd.core.arrays.integer.IntegerArray):
+            values = np.ma.array(values._data, mask=values._mask)
         try:
             vaex_df.add_column(name, values)
         except Exception as e:
@@ -509,9 +539,9 @@ aliases = vaex.settings.main.auto_store_dict("aliases")
 
 # py2/p3 compatibility
 try:
-    from urllib.parse import urlparse
+    from urllib.parse import urlparse, parse_qs
 except ImportError:
-    from urlparse import urlparse
+    from urlparse import urlparse, parse_qs
 
 
 def server(url, **kwargs):
@@ -596,19 +626,93 @@ if os.path.exists(import_script):
             exec(code)
     except:
         import traceback
-        traceback.print_tb()
+        traceback.print_stack()
 
 
 logger = logging.getLogger('vaex')
 
 
+def register_dataframe_accessor(name, cls=None, override=False):
+    """Registers a new accessor for a dataframe
+
+    See vaex.geo for an example.
+    """
+    def wrapper(cls):
+        old_value = getattr(vaex.dataframe.DataFrame, name, None)
+        if old_value is not None and override is False:
+            raise ValueError("DataFrame already has a property/accessor named %r (%r)" % (name, old_value) )
+
+        def get_accessor(self):
+            if name in self.__dict__:
+                return self.__dict__[name]
+            else:
+                self.__dict__[name] = cls(self)
+            return self.__dict__[name]
+        setattr(vaex.dataframe.DataFrame, name, property(get_accessor))
+        return cls
+    if cls is None:
+        return wrapper
+    else:
+        return wrapper(cls)
+
+
 for entry in pkg_resources.iter_entry_points(group='vaex.namespace'):
-    logger.debug('adding vaex namespace: ' + entry.name)
+    logger.warning('(DEPRECATED, use vaex.dataframe.accessor) adding vaex namespace: ' + entry.name)
     try:
         add_namespace = entry.load()
         add_namespace()
     except Exception:
         logger.exception('issue loading ' + entry.name)
+
+_df_lazy_accessors = {}
+
+
+class _lazy_accessor(object):
+    def __init__(self, name, scope, loader):
+        """When adding an accessor geo.cone, scope=='geo', name='cone', scope may be falsy"""
+        self.loader = loader
+        self.name = name
+        self.scope = scope
+
+    def __call__(self, obj):
+        if self.name in obj.__dict__:
+            return obj.__dict__[self.name]
+        else:
+            cls = self.loader()
+            accessor = cls(obj)
+            obj.__dict__[self.name] = accessor
+            fullname = self.name
+            if self.scope:
+                fullname = self.scope + '.' + self.name
+            if fullname in _df_lazy_accessors:
+                for name, scope, loader in _df_lazy_accessors[fullname]:
+                    assert fullname == scope
+                    setattr(cls, name, property(_lazy_accessor(name, scope, loader)))
+        return obj.__dict__[self.name]
+
+
+def _add_lazy_accessor(name, loader, target_class=vaex.dataframe.DataFrame):
+    """Internal use see tests/internal/accessor_test.py for usage
+
+    This enables us to have df.foo.bar accessors that lazily loads the modules.
+    """
+    parts = name.split('.')
+    target_class = vaex.dataframe.DataFrame
+    if len(parts) == 1:
+        setattr(target_class, parts[0], property(_lazy_accessor(name, None, loader)))
+    else:
+        scope = ".".join(parts[:-1])
+        if scope not in _df_lazy_accessors:
+            _df_lazy_accessors[scope] = []
+        _df_lazy_accessors[scope].append((parts[-1], scope, loader))
+
+
+for entry in pkg_resources.iter_entry_points(group='vaex.dataframe.accessor'):
+    logger.debug('adding vaex accessor: ' + entry.name)
+    def loader(entry=entry):
+        return entry.load()
+    _add_lazy_accessor(entry.name, loader)
+
 
 for entry in pkg_resources.iter_entry_points(group='vaex.plugin'):
     logger.debug('adding vaex plugin: ' + entry.name)

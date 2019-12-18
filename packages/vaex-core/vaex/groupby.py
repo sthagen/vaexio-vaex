@@ -99,7 +99,10 @@ class Grouper(BinnerBase):
         self.N = len(self.set.keys())
         if self.set.has_null:
             self.N += 1
-            keys += ['null']
+            self.bin_values = ['null'] + self.bin_values
+        if self.set.has_nan:
+            self.N += 1
+            self.bin_values = [np.nan] + self.bin_values
         self.binner = self.df._binner_ordinal(self.binby_expression, self.N)
 
 
@@ -107,7 +110,7 @@ class GroupByBase(object):
     def __init__(self, df, by):
         self.df = df
 
-        if not isinstance(by, collections.Iterable)\
+        if not isinstance(by, collections_abc.Iterable)\
             or isinstance(by, six.string_types):
             by = [by]
 
@@ -130,9 +133,9 @@ class GroupByBase(object):
 
     def _agg(self, actions):
         df = self.df
-        if isinstance(actions, collections.Mapping):
+        if isinstance(actions, collections_abc.Mapping):
             actions = list(actions.items())
-        elif not isinstance(actions, collections.Iterable)\
+        elif not isinstance(actions, collections_abc.Iterable)\
             or isinstance(actions, six.string_types):
             actions = [actions]
 
@@ -153,7 +156,7 @@ class GroupByBase(object):
                 aggregates = item
                 name = None
 
-            if not isinstance(aggregates, collections.Iterable)\
+            if not isinstance(aggregates, collections_abc.Iterable)\
                 or isinstance(aggregates, six.string_types):
                 # not a list, or a string
                 aggregates = [aggregates]
@@ -196,7 +199,7 @@ class BinBy(GroupByBase):
 
         keys = list(arrays.keys())
         key0 = keys[0]
-        if not isinstance(actions, collections.Iterable)\
+        if not isinstance(actions, collections_abc.Iterable)\
             or isinstance(actions, six.string_types):
             assert len(keys) == 1
             final_array = arrays[key0]

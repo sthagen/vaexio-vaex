@@ -34,6 +34,7 @@ from . import selections, tasks, scopes
 from .expression import expression_namespace
 from .delayed import delayed, delayed_args, delayed_list
 from .column import Column, ColumnIndexed, ColumnSparse, ColumnString, ColumnConcatenatedLazy, str_type
+from .array_types import to_numpy
 import vaex.events
 
 # py2/p3 compatibility
@@ -177,6 +178,9 @@ class DataFrame(object):
         self.variables["seconds_per_year"] = 31557600
         # leads to k = 4.74047 to go from au/year to km/s
         self.virtual_columns = collections.OrderedDict()
+        # we also store the virtual columns as expressions, for performance reasons
+        # the expression object can cache the ast, making renaming/rewriting faster
+        self._virtual_expressions = {}
         self.functions = collections.OrderedDict()
         self._length_original = None
         self._length_unfiltered = None
@@ -190,6 +194,7 @@ class DataFrame(object):
         self.ucds = {}
         self.units = {}
         self.descriptions = {}
+        self._dtypes_override = {}
 
         self.favorite_selections = collections.OrderedDict()
 
@@ -208,6 +213,13 @@ class DataFrame(object):
         self._selection_mask_caches = collections.defaultdict(dict)
         self._selection_masks = {}  # maps to vaex.superutils.Mask object
         self._renamed_columns = []
+        self._column_aliases = {}  # maps from invalid variable names to valid ones
+
+        # weak refs of expression that we keep to rewrite expressions
+        self._expressions = []
+
+        # a check to avoid nested aggregator calls, which make stack traces very difficult
+        self._aggregator_nest_count = 0
 
     def __getattr__(self, name):
         # will support the hidden methods
@@ -230,6 +242,9 @@ class DataFrame(object):
                     def myrepr(k):
                         if isinstance(k, Expression):
                             return str(k)
+                        elif isinstance(k, np.ndarray) and k.ndim == 0:
+                            # to support numpy scalars
+                            return myrepr(k.item())
                         else:
                             return repr(k)
                     arg_string = ", ".join([myrepr(k) for k in args] + ['{}={}'.format(name, myrepr(value)) for name, value in kwargs.items()])
@@ -282,15 +297,39 @@ class DataFrame(object):
     def filtered(self):
         return self.has_selection(FILTER_SELECTION_NAME)
 
-    def map_reduce(self, map, reduce, arguments, progress=False, delay=False, info=False, ordered_reduce=False, to_numpy=True, name='map reduce (custom)'):
+    def map_reduce(self, map, reduce, arguments, progress=False, delay=False, info=False, ordered_reduce=False, to_numpy=True, ignore_filter=False, pre_filter=False, name='map reduce (custom)', selection=None):
         # def map_wrapper(*blocks):
-        task = tasks.TaskMapReduce(self, arguments, map, reduce, info=info, ordered_reduce=ordered_reduce, to_numpy=to_numpy)
+        task = tasks.TaskMapReduce(self, arguments, map, reduce, info=info, ordered_reduce=ordered_reduce, to_numpy=to_numpy, ignore_filter=ignore_filter, selection=selection, pre_filter=pre_filter)
         progressbar = vaex.utils.progressbars(progress)
         progressbar.add_task(task, name)
         self.executor.schedule(task)
         return self._delay(delay, task)
 
     def apply(self, f, arguments=None, dtype=None, delay=False, vectorize=False):
+        """Apply a function on a per row basis across the entire DataFrame.
+
+        Example:
+
+        >>> import vaex
+        >>> df = vaex.example()
+        >>> def func(x, y):
+        ...     return (x+y)/(x-y)
+        ...
+        >>> df.apply(func, arguments=[df.x, df.y])
+        Expression = lambda_function(x, y)
+        Length: 330,000 dtype: float64 (expression)
+        -------------------------------------------
+             0  -0.460789
+             1    3.90038
+             2  -0.642851
+             3   0.685768
+             4  -0.543357
+
+
+        :param f: The function to be applied
+        :param arguments: List of arguments to be passed on the the function f.
+        :return: A function that is lazily evaluated.
+        """
         assert arguments is not None, 'for now, you need to supply arguments'
         import types
         if isinstance(f, types.LambdaType):
@@ -312,7 +351,7 @@ class DataFrame(object):
             pass
         return self.map_reduce(map, reduce, [expression], delay=delay, progress=progress, name='nop', to_numpy=False)
 
-    def _set(self, expression, progress=False, delay=False):
+    def _set(self, expression, progress=False, selection=None, delay=False):
         column = _ensure_string_from_expression(expression)
         columns = [column]
         from .hash import ordered_set_type_from_dtype
@@ -343,16 +382,57 @@ class DataFrame(object):
                 sets[thread_index].update(ar)
         def reduce(a, b):
             pass
-        self.map_reduce(map, reduce, columns, delay=delay, name='set', info=True, to_numpy=False)
+        self.map_reduce(map, reduce, columns, delay=delay, name='set', info=True, to_numpy=False, selection=selection)
         sets = [k for k in sets if k is not None]
         set0 = sets[0]
         for other in sets[1:]:
             set0.merge(other)
         return set0
 
-    def unique(self, expression, return_inverse=False, progress=False, delay=False):
+    def _index(self, expression, progress=False, delay=False):
+        column = _ensure_string_from_expression(expression)
+        columns = [column]
+        from .hash import index_type_from_dtype
+        from vaex.column import _to_string_sequence
+
+        transient = self[str(expression)].transient or self.filtered or self.is_masked(expression)
+        if self.dtype(expression) == str_type and not transient:
+            # string is a special case, only ColumnString are not transient
+            ar = self.columns[str(expression)]
+            if not isinstance(ar, ColumnString):
+                transient = True
+
+        dtype = self.dtype(column)
+        index_type = index_type_from_dtype(dtype, transient)
+        index_list = [None] * self.executor.thread_pool.nthreads
+        def map(thread_index, i1, i2, ar):
+            if index_list[thread_index] is None:
+                index_list[thread_index] = index_type()
+            if dtype == str_type:
+                previous_ar = ar
+                ar = _to_string_sequence(ar)
+                if not transient:
+                    assert ar is previous_ar.string_sequence
+            if np.ma.isMaskedArray(ar):
+                mask = np.ma.getmaskarray(ar)
+                index_list[thread_index].update(ar, mask, i1)
+            else:
+                index_list[thread_index].update(ar, i1)
+        def reduce(a, b):
+            pass
+        self.map_reduce(map, reduce, columns, delay=delay, name='index', info=True, to_numpy=False)
+        index_list = [k for k in index_list if k is not None]
+        index0 = index_list[0]
+        for other in index_list[1:]:
+            index0.merge(other)
+        return index0
+
+    def unique(self, expression, return_inverse=False, dropna=False, dropnan=False, dropmissing=False, progress=False, selection=None, delay=False):
+        if dropna:
+            dropnan = True
+            dropmissing = True
         expression = _ensure_string_from_expression(expression)
-        ordered_set = self._set(expression, progress=progress)
+        ordered_set = self._set(expression, progress=progress, selection=selection)
         transient = True
         if return_inverse:
             # inverse type can be smaller, depending on length of set
@@ -369,12 +449,14 @@ class DataFrame(object):
                 inverse[i1:i2:] = ordered_set.map_ordinal(ar)
             def reduce(a, b):
                 pass
-            self.map_reduce(map, reduce, [expression], delay=delay, name='unique_return_inverse', info=True, to_numpy=False)
+            self.map_reduce(map, reduce, [expression], delay=delay, name='unique_return_inverse', info=True, to_numpy=False, selection=selection)
         keys = ordered_set.keys()
-        if ordered_set.has_nan:
-            keys = [np.nan] + keys
-        if ordered_set.has_null:
-            keys = [np.ma.core.MaskedConstant()] + keys
+        if not dropnan:
+            if ordered_set.has_nan:
+                keys = [np.nan] + keys
+        if not dropmissing:
+            if ordered_set.has_null:
+                keys = [np.ma.core.MaskedConstant()] + keys
         keys = np.asarray(keys)
         if return_inverse:
             return keys, inverse
@@ -559,24 +641,42 @@ class DataFrame(object):
         if extra_expressions:
             extra_expressions = _ensure_strings_from_expressions(extra_expressions)
         expression_waslist, [expressions,] = vaex.utils.listify(expression)
+        assert self._aggregator_nest_count == 0, "detected nested aggregator call"
+        # Instead of 'expression is not None', we would like to have 'not virtual'
+        # but in agg.py we do some casting, which results in calling .dtype(..) with a non-column
+        # expression even though all expressions passed here are column references
+        # virtual = [k for k in expressions if k and k not in self.columns]
+        if self.filtered and expression is not None:
+            # When our dataframe is filtered, and we have expressions, we may end up calling
+            # df.dtype(..) which in turn may call df.evaluate(..) which in turn needs to have
+            # the filter cache filled in order to compute the first non-missing row. This last
+            # item could call df.count() again, leading to nested aggregators, which we do not
+            # support. df.dtype() needs to call evaluate with filtering enabled since we consider
+            # it invalid that expressions are evaluate with filtered data. Sklearn for instance may
+            # give errors when evaluated with NaN's present.
+            len(self) # fill caches and masks
         grid = self._create_grid(binby, limits, shape, delay=True)
         @delayed
         def compute(expression, grid, selection, edges, progressbar):
-            if expression in ["*", None]:
-                agg = vaex.agg.aggregates[name]()
-            else:
-                if extra_expressions:
-                    agg = vaex.agg.aggregates[name](expression, *extra_expressions)
+            self._aggregator_nest_count += 1
+            try:
+                if expression in ["*", None]:
+                    agg = vaex.agg.aggregates[name](selection=selection)
                 else:
-                    agg = vaex.agg.aggregates[name](expression)
-            task = self._get_task_agg(grid)
-            agg_subtask = agg.add_operations(task, selection=selection, edges=edges)
-            progressbar.add_task(task, "%s for %s" % (name, expression))
-            @delayed
-            def finish(counts):
-                counts = np.asarray(counts)
-                return counts
-            return finish(agg_subtask)
+                    if extra_expressions:
+                        agg = vaex.agg.aggregates[name](expression, *extra_expressions, selection=selection)
+                    else:
+                        agg = vaex.agg.aggregates[name](expression, selection=selection)
+                task = self._get_task_agg(grid)
+                agg_subtask = agg.add_operations(task, edges=edges)
+                progressbar.add_task(task, "%s for %s" % (name, expression))
+                @delayed
+                def finish(counts):
+                    counts = np.asarray(counts)
+                    return counts
+                return finish(agg_subtask)
+            finally:
+                self._aggregator_nest_count -= 1
         @delayed
         def finish(*counts):
             return np.asarray(vaex.utils.unlistify(expression_waslist, counts))
@@ -813,8 +913,9 @@ class DataFrame(object):
         :param progress: {progress}
         :return: {return_stat_scalar}
         """
+        edges = False
+        return self._compute_agg('var', expression, binby, limits, shape, selection, delay, edges, progress)
         expression = _ensure_strings_from_expressions(expression)
-
         @delayed
         def calculate(expression, limits):
             task = tasks.TaskStatistic(self, binby, shape, limits, weight=expression, op=tasks.OP_ADD_WEIGHT_MOMENTS_012, selection=selection)
@@ -1319,6 +1420,8 @@ class DataFrame(object):
         return delay == True
 
     def _delay(self, delay, task, progressbar=False):
+        if task.isRejected:
+            task.get()
         if delay:
             return task
         else:
@@ -1355,13 +1458,12 @@ class DataFrame(object):
         waslist, [expressions, ] = vaex.utils.listify(expression)
         limits = []
         for expr in expressions:
-            subspace = self(expr)
-            limits_minmax = subspace.minmax()
-            vmin, vmax = limits_minmax[0]
+            limits_minmax = self.minmax(expr)
+            vmin, vmax = limits_minmax
             size = 1024 * 16
-            counts = subspace.histogram(size=size, limits=limits_minmax)
+            counts = self.count(binby=expr, shape=size, limits=limits_minmax)
             cumcounts = np.concatenate([[0], np.cumsum(counts)])
-            cumcounts /= cumcounts.max()
+            cumcounts = cumcounts / cumcounts.max()
             # TODO: this is crude.. see the details!
             f = (1 - percentage / 100.) / 2
             x = np.linspace(vmin, vmax, size + 1)
@@ -1908,9 +2010,16 @@ class DataFrame(object):
         """Alias for `df.byte_size()`, see :meth:`DataFrame.byte_size`."""
         return self.byte_size()
 
+    def _shape_of(self, expression, filtered=True):
+        sample = self.evaluate(expression, 0, 1, filtered=False, internal=True, parallel=False)
+        rows = len(self) if filtered else self.length_unfiltered()
+        return (rows,) + sample.shape[1:]
+
     def dtype(self, expression, internal=False):
         """Return the numpy dtype for the given expression, if not a column, the first row will be evaluated to get the dtype."""
         expression = _ensure_string_from_expression(expression)
+        if expression in self._dtypes_override:
+            return self._dtypes_override[expression]
         if expression in self.variables:
             return np.float64(1).dtype
         elif expression in self.columns.keys():
@@ -1918,16 +2027,15 @@ class DataFrame(object):
             data = column[0:1]
             dtype = data.dtype
         else:
-            data = self.evaluate(expression, 0, 1, filtered=False)
+            try:
+                data = self.evaluate(expression, 0, 1, filtered=False, internal=True, parallel=False)
+            except:
+                data = self.evaluate(expression, 0, 1, filtered=True, internal=True, parallel=False)
             dtype = data.dtype
         if not internal:
             if dtype != str_type:
                 if dtype.kind in 'US':
                     return str_type
-                if dtype.kind == 'O':
-                    # we lie about arrays containing strings
-                    if isinstance(data[0], six.string_types):
-                        return str_type
         return dtype
 
     @property
@@ -1940,7 +2048,17 @@ class DataFrame(object):
         '''Return if a column is a masked (numpy.ma) column.'''
         column = _ensure_string_from_expression(column)
         if column in self.columns:
-            return np.ma.isMaskedArray(self.columns[column])
+            column = self.columns[column]
+            if isinstance(column, np.ndarray):
+                return np.ma.isMaskedArray(column)
+            else:
+                # in case the column is not a numpy array, we take a small slice
+                # which should return a numpy array
+                return np.ma.isMaskedArray(column[0:1])
+        else:
+            ar = self.evaluate(column, i1=0, i2=1, parallel=False)
+            if isinstance(ar, np.ndarray) and np.ma.isMaskedArray(ar):
+                return True
         return False
 
     def label(self, expression, unit=None, output_unit=None, format="latex_inline"):
@@ -2133,10 +2251,11 @@ class DataFrame(object):
                      units=units,
                      descriptions=descriptions,
                      description=self.description,
-                     active_range=[self._index_start, self._index_end])
+                     active_range=[self._index_start, self._index_end],
+                     column_aliases=self._column_aliases)
         return state
 
-    def state_set(self, state, use_active_range=False):
+    def state_set(self, state, use_active_range=False, trusted=True):
         """Sets the internal state of the df
 
         Example:
@@ -2177,7 +2296,7 @@ class DataFrame(object):
             for old, new in state['renamed_columns']:
                 self._rename(old, new)
         for name, value in state['functions'].items():
-            self.add_function(name, vaex.serialize.from_dict(value))
+            self.add_function(name, vaex.serialize.from_dict(value, trusted=trusted))
         if 'column_names' in state:
             # we clear all columns, and add them later on, since otherwise self[name] = ... will try
             # to rename the columns (which is unsupported for remote dfs)
@@ -2186,13 +2305,14 @@ class DataFrame(object):
             for name, value in state['virtual_columns'].items():
                 self[name] = self._expr(value)
                 # self._save_assign_expression(name)
-            self.column_names = state['column_names']
+            self.column_names = list(state['column_names'])
         else:
             # old behaviour
             self.virtual_columns = collections.OrderedDict()
             for name, value in state['virtual_columns'].items():
                 self[name] = self._expr(value)
         self.variables = state['variables']
+        self._column_aliases = state.get('column_aliases', {})
         import astropy  # TODO: make this dep optional?
         units = {key: astropy.units.Unit(value) for key, value in state["units"].items()}
         self.units.update(units)
@@ -2530,33 +2650,45 @@ class DataFrame(object):
         else:
             return self.variables[name]
 
-    def _evaluate_selection_mask(self, name="default", i1=None, i2=None, selection=None, cache=False):
+    def _evaluate_selection_mask(self, name="default", i1=None, i2=None, selection=None, cache=False, filter_mask=None):
         """Internal use, ignores the filter"""
         i1 = i1 or 0
         i2 = i2 or len(self)
-        scope = scopes._BlockScopeSelection(self, i1, i2, selection, cache=cache)
-        return scope.evaluate(name)
+        scope = scopes._BlockScopeSelection(self, i1, i2, selection, cache=cache, filter_mask=filter_mask)
+        return vaex.utils.unmask_selection_mask(scope.evaluate(name))
 
-    def evaluate_selection_mask(self, name="default", i1=None, i2=None, selection=None, cache=False):
+    def evaluate_selection_mask(self, name="default", i1=None, i2=None, selection=None, cache=False, filtered=True, pre_filtered=True):
         i1 = i1 or 0
         i2 = i2 or self.length_unfiltered()
-        if name in [None, False] and self.filtered:
+        if isinstance(name, vaex.expression.Expression):
+            # make sure if we get passed an expression, it is converted to a string
+            # otherwise the name != <sth> will evaluate to an Expression object
+            name = str(name)
+        if name in [None, False] and self.filtered and filtered:
             scope_global = scopes._BlockScopeSelection(self, i1, i2, None, cache=cache)
             mask_global = scope_global.evaluate(FILTER_SELECTION_NAME)
-            return mask_global
-        elif self.filtered and name != FILTER_SELECTION_NAME:
-            scope = scopes._BlockScopeSelection(self, i1, i2, selection)
+            return vaex.utils.unmask_selection_mask(mask_global)
+        elif self.filtered and filtered and name != FILTER_SELECTION_NAME:
             scope_global = scopes._BlockScopeSelection(self, i1, i2, None, cache=cache)
-            mask = scope.evaluate(name)
             mask_global = scope_global.evaluate(FILTER_SELECTION_NAME)
-            return mask & mask_global
+            if pre_filtered:
+                scope = scopes._BlockScopeSelection(self, i1, i2, selection, filter_mask=vaex.utils.unmask_selection_mask(mask_global))
+                mask = scope.evaluate(name)
+                return vaex.utils.unmask_selection_mask(mask)
+            else:  # only used in legacy.py?
+                scope = scopes._BlockScopeSelection(self, i1, i2, selection)
+                mask = scope.evaluate(name)
+                return vaex.utils.unmask_selection_mask(mask & mask_global)
         else:
+            if name in [None, False]:
+                # # in this case we can
+                return np.full(i2-i1, True)
             scope = scopes._BlockScopeSelection(self, i1, i2, selection, cache=cache)
-            return scope.evaluate(name)
+            return vaex.utils.unmask_selection_mask(scope.evaluate(name))
 
         # if _is_string(selection):
 
-    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None):
+    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, parallel=True):
         """Evaluate an expression, and return a numpy array with the results for the full column or a part of it.
 
         Note that this is not how vaex should be used, since it means a copy of the data needs to fit in memory.
@@ -2574,7 +2706,7 @@ class DataFrame(object):
         raise NotImplementedError
 
     @docsubst
-    def to_items(self, column_names=None, selection=None, strings=True, virtual=False):
+    def to_items(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True):
         """Return a list of [(column_name, ndarray), ...)] pairs where the ndarray corresponds to the evaluated data
 
         :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
@@ -2584,12 +2716,23 @@ class DataFrame(object):
         :return: list of (name, ndarray) pairs
         """
         items = []
-        for name in column_names or self.get_column_names(strings=strings, virtual=virtual):
-            items.append((name, self.evaluate(name, selection=selection)))
-        return items
+        column_names = self.get_column_names(strings=strings, virtual=virtual)
+        return list(zip(column_names, self.evaluate(column_names, selection=selection, parallel=parallel)))
 
     @docsubst
-    def to_dict(self, column_names=None, selection=None, strings=True, virtual=False):
+    def to_arrays(self, column_names=None, selection=None, strings=True, virtual=True, parallel=True):
+        """Return a list of ndarrays
+
+        :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
+        :param selection: {selection}
+        :param strings: argument passed to DataFrame.get_column_names when column_names is None
+        :param virtual: argument passed to DataFrame.get_column_names when column_names is None
+        :return: list of (name, ndarray) pairs
+        """
+        return self.evaluate(column_names or self.get_column_names(strings=strings, virtual=virtual), selection=selection, parallel=parallel)
+
+    @docsubst
+    def to_dict(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True):
         """Return a dict containing the ndarray corresponding to the evaluated data
 
         :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
@@ -2598,7 +2741,7 @@ class DataFrame(object):
         :param virtual: argument passed to DataFrame.get_column_names when column_names is None
         :return: dict
         """
-        return dict(self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual))
+        return dict(self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=parallel))
 
     @docsubst
     def to_copy(self, column_names=None, selection=None, strings=True, virtual=False, selections=True):
@@ -2637,10 +2780,11 @@ class DataFrame(object):
                 self.descriptions[name] = other.descriptions[name]
             if name in other.ucds:
                 self.ucds[name] = other.ucds[name]
+        self._column_aliases = dict(other._column_aliases)
         self.description = other.description
 
     @docsubst
-    def to_pandas_df(self, column_names=None, selection=None, strings=True, virtual=False, index_name=None):
+    def to_pandas_df(self, column_names=None, selection=None, strings=True, virtual=False, index_name=None, parallel=True):
         """Return a pandas DataFrame containing the ndarray corresponding to the evaluated data
 
          If index is given, that column is used for the index of the dataframe.
@@ -2658,7 +2802,7 @@ class DataFrame(object):
         :return: pandas.DataFrame object
         """
         import pandas as pd
-        data = self.to_dict(column_names=column_names, selection=selection, strings=strings, virtual=virtual)
+        data = self.to_dict(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=True)
         if index_name is not None:
             if index_name in data:
                 index = data.pop(index_name)
@@ -2685,7 +2829,7 @@ class DataFrame(object):
         return arrow_table_from_vaex_df(self, column_names, selection, strings, virtual)
 
     @docsubst
-    def to_astropy_table(self, column_names=None, selection=None, strings=True, virtual=False, index=None):
+    def to_astropy_table(self, column_names=None, selection=None, strings=True, virtual=False, index=None, parallel=True):
         """Returns a astropy table object containing the ndarrays corresponding to the evaluated data
 
         :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
@@ -2701,7 +2845,7 @@ class DataFrame(object):
         meta["description"] = self.description
 
         table = Table(meta=meta)
-        for name, data in self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual):
+        for name, data in self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=parallel):
             if self.dtype(name) == str_type:  # for astropy we convert it to unicode, it seems to ignore object type
                 data = np.array(data).astype('U')
             meta = dict()
@@ -2713,6 +2857,32 @@ class DataFrame(object):
                 cls = Column
             table[name] = cls(data, unit=self.unit(name), description=self.descriptions.get(name), meta=meta)
         return table
+
+    def to_dask_array(self, chunks="auto"):
+        """Lazily expose the DataFrame as a dask.array
+
+        Example
+
+        >>> df = vaex.example()
+        >>> A = df[['x', 'y', 'z']].to_dask_array()
+        >>> A
+        dask.array<vaex-df-1f048b40-10ec-11ea-9553, shape=(330000, 3), dtype=float64, chunksize=(330000, 3), chunktype=numpy.ndarray>
+        >>> A+1
+        dask.array<add, shape=(330000, 3), dtype=float64, chunksize=(330000, 3), chunktype=numpy.ndarray>
+
+        :param chunks: How to chunk the array, similar to :func:`dask.array.from_array`.
+        :return: :class:`dask.array.Array` object.
+        """
+        import dask.array as da
+        import uuid
+        dtype = self._dtype
+        chunks = da.core.normalize_chunks(chunks, shape=self.shape, dtype=dtype)
+        name = 'vaex-df-%s' % str(uuid.uuid1())
+        def getitem(df, item):
+            return np.array(df.__getitem__(item).to_arrays(parallel=False)).T
+        dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype)
+        dsk[name] = self
+        return da.Array(dsk, name, chunks, dtype=dtype)
 
     def validate_expression(self, expression):
         """Validate an expression (may throw Exceptions)"""
@@ -2730,7 +2900,7 @@ class DataFrame(object):
 
         if boolean_expression is None, remove the selection, has_selection() will returns false
 
-        Note that per DataFrame, only one selection is possible.
+        Note that per DataFrame, multiple selections are possible, and one filter (see :func:`DataFrame.select`).
 
         :param str boolean_expression: boolean expression, such as 'x < 0', '(x < 0) || (y > -10)' or None to remove the selection
         :param str mode: boolean operation to perform with the previous selection, "replace", "and", "or", "xor", "subtract"
@@ -2738,8 +2908,14 @@ class DataFrame(object):
         """
         raise NotImplementedError
 
-    def add_column(self, name, f_or_array):
+    def add_column(self, name, f_or_array, dtype=None):
         """Add an in memory array as a column."""
+        column_position = len(self.column_names)
+        if name in self.get_column_names():
+            column_position = self.column_names.index(name)
+            renamed = '__' +vaex.utils.find_valid_name(name, used=self.get_column_names())
+            self._rename(name, renamed)
+
         if isinstance(f_or_array, (np.ndarray, Column)):
             data = ar = f_or_array
             # it can be None when we have an 'empty' DataFrameArrays
@@ -2754,12 +2930,25 @@ class DataFrame(object):
                         raise ValueError("Array is of length %s, while the length of the DataFrame is %s due to the filtering, the (unfiltered) length is %s." % (len(ar), len(self), self.length_unfiltered()))
                 raise ValueError("array is of length %s, while the length of the DataFrame is %s" % (len(ar), self.length_original()))
             # assert self.length_unfiltered() == len(data), "columns should be of equal length, length should be %d, while it is %d" % ( self.length_unfiltered(), len(data))
-            self.columns[name] = f_or_array
-            if name not in self.column_names:
-                self.column_names.append(name)
+            valid_name = vaex.utils.find_valid_name(name)
+            if name != valid_name:
+                self._column_aliases[name] = valid_name
+            ar = f_or_array
+            if dtype is not None:
+                self._dtypes_override[valid_name] = dtype
+            else:
+                if isinstance(ar, np.ndarray) and ar.dtype.kind == 'O':
+                    types = list({type(k) for k in ar if np.all(k == k) and k is not None})
+                    if len(types) == 1 and issubclass(types[0], six.string_types):
+                        self._dtypes_override[valid_name] = str_type
+                    if len(types) == 0:  # can only be if all nan right?
+                        ar = ar.astype(np.float64)
+            self.columns[valid_name] = ar
+            if valid_name not in self.column_names:
+                self.column_names.insert(column_position, valid_name)
         else:
             raise ValueError("functions not yet implemented")
-        self._save_assign_expression(name, Expression(self, name))
+        self._save_assign_expression(valid_name, Expression(self, valid_name))
 
     def _sparse_matrix(self, column):
         column = _ensure_string_from_expression(column)
@@ -2790,22 +2979,10 @@ class DataFrame(object):
 
     def rename_column(self, name, new_name, unique=False, store_in_state=True):
         """Renames a column, not this is only the in memory name, this will not be reflected on disk"""
+        if name == new_name:
+            return
         new_name = vaex.utils.find_valid_name(new_name, used=[] if not unique else list(self))
-        data = self.columns.get(name)
-        if data is not None:
-            del self.columns[name]
-            self.column_names[self.column_names.index(name)] = new_name
-            self.columns[new_name] = data
-        else:
-            expression = self.virtual_columns[name]
-            del self.virtual_columns[name]
-            self.virtual_columns[new_name] = expression
-        if store_in_state:
-            self._renamed_columns.append((name, new_name))
-        for d in [self.ucds, self.units, self.descriptions]:
-            if name in d:
-                d[new_name] = d[name]
-                del d[name]
+        self._rename(name, new_name, rename_meta_data=True)
         return new_name
 
     @_hidden
@@ -2830,20 +3007,6 @@ class DataFrame(object):
         hp_index = hp.ang2pix(hp.order2nside(healpix_order), theta, phi, nest=nest)
         self.add_column("healpix", hp_index)
 
-    @_hidden
-    def add_virtual_column_bearing(self, name, lon1, lat1, lon2, lat2):
-        lon1 = "(pickup_longitude * pi / 180)"
-        lon2 = "(dropoff_longitude * pi / 180)"
-        lat1 = "(pickup_latitude * pi / 180)"
-        lat2 = "(dropoff_latitude * pi / 180)"
-        p1 = lat1
-        p2 = lat2
-        l1 = lon1
-        l2 = lon2
-        # from http://www.movable-type.co.uk/scripts/latlong.html
-        expr = "arctan2(sin({l2}-{l1}) * cos({p2}), cos({p1})*sin({p2}) - sin({p1})*cos({p2})*cos({l2}-{l1}))" \
-            .format(**locals())
-        self.add_virtual_column("bearing", expr)
 
     @_hidden
     def add_virtual_columns_matrix3d(self, x, y, z, xnew, ynew, znew, matrix, matrix_name='deprecated', matrix_is_expression=False, translation=[0, 0, 0], propagate_uncertainties=False):
@@ -2996,55 +3159,15 @@ class DataFrame(object):
     def add_virtual_columns_cartesian_to_polar(self, x="x", y="y", radius_out="r_polar", azimuth_out="phi_polar",
                                                propagate_uncertainties=False,
                                                radians=False):
-        """Convert cartesian to polar coordinates
-
-        :param x: expression for x
-        :param y: expression for y
-        :param radius_out: name for the virtual column for the radius
-        :param azimuth_out: name for the virtual column for the azimuth angle
-        :param propagate_uncertainties: {propagate_uncertainties}
-        :param radians: if True, azimuth is in radians, defaults to degrees
-        :return:
-        """
-        x = self[x]
-        y = self[y]
-        if radians:
-            to_degrees = ""
-        else:
-            to_degrees = "*180/pi"
-        r = np.sqrt(x**2 + y**2)
-        self[radius_out] = r
-        phi = np.arctan2(y, x)
-        if not radians:
-            phi = phi * 180/np.pi
-        self[azimuth_out] = phi
-        if propagate_uncertainties:
-            self.propagate_uncertainties([self[radius_out], self[azimuth_out]])
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.cartesian_to_polar(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_cartesian_velocities_to_spherical(self, x="x", y="y", z="z", vx="vx", vy="vy", vz="vz", vr="vr", vlong="vlong", vlat="vlat", distance=None):
-        """Concert velocities from a cartesian to a spherical coordinate system
-
-        TODO: errors
-
-        :param x: name of x column (input)
-        :param y:         y
-        :param z:         z
-        :param vx:       vx
-        :param vy:       vy
-        :param vz:       vz
-        :param vr: name of the column for the radial velocity in the r direction (output)
-        :param vlong: name of the column for the velocity component in the longitude direction  (output)
-        :param vlat: name of the column for the velocity component in the latitude direction, positive points to the north pole (output)
-        :param distance: Expression for distance, if not given defaults to sqrt(x**2+y**2+z**2), but if this column already exists, passing this expression may lead to a better performance
-        :return:
-        """
-        # see http://www.astrosurf.com/jephem/library/li110spherCart_en.htm
-        if distance is None:
-            distance = "sqrt({x}**2+{y}**2+{z}**2)".format(**locals())
-        self.add_virtual_column(vr, "({x}*{vx}+{y}*{vy}+{z}*{vz})/{distance}".format(**locals()))
-        self.add_virtual_column(vlong, "-({vx}*{y}-{x}*{vy})/sqrt({x}**2+{y}**2)".format(**locals()))
-        self.add_virtual_column(vlat, "-({z}*({x}*{vx}+{y}*{vy}) - ({x}**2+{y}**2)*{vz})/( {distance}*sqrt({x}**2+{y}**2) )".format(**locals()))
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.velocity_cartesian2spherical(inplace=True, **kwargs)
 
     def _expr(self, *expressions, **kwargs):
         always_list = kwargs.pop('always_list', False)
@@ -3053,201 +3176,48 @@ class DataFrame(object):
     @_hidden
     def add_virtual_columns_cartesian_velocities_to_polar(self, x="x", y="y", vx="vx", radius_polar=None, vy="vy", vr_out="vr_polar", vazimuth_out="vphi_polar",
                                                           propagate_uncertainties=False,):
-        """Convert cartesian to polar velocities.
-
-        :param x:
-        :param y:
-        :param vx:
-        :param radius_polar: Optional expression for the radius, may lead to a better performance when given.
-        :param vy:
-        :param vr_out:
-        :param vazimuth_out:
-        :param propagate_uncertainties: {propagate_uncertainties}
-        :return:
-        """
-        x = self._expr(x)
-        y = self._expr(y)
-        vx = self._expr(vx)
-        vy = self._expr(vy)
-        if radius_polar is None:
-            radius_polar = np.sqrt(x**2 + y**2)
-        radius_polar = self._expr(radius_polar)
-        self[vr_out]       = (x*vx + y*vy) / radius_polar
-        self[vazimuth_out] = (x*vy - y*vx) / radius_polar
-        if propagate_uncertainties:
-            self.propagate_uncertainties([self[vr_out], self[vazimuth_out]])
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.velocity_cartesian2polar(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_polar_velocities_to_cartesian(self, x='x', y='y', azimuth=None, vr='vr_polar', vazimuth='vphi_polar', vx_out='vx', vy_out='vy', propagate_uncertainties=False):
-        """ Convert cylindrical polar velocities to Cartesian.
-
-        :param x:
-        :param y:
-        :param azimuth: Optional expression for the azimuth in degrees , may lead to a better performance when given.
-        :param vr:
-        :param vazimuth:
-        :param vx_out:
-        :param vy_out:
-        :param propagate_uncertainties: {propagate_uncertainties}
-        """
-        x = self._expr(x)
-        y = self._expr(y)
-        vr = self._expr(vr)
-        vazimuth = self._expr(vazimuth)
-        if azimuth is not None:
-            azimuth = self._expr(azimuth)
-            azimuth = np.deg2rad(azimuth)
-        else:
-            azimuth = np.arctan2(y, x)
-        azimuth = self._expr(azimuth)
-        self[vx_out] = vr * np.cos(azimuth) - vazimuth * np.sin(azimuth)
-        self[vy_out] = vr * np.sin(azimuth) + vazimuth * np.cos(azimuth)
-        if propagate_uncertainties:
-            self.propagate_uncertainties([self[vx_out], self[vy_out]])
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.velocity_polar2cartesian(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_rotation(self, x, y, xnew, ynew, angle_degrees, propagate_uncertainties=False):
-        """Rotation in 2d.
-
-        :param str x: Name/expression of x column
-        :param str y: idem for y
-        :param str xnew: name of transformed x column
-        :param str ynew:
-        :param float angle_degrees: rotation in degrees, anti clockwise
-        :return:
-        """
-        x = _ensure_string_from_expression(x)
-        y = _ensure_string_from_expression(y)
-        theta = np.radians(angle_degrees)
-        matrix = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
-        m = matrix_name = x + "_" + y + "_rot"
-        for i in range(2):
-            for j in range(2):
-                self.set_variable(matrix_name + "_%d%d" % (i, j), matrix[i, j].item())
-        self[xnew] = self._expr("{m}_00 * {x} + {m}_01 * {y}".format(**locals()))
-        self[ynew] = self._expr("{m}_10 * {x} + {m}_11 * {y}".format(**locals()))
-        if propagate_uncertainties:
-            self.propagate_uncertainties([self[xnew], self[ynew]])
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.rotation_2d(inplace=True, **kwargs)
 
     @docsubst
     @_hidden
     def add_virtual_columns_spherical_to_cartesian(self, alpha, delta, distance, xname="x", yname="y", zname="z",
                                                    propagate_uncertainties=False,
-                                                   center=[0, 0, 0], center_name="solar_position", radians=False):
-        """Convert spherical to cartesian coordinates.
-
-
-
-        :param alpha:
-        :param delta: polar angle, ranging from the -90 (south pole) to 90 (north pole)
-        :param distance: radial distance, determines the units of x, y and z
-        :param xname:
-        :param yname:
-        :param zname:
-        :param propagate_uncertainties: {propagate_uncertainties}
-        :param center:
-        :param center_name:
-        :param radians:
-        :return:
-        """
-        alpha = self._expr(alpha)
-        delta = self._expr(delta)
-        distance = self._expr(distance)
-        if not radians:
-            alpha = alpha * self._expr('pi')/180
-            delta = delta * self._expr('pi')/180
-
-        # TODO: use sth like .optimize by default to get rid of the +0 ?
-        if center[0]:
-            self[xname] = np.cos(alpha) * np.cos(delta) * distance + center[0]
-        else:
-            self[xname] = np.cos(alpha) * np.cos(delta) * distance
-        if center[1]:
-            self[yname] = np.sin(alpha) * np.cos(delta) * distance + center[1]
-        else:
-            self[yname] = np.sin(alpha) * np.cos(delta) * distance
-        if center[2]:
-            self[zname] =                 np.sin(delta) * distance + center[2]
-        else:
-            self[zname] =                 np.sin(delta) * distance
-        if propagate_uncertainties:
-            self.propagate_uncertainties([self[xname], self[yname], self[zname]])
+                                                   center=[0, 0, 0], radians=False):
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.spherical2cartesian(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_cartesian_to_spherical(self, x="x", y="y", z="z", alpha="l", delta="b", distance="distance", radians=False, center=None, center_name="solar_position"):
-        """Convert cartesian to spherical coordinates.
-
-
-
-        :param x:
-        :param y:
-        :param z:
-        :param alpha:
-        :param delta: name for polar angle, ranges from -90 to 90 (or -pi to pi when radians is True).
-        :param distance:
-        :param radians:
-        :param center:
-        :param center_name:
-        :return:
-        """
-        transform = "" if radians else "*180./pi"
-
-        if center is not None:
-            self.add_variable(center_name, center)
-        if center is not None and center[0] != 0:
-            x = "({x} - {center_name}[0])".format(**locals())
-        if center is not None and center[1] != 0:
-            y = "({y} - {center_name}[1])".format(**locals())
-        if center is not None and center[2] != 0:
-            z = "({z} - {center_name}[2])".format(**locals())
-        self.add_virtual_column(distance, "sqrt({x}**2 + {y}**2 + {z}**2)".format(**locals()))
-        # self.add_virtual_column(alpha, "((arctan2({y}, {x}) + 2*pi) % (2*pi)){transform}".format(**locals()))
-        self.add_virtual_column(alpha, "arctan2({y}, {x}){transform}".format(**locals()))
-        self.add_virtual_column(delta, "(-arccos({z}/{distance})+pi/2){transform}".format(**locals()))
-    # self.add_virtual_column(long_out, "((arctan2({y}, {x})+2*pi) % (2*pi)){transform}".format(**locals()))
-    # self.add_virtual_column(lat_out, "(-arccos({z}/sqrt({x}**2+{y}**2+{z}**2))+pi/2){transform}".format(**locals()))
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.cartesian2spherical(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_aitoff(self, alpha, delta, x, y, radians=True):
-        """Add aitoff (https://en.wikipedia.org/wiki/Aitoff_projection) projection
-
-        :param alpha: azimuth angle
-        :param delta: polar angle
-        :param x: output name for x coordinate
-        :param y: output name for y coordinate
-        :param radians: input and output in radians (True), or degrees (False)
-        :return:
-        """
-        transform = "" if radians else "*pi/180."
-        aitoff_alpha = "__aitoff_alpha_%s_%s" % (alpha, delta)
-        # sanatize
-        aitoff_alpha = re.sub("[^a-zA-Z_]", "_", aitoff_alpha)
-
-        self.add_virtual_column(aitoff_alpha, "arccos(cos({delta}{transform})*cos({alpha}{transform}/2))".format(**locals()))
-        self.add_virtual_column(x, "2*cos({delta}{transform})*sin({alpha}{transform}/2)/sinc({aitoff_alpha}/pi)/pi".format(**locals()))
-        self.add_virtual_column(y, "sin({delta}{transform})/sinc({aitoff_alpha}/pi)/pi".format(**locals()))
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.project_aitoff(inplace=True, **kwargs)
 
     @_hidden
     def add_virtual_columns_projection_gnomic(self, alpha, delta, alpha0=0, delta0=0, x="x", y="y", radians=False, postfix=""):
-        if not radians:
-            alpha = "pi/180.*%s" % alpha
-            delta = "pi/180.*%s" % delta
-            alpha0 = alpha0 * np.pi / 180
-            delta0 = delta0 * np.pi / 180
-        transform = "" if radians else "*180./pi"
-        # aliases
-        ra = alpha
-        dec = delta
-        ra_center = alpha0
-        dec_center = delta0
-        gnomic_denominator = 'sin({dec_center}) * tan({dec}) + cos({dec_center}) * cos({ra} - {ra_center})'.format(**locals())
-        denominator_name = 'gnomic_denominator' + postfix
-        xi = 'sin({ra} - {ra_center})/{denominator_name}{transform}'.format(**locals())
-        eta = '(cos({dec_center}) * tan({dec}) - sin({dec_center}) * cos({ra} - {ra_center}))/{denominator_name}{transform}'.format(**locals())
-        self.add_virtual_column(denominator_name, gnomic_denominator)
-        self.add_virtual_column(x, xi)
-        self.add_virtual_column(y, eta)
-        # return xi, eta
+        kwargs = dict(**locals())
+        del kwargs['self']
+        return self.geo.project_gnomic(inplace=True, **kwargs)
 
     def add_function(self, name, f, unique=False):
         name = vaex.utils.find_valid_name(name, used=[] if not unique else self.functions.keys())
@@ -3268,36 +3238,66 @@ class DataFrame(object):
         :param str unique: if name is already used, make it unique by adding a postfix, e.g. _1, or _2
         """
         type = "change" if name in self.virtual_columns else "add"
-        expression = _ensure_string_from_expression(expression)
+        if isinstance(expression, Expression):
+            if expression.df is not self:
+                expression = expression.copy(self)
+        column_position = len(self.column_names)
+        # if the current name is an existing column name....
         if name in self.get_column_names():
-            renamed = '__' +vaex.utils.find_valid_name(name, used=self.get_column_names())
-            expression = self._rename(name, renamed, expression)[0].expression
+            column_position = self.column_names.index(name)
+            renamed = vaex.utils.find_valid_name('__' +name, used=self.get_column_names(hidden=True))
+            # we rewrite all existing expressions (including the passed down expression argument)
+            self._rename(name, renamed)
+        expression = _ensure_string_from_expression(expression)
 
         name = vaex.utils.find_valid_name(name, used=[] if not unique else self.get_column_names())
+
         self.virtual_columns[name] = expression
-        self.column_names.append(name)
+        self._virtual_expressions[name] = Expression(self, expression)
+        if name not in self.column_names:
+            self.column_names.insert(column_position, name)
         self._save_assign_expression(name)
         self.signal_column_changed.emit(self, name, "add")
         # self.write_virtual_meta()
 
-    def _rename(self, old, new, *expressions):
-        #for name, expr in self.virtual_columns.items():
+    def _rename(self, old, new, rename_meta_data=False):
+        if old in self._dtypes_override:
+            self._dtypes_override[new] = self._dtypes_override.pop(old)
         if old in self.columns:
             self.columns[new] = self.columns.pop(old)
+        if rename_meta_data:
+            for d in [self.ucds, self.units, self.descriptions]:
+                if old in d:
+                    d[new] = d[old]
+                    del d[old]
         if old in self.virtual_columns:
             self.virtual_columns[new] = self.virtual_columns.pop(old)
+            self._virtual_expressions[new] = self._virtual_expressions.pop(old)
         self._renamed_columns.append((old, new))
-        index = self.column_names.index(old)
-        self.column_names[index] = new
-        self.virtual_columns = {k:self[v]._rename(old, new).expression for k, v in self.virtual_columns.items()}
+        self.column_names.remove(old)
+        self.column_names.append(new)
         for key, value in self.selection_histories.items():
             self.selection_histories[key] = list([k if k is None else k._rename(self, old, new) for k in value])
-        return [self[_ensure_string_from_expression(e)]._rename(old, new) for e in expressions]
+        if hasattr(self, name):
+            try:
+                if isinstance(getattr(self, name), Expression):
+                    delattr(self, name)
+            except:
+                pass
+        self._save_assign_expression(new)
+        existing_expressions = [k() for k in self._expressions]
+        existing_expressions = [k for k in existing_expressions if k is not None]
+        # print(len(existing_expressions))
+        for expression in existing_expressions:
+            expression._rename(old, new, inplace=True)
+        self.virtual_columns = {k:self._virtual_expressions[k].expression for k, v in self.virtual_columns.items()}
+        # return [self[_ensure_string_from_expression(e)]._rename(old, new) for e in expressions]
 
 
     def delete_virtual_column(self, name):
         """Deletes a virtual column from a DataFrame."""
         del self.virtual_columns[name]
+        del self._virtual_expressions[name]
         self.signal_column_changed.emit(self, name, "delete")
         # self.write_virtual_meta()
 
@@ -3451,21 +3451,35 @@ class DataFrame(object):
         columns = {}
         for feature in self.get_column_names(strings=strings, virtual=virtual)[:]:
             dtype = str(self.dtype(feature)) if self.dtype(feature) != str else 'str'
-            if self.dtype(feature) == str_type or self.dtype(feature).kind in ['S', 'U', 'O']:
+            if self.dtype(feature) == str_type or self.dtype(feature).kind in ['S', 'U']:
                 count = self.count(feature, selection=selection, delay=True)
                 self.execute()
                 count = count.get()
                 columns[feature] = ((dtype, count, N-count, '--', '--', '--', '--'))
+            elif self.dtype(feature).kind == 'O':
+                # this will also properly count NaN-like objects like NaT
+                count_na = self[feature].isna().astype('int').sum(delay=True)
+                self.execute()
+                count_na = count_na.get()
+                columns[feature] = ((dtype, N-count_na, count_na, '--', '--', '--', '--'))
             else:
-                count = self.count(feature, selection=selection, delay=True)
+                is_datetime = self.is_datetime(feature)
                 mean = self.mean(feature, selection=selection, delay=True)
                 std = self.std(feature, selection=selection, delay=True)
                 minmax = self.minmax(feature, selection=selection, delay=True)
+                if is_datetime:  # this path tests using isna, which test for nat
+                    count_na = self[feature].isna().astype('int').sum(delay=True)
+                else:
+                    count = self.count(feature, selection=selection, delay=True)
                 self.execute()
-                count, mean, std, minmax = count.get(), mean.get(), std.get(), minmax.get()
-                count = int(count)
+                if is_datetime:
+                    count_na, mean, std, minmax = count_na.get(), mean.get(), std.get(), minmax.get()
+                    count = N - int(count_na)
+                else:
+                    count, mean, std, minmax = count.get(), mean.get(), std.get(), minmax.get()
+                    count = int(count)
                 columns[feature] = ((dtype, count, N-count, mean, std, minmax[0], minmax[1]))
-        return pd.DataFrame(data=columns, index=['dtype', 'count', 'missing', 'mean', 'std', 'min', 'max'])
+        return pd.DataFrame(data=columns, index=['dtype', 'count', 'NA', 'mean', 'std', 'min', 'max'])
 
     def cat(self, i1, i2, format='html'):
         """Display the DataFrame from row i1 till i2
@@ -3683,7 +3697,14 @@ class DataFrame(object):
             if not hidden and name.startswith('__'):
                 return False
             return True
+        if hidden and virtual and regex is None:
+            return list(self.column_names)  # quick path
+        if not hidden and virtual and regex is None:
+            return [k for k in self.column_names if not k.startswith('__')]  # also a quick path
         return [name for name in self.column_names if column_filter(name)]
+
+    def __bool__(self):
+        return True  # we are always true :) otherwise Python might call __len__, which can be expensive
 
     def __len__(self):
         """Returns the number of rows in the DataFrame (filtering applied)."""
@@ -3763,7 +3784,7 @@ class DataFrame(object):
         df = self if inplace else self.copy()
         if self._index_start == 0 and self._index_end == self._length_original:
             return df
-        for name in df:
+        for name in df.get_column_names(hidden=True):
             column = df.columns.get(name)
             if column is not None:
                 if self._index_start == 0 and len(column) == self._index_end:
@@ -3773,6 +3794,7 @@ class DataFrame(object):
                         df.columns[name] = column[self._index_start:self._index_end]
                     else:
                         df.columns[name] = column.trim(self._index_start, self._index_end)
+
         df._length_original = self.length_unfiltered()
         df._length_unfiltered = df._length_original
         df._cached_filtered_length = None
@@ -3786,7 +3808,7 @@ class DataFrame(object):
         return df
 
     @docsubst
-    def take(self, indices, unfiltered=False):
+    def take(self, indices, filtered=True, dropfilter=True):
         '''Returns a DataFrame containing only rows indexed by indices
 
         {note_copy}
@@ -3801,7 +3823,9 @@ class DataFrame(object):
          1  c      3
 
         :param indices: sequence (list or numpy array) with row numbers
-        :param unfiltered: (for internal use) The indices refer to the unfiltered data.
+        :param filtered: (for internal use) The indices refer to the filtered data.
+        :param dropfilter: (for internal use) Drop the filter, set to False when
+            indices refer to unfiltered, but may contain rows that still need to be filtered out.
         :return: DataFrame which is a shallow copy of the original data.
         :rtype: DataFrame
         '''
@@ -3813,33 +3837,32 @@ class DataFrame(object):
         # them in this dict
         direct_indices_map = {}
         indices = np.asarray(indices)
-        if df.filtered and not unfiltered:
+        if df.filtered and filtered:
+            # we translate the indices that refer to filters row indices to
+            # indices of the unfiltered row indices
             df.count() # make sure the mask is filled
-            # translate the indices to unfiltered indices
             max_index = indices.max()
             mask = df._selection_masks[FILTER_SELECTION_NAME]
             filtered_indices = mask.first(max_index+1)
-            indices = indices[filtered_indices]
+            indices = filtered_indices[indices]
         for name, column in df.columns.items():
             if column is not None:
                 # we optimize this somewhere, so we don't do multiple
                 # levels of indirection
-                if isinstance(column, ColumnIndexed):
-                    # TODO: think about what happpens when the indices are masked.. ?
-                    if id(column.indices) not in direct_indices_map:
-                        direct_indices = column.indices[indices]
-                        direct_indices_map[id(column.indices)] = direct_indices
-                    else:
-                        direct_indices = direct_indices_map[id(column.indices)]
-                    df.columns[name] = ColumnIndexed(column.df, direct_indices, column.name)
-                else:
-                    df.columns[name] = ColumnIndexed(df_trimmed, indices, name)
+                df.columns[name] = ColumnIndexed.index(df_trimmed, column, name, indices, direct_indices_map)
         df._length_original = len(indices)
         df._length_unfiltered = df._length_original
         df._cached_filtered_length = None
         df._index_start = 0
         df._index_end = df._length_original
-        df.set_selection(None, name=FILTER_SELECTION_NAME)
+        if dropfilter:
+            # if the indices refer to the filtered rows, we can discard the
+            # filter in the final dataframe
+            df.set_selection(None, name=FILTER_SELECTION_NAME)
+        # if we will not drop the filter, we will have to invalidate the cache
+        # since it refers to the previous dataframe rows
+        # TODO perf: we could instead of dropping the cache, take out the rows we need
+        df._invalidate_selection_cache()
         return df
 
     @docsubst
@@ -3862,7 +3885,7 @@ class DataFrame(object):
             mask = self._selection_masks[FILTER_SELECTION_NAME]
             indices = mask.first(len(self))
             assert len(indices) == len(self)
-            return self.take(indices, unfiltered=True)
+            return self.take(indices, filtered=False)
         else:
             return trimmed
 
@@ -4001,6 +4024,8 @@ class DataFrame(object):
     def sort(self, by, ascending=True, kind='quicksort'):
         '''Return a sorted DataFrame, sorted by the expression 'by'
 
+        The kind keyword is ignored if doing multi-key sorting.
+
         {note_copy}
 
         {note_filter}
@@ -4028,14 +4053,19 @@ class DataFrame(object):
         :param str kind: kind of algorithm to use (passed to numpy.argsort)
         '''
         self = self.trim()
-        values = self.evaluate(by, filtered=False)
-        indices = np.argsort(values, kind=kind)
+        if not isinstance(by, list):
+            values = self.evaluate(by)
+            indices = np.argsort(values, kind=kind)
+        if isinstance(by, (list, tuple)):
+            by = _ensure_strings_from_expressions(by)[::-1]
+            values = self.evaluate(by)
+            indices = np.lexsort(values)
         if not ascending:
             indices = indices[::-1].copy()  # this may be used a lot, so copy for performance
         return self.take(indices)
 
     @docsubst
-    def fillna(self, value, fill_nan=True, fill_masked=True, column_names=None, prefix='__original_', inplace=False):
+    def fillna(self, value, column_names=None, prefix='__original_', inplace=False):
         '''Return a DataFrame, where missing values/NaN are filled with 'value'.
 
         The original columns will be renamed, and by default they will be hidden columns. No data is lost.
@@ -4073,9 +4103,9 @@ class DataFrame(object):
             if column is not None:
                 new_name = df.rename_column(name, prefix + name)
                 expr = df[new_name]
-                df[name] = df.func.fillna(expr, value, fill_nan=fill_nan, fill_masked=fill_masked)
+                df[name] = df.func.fillna(expr, value)
             else:
-                df[name] = df.func.fillna(df[name], value, fill_nan=fill_nan, fill_masked=fill_masked)
+                df[name] = df.func.fillna(df[name], value)
         return df
 
     def materialize(self, virtual_column, inplace=False):
@@ -4118,7 +4148,7 @@ class DataFrame(object):
         selection_history = self.selection_histories[name]
         index = self.selection_history_indices[name]
         self.selection_history_indices[name] -= 1
-        self.signal_selection_changed.emit(self)
+        self.signal_selection_changed.emit(self, name)
         logger.debug("undo: selection history is %r, index is %r", selection_history, self.selection_history_indices[name])
 
     def selection_redo(self, name="default", executor=None):
@@ -4130,7 +4160,7 @@ class DataFrame(object):
         index = self.selection_history_indices[name]
         next = selection_history[index + 1]
         self.selection_history_indices[name] += 1
-        self.signal_selection_changed.emit(self)
+        self.signal_selection_changed.emit(self, name)
         logger.debug("redo: selection history is %r, index is %r", selection_history, index)
 
     def selection_can_undo(self, name="default"):
@@ -4155,7 +4185,7 @@ class DataFrame(object):
         boolean_expression = _ensure_string_from_expression(boolean_expression)
         if boolean_expression is None and not self.has_selection(name=name):
             pass  # we don't want to pollute the history with many None selections
-            self.signal_selection_changed.emit(self)  # TODO: unittest want to know, does this make sense?
+            self.signal_selection_changed.emit(self, name)  # TODO: unittest want to know, does this make sense?
         else:
             def create(current):
                 return selections.SelectionExpression(boolean_expression, current, mode) if boolean_expression else None
@@ -4179,24 +4209,44 @@ class DataFrame(object):
             return selections.SelectionDropNa(drop_nan, drop_masked, column_names, current, mode)
         self._selection(create, name)
 
-    def dropna(self, drop_nan=True, drop_masked=True, column_names=None):
-        """Create a shallow copy of a DataFrame, with filtering set using select_non_missing.
+    def dropmissing(self, column_names=None):
+        """Create a shallow copy of a DataFrame, with filtering set using ismissing.
 
-        :param drop_nan: drop rows when there is a NaN in any of the columns (will only affect float values)
-        :param drop_masked: drop rows when there is a masked value in any of the columns
         :param column_names: The columns to consider, default: all (real, non-virtual) columns
         :rtype: DataFrame
         """
+        return self._filter_all(self.func.ismissing, column_names)
+
+    def dropnan(self, column_names=None):
+        """Create a shallow copy of a DataFrame, with filtering set using isnan.
+
+        :param column_names: The columns to consider, default: all (real, non-virtual) columns
+        :rtype: DataFrame
+        """
+        return self._filter_all(self.func.isnan, column_names)
+
+    def dropna(self, column_names=None):
+        """Create a shallow copy of a DataFrame, with filtering set using isna.
+
+        :param column_names: The columns to consider, default: all (real, non-virtual) columns
+        :rtype: DataFrame
+        """
+        return self._filter_all(self.func.isna, column_names)
+
+    def _filter_all(self, f, column_names=None):
         copy = self.copy()
-        copy.select_non_missing(drop_nan=drop_nan, drop_masked=drop_masked, column_names=column_names,
-                                name=FILTER_SELECTION_NAME, mode='and')
+        column_names = column_names or self.get_column_names(virtual=False)
+        expression = f(self._expr(column_names[0]))
+        for column in column_names[1:]:
+            expression = expression & f(self._expr(column))
+        copy.select(~expression, name=FILTER_SELECTION_NAME, mode='and')
         return copy
 
     def select_nothing(self, name="default"):
         """Select nothing."""
         logger.debug("selecting nothing")
         self.select(None, name=name)
-    # self.signal_selection_changed.emit(self)
+        self.signal_selection_changed.emit(self, name)
 
     def select_rectangle(self, x, y, limits, mode="replace", name="default"):
         """Select a 2d rectangular box in the space given by x and y, bounds by limits.
@@ -4355,7 +4405,7 @@ class DataFrame(object):
         self.selection_history_indices[name] += 1
         # clip any redo history
         del selection_history[self.selection_history_indices[name]:-1]
-        self.signal_selection_changed.emit(self)
+        self.signal_selection_changed.emit(self, name)
         result = vaex.promise.Promise.fulfilled(None)
         logger.debug("select selection history is %r, index is %r", selection_history, self.selection_history_indices[name])
         return result
@@ -4377,14 +4427,72 @@ class DataFrame(object):
         '''
 
         if isinstance(name, six.string_types):
-            if isinstance(value, Expression):
-                value = value.expression
-            if isinstance(value, np.ndarray):
+            if isinstance(value, (np.ndarray, Column)):
                 self.add_column(name, value)
             else:
                 self.add_virtual_column(name, value)
         else:
             raise TypeError('__setitem__ only takes strings as arguments, not {}'.format(type(name)))
+
+    def drop_filter(self, inplace=False):
+        """Removes all filters from the DataFrame"""
+        df = self if inplace else self.copy()
+        df.select_nothing(name=FILTER_SELECTION_NAME)
+        df._invalidate_caches()
+        return df
+
+    def filter(self, expression, mode="and"):
+        """General version of df[<boolean expression>] to modify the filter applied to the DataFrame.
+
+        See :func:`DataFrame.select` for usage of selection.
+
+        Note that using `df = df[<boolean expression>]`, one can only narrow the filter (i.e. only less rows
+        can be selected). Using the filter method, and a different boolean mode (e.g. "or") one can actually
+        cause more rows to be selected. This differs greatly from numpy and pandas for instance, which can only
+        narrow the filter.
+
+        Example:
+
+        >>> import vaex
+        >>> import numpy as np
+        >>> x = np.arange(10)
+        >>> df = vaex.from_arrays(x=x, y=x**2)
+        >>> df
+        #    x    y
+        0    0    0
+        1    1    1
+        2    2    4
+        3    3    9
+        4    4   16
+        5    5   25
+        6    6   36
+        7    7   49
+        8    8   64
+        9    9   81
+        >>> dff = df[df.x<=2]
+        >>> dff
+        #    x    y
+        0    0    0
+        1    1    1
+        2    2    4
+        >>> dff = dff.filter(dff.x >=7, mode="or")
+        >>> dff
+        #    x    y
+        0    0    0
+        1    1    1
+        2    2    4
+        3    7   49
+        4    8   64
+        5    9   81
+        """
+        df = self.copy()
+        df.select(expression, name=FILTER_SELECTION_NAME, mode=mode)
+        df._cached_filtered_length = None  # invalide cached length
+        # WARNING: this is a special case where we create a new filter
+        # the cache mask chunks still hold references to views on the old
+        # mask, and this new mask will be filled when required
+        df._selection_masks[FILTER_SELECTION_NAME] = vaex.superutils.Mask(df._length_unfiltered)
+        return df
 
     def __getitem__(self, item):
         """Convenient way to get expressions, (shallow) copies of a few columns, or to apply filtering.
@@ -4405,41 +4513,46 @@ class DataFrame(object):
                 return getattr(self, item)
             # if item in self.virtual_columns:
             #   return Expression(self, self.virtual_columns[item])
+            if item in self._column_aliases:
+                item = self._column_aliases[item]  # translate the alias name into the real name
+            # if item in self._virtual_expressions:
+            #     return self._virtual_expressions[item]
             return Expression(self, item)  # TODO we'd like to return the same expression if possible
         elif isinstance(item, Expression):
             expression = item.expression
-            df = self.copy()
-            df.select(expression, name=FILTER_SELECTION_NAME, mode='and')
-            df._cached_filtered_length = None  # invalide cached length
-            # WARNING: this is a special case where we create a new filter
-            # the cache mask chunks still hold references to views on the old
-            # mask, and this new mask will be filled when required
-            df._selection_masks[FILTER_SELECTION_NAME] = vaex.superutils.Mask(df._length_unfiltered)
-            return df
+            return self.filter(expression)
         elif isinstance(item, (tuple, list)):
+            df = self
+            if isinstance(item[0], slice):
+                df = df[item[0]]
+            if len(item) > 1:
+                if isinstance(item[1], int):
+                    name = self.get_column_names()[item[1]]
+                    return df[name]
+                elif isinstance(item[1], slice):
+                    names = self.get_column_names().__getitem__(item[1])
+                    return df[names]
             df = self.copy(column_names=item)
             return df
         elif isinstance(item, slice):
             start, stop, step = item.start, item.stop, item.step
             start = start or 0
             stop = stop or len(self)
+            if start < 0:
+                start = len(self)+start
             if stop < 0:
                 stop = len(self)+stop
             stop = min(stop, len(self))
             assert step in [None, 1]
-            if self.filtered and start == 0:
-                self.count()  # fill caches and masks
+            if self.filtered:
+                count_check = self.count()  # fill caches and masks
                 mask = self._selection_masks[FILTER_SELECTION_NAME]
-                indices = mask.first(stop-start)
-                df = self.trim().take(indices, unfiltered=True)
-            elif self.filtered and stop == len(self):
-                self.count()  # fill caches and masks
-                mask = self._selection_masks[FILTER_SELECTION_NAME]
-                indices = mask.last(stop-start)
-                df = self.trim().take(indices, unfiltered=True)
-            else:
-                df = self.extract()
-                df.set_active_range(start, stop)
+                start, stop = mask.indices(start, stop-1) # -1 since it is inclusive
+                assert start != -1
+                assert stop != -1
+                stop = stop+1  # +1 to make it inclusive
+            df = self.trim()
+            df.set_active_range(start, stop)
             return df.trim()
 
     def __delitem__(self, item):
@@ -4457,9 +4570,11 @@ class DataFrame(object):
             self.column_names.remove(name)
         elif name in self.virtual_columns:
             del self.virtual_columns[name]
+            del self._virtual_expressions[name]
             self.column_names.remove(name)
         else:
             raise KeyError('no such column or virtual_columns named %r' % name)
+        self.signal_column_changed.emit(self, name, "delete")
         if hasattr(self, name):
             try:
                 if isinstance(getattr(self, name), Expression):
@@ -4491,6 +4606,7 @@ class DataFrame(object):
         column = _ensure_string_from_expression(column)
         new_name = self._find_valid_name('__' + column)
         self._rename(column, new_name)
+        return new_name
 
     def _find_valid_name(self, initial_name):
         '''Finds a non-colliding name by optional postfixing'''
@@ -4690,10 +4806,12 @@ class DataFrameLocal(DataFrame):
         df._index_start = self._index_start
         df._active_fraction = self._active_fraction
         df._renamed_columns = list(self._renamed_columns)
+        df._column_aliases = dict(self._column_aliases)
         df.units.update(self.units)
         df.variables.update(self.variables)
         df._categories.update(self._categories)
-        column_names = column_names or self.get_column_names(hidden=True)
+        if column_names is None:
+            column_names = self.get_column_names(hidden=True)
         all_column_names = self.get_column_names(hidden=True)
 
         # put in the selections (thus filters) in place
@@ -4723,32 +4841,100 @@ class DataFrameLocal(DataFrame):
                 df._selection_mask_caches[key] = collections.defaultdict(dict)
                 df._selection_mask_caches[key].update(self._selection_mask_caches[key])
 
-        # we copy all columns, but drop the ones that are not wanted
-        # this makes sure that needed columns are hidden instead
-        def add_columns(columns):
-            for name in columns:
+        if 1:
+            # print("-----", column_names)
+            depending = set()
+            added = set()
+            for name in column_names:
+                # print("add", name)
+                added.add(name)
                 if name in self.columns:
-                    df.add_column(name, self.columns[name])
+                    column = self.columns[name]
+                    if not isinstance(column, ColumnSparse):
+                        df.add_column(name, column, dtype=self._dtypes_override.get(name))
                 elif name in self.virtual_columns:
-                    if virtual:
+                    if virtual:  # TODO: check if the ast is cached
                         df.add_virtual_column(name, self.virtual_columns[name])
+                        deps = [key for key, value in df._virtual_expressions[name].ast_names.items()]
+                        # print("add virtual", name, df._virtual_expressions[name].expression, deps)
+                        depending.update(deps)
                 else:
                     # this might be an expression, create a valid name
                     expression = name
                     name = vaex.utils.find_valid_name(name)
+                    # add the expression
                     df[name] = df._expr(expression)
-        # to preserve the order, we first add the ones we want, then the rest
-        add_columns(column_names)
-        # then the rest
-        rest = set(all_column_names) - set(column_names)
-        add_columns(rest)
-        # and remove them
-        for name in rest:
-            # if the column should not have been added, drop it. This checks if columns need
-            # to be hidden instead, and expressions be rewritten.
-            if name not in column_names:
-                df.drop(name, inplace=True)
-                assert name not in df.get_column_names(hidden=True)
+                    # then get the dependencies
+                    deps = [key for key, value in df._virtual_expressions[name].ast_names.items()]
+                    depending.update(deps)
+                # print(depending, "after add")
+            # depending |= column_names
+            # print(depending)
+            # print(depending, "before filter")
+            if self.filtered:
+                selection = self.get_selection(FILTER_SELECTION_NAME)
+                depending |= selection._depending_columns(self)
+            depending.difference_update(added)  # remove already added
+            # print(depending, "after filter")
+            # return depending_columns
+
+            hide = []
+
+            while depending:
+                new_depending = set()
+                for name in depending:
+                    added.add(name)
+                    if name in self.columns:
+                        # print("add column", name)
+                        df.add_column(name, self.columns[name], dtype=self._dtypes_override.get(name))
+                        # print("and hide it")
+                        # df._hide_column(name)
+                        hide.append(name)
+                    elif name in self.virtual_columns:
+                        if virtual:  # TODO: check if the ast is cached
+                            df.add_virtual_column(name, self.virtual_columns[name])
+                            deps = [key for key, value in self._virtual_expressions[name].ast_names.items()]
+                            new_depending.update(deps)
+                        # df._hide_column(name)
+                        hide.append(name)
+                    elif name in self.variables:
+                        # if must be a variables?
+                        # TODO: what if the variable depends on other variables
+                        df.add_variable(name, self.variables[name])
+
+                # print("new_depending", new_depending)
+                new_depending.difference_update(added)
+                depending = new_depending
+            for name in hide:
+                df._hide_column(name)
+
+        else:
+            # we copy all columns, but drop the ones that are not wanted
+            # this makes sure that needed columns are hidden instead
+            def add_columns(columns):
+                for name in columns:
+                    if name in self.columns:
+                        df.add_column(name, self.columns[name], dtype=self._dtypes_override.get(name))
+                    elif name in self.virtual_columns:
+                        if virtual:
+                            df.add_virtual_column(name, self.virtual_columns[name])
+                    else:
+                        # this might be an expression, create a valid name
+                        expression = name
+                        name = vaex.utils.find_valid_name(name)
+                        df[name] = df._expr(expression)
+            # to preserve the order, we first add the ones we want, then the rest
+            add_columns(column_names)
+            # then the rest
+            rest = set(all_column_names) - set(column_names)
+            add_columns(rest)
+            # and remove them
+            for name in rest:
+                # if the column should not have been added, drop it. This checks if columns need
+                # to be hidden instead, and expressions be rewritten.
+                if name not in column_names:
+                    df.drop(name, inplace=True)
+                    assert name not in df.get_column_names(hidden=True)
 
         df.copy_metadata(self)
         return df
@@ -4804,7 +4990,18 @@ class DataFrameLocal(DataFrame):
 
     def echo(self, arg): return arg
 
-    def __array__(self, dtype=None):
+    @property
+    def _dtype(self):
+        dtypes = [self[k].dtype for k in self.get_column_names()]
+        if not all([dtypes[0] == dtype for dtype in dtypes]):
+            return ValueError("Not all dtypes are equal: %r" % dtypes)
+        return dtypes[0]
+
+    @property
+    def shape(self):
+        return (len(self), len(self.get_column_names()))
+
+    def __array__(self, dtype=None, parallel=True):
         """Gives a full memory copy of the DataFrame into a 2d numpy array of shape (n_rows, n_columns).
         Note that the memory order is fortran, so all values of 1 column are contiguous in memory for performance reasons.
 
@@ -4817,12 +5014,12 @@ class DataFrameLocal(DataFrame):
         if dtype is None:
             dtype = np.float64
         chunks = []
-        for name in self.get_column_names(strings=False):
+        column_names = self.get_column_names(strings=False)
+        for name in column_names:
             if not np.can_cast(self.dtype(name), dtype):
                 if self.dtype(name) != dtype:
                     raise ValueError("Cannot cast %r (of type %r) to %r" % (name, self.dtype(name), dtype))
-            else:
-                chunks.append(self.evaluate(name))
+        chunks = self.evaluate(column_names, parallel=parallel)
         return np.array(chunks, dtype=dtype).T
 
     @vaex.utils.deprecated('use DataFrame.join(other)')
@@ -4895,8 +5092,8 @@ class DataFrameLocal(DataFrame):
             done = offset_filtered >= i2
         return np.array(indices, dtype=np.int64)
 
-    def _evaluate(self, expression, i1, i2, out=None, selection=None, internal=False):
-        scope = scopes._BlockScope(self, i1, i2, **self.variables)
+    def _evaluate(self, expression, i1, i2, out=None, selection=None, internal=False, filter_mask=None):
+        scope = scopes._BlockScope(self, i1, i2, mask=filter_mask, **self.variables)
         if out is not None:
             scope.buffers[expression] = out
         value = scope.evaluate(expression)
@@ -4904,17 +5101,98 @@ class DataFrameLocal(DataFrame):
             value = value.to_numpy()
         return value
 
-    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, internal=False):
+    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, internal=False, parallel=True):
         """The local implementation of :func:`DataFrame.evaluate`"""
-        expression = _ensure_string_from_expression(expression)
+        # expression = _ensure_string_from_expression(expression)
+        was_list, [expressions] = vaex.utils.listify(expression)
+        expressions = vaex.utils._ensure_strings_from_expressions(expressions)
+
         selection = _ensure_strings_from_expressions(selection)
+        max_stop = (len(self) if (self.filtered and filtered) else self.length_unfiltered())
         i1 = i1 or 0
-        i2 = i2 or (len(self) if (self.filtered and filtered) else self.length_unfiltered())
+        i2 = i2 or max_stop
+        if parallel:
+            df = self
+            # first, reduce complexity for the parallel path
+            if self.filtered and not filtered:
+                df = df.drop_filter()
+            if i1 != 0 or i2 != max_stop:
+                df = df[i1:i2]
+            if df != self and parallel:
+                return df.evaluate(expression, out=out, selection=selection, internal=internal, parallel=parallel)
+        expression = expressions[0]
+        # here things are simpler or we don't go parallel
         mask = None
 
-        if self.filtered and filtered:  # if we filter, i1:i2 has a different meaning
-            if 1:
-                count_check = self.count()  # fill caches and masks
+        if parallel:
+            use_filter = self.filtered and filtered
+
+            length = self.length_unfiltered()
+            arrays = {}
+            # maps to a dict of start_index -> apache arrow array (a chunk)
+            chunks_map = {}
+            dtypes = {}
+            shapes = {}
+            virtual = set()
+            # TODO: For NEP branch: dtype -> dtype_evaluate
+
+            for expression in set(expressions):
+                dtypes[expression] = self.dtype(expression, internal=False)
+                if expression not in self.columns:
+                    virtual.add(expression)
+                # since we will use pre_filter=True, we'll get chunks of the data at unknown offset
+                # so we'll also have to stitch those back together
+                if dtypes[expression] == str_type or use_filter or selection:
+                    chunks_map[expression] = {}
+                else:
+                    # we know exactly where to place the chunks, so we pre allocate the arrays
+                    shape = (length, ) + self._shape_of(expression, filtered=False)[1:]
+                    shapes[expression] = shape
+                    if self.is_masked(expression):
+                        arrays[expression] = np.ma.empty(shapes.get(expression, length), dtype=dtypes[expression])
+                    else:
+                        arrays[expression] = np.zeros(shapes.get(expression, length), dtype=dtypes[expression])
+
+            def assign(thread_index, i1, i2, *blocks):
+                for i, expr in enumerate(expressions):
+                    if expr in chunks_map:
+                        # for non-primitive arrays we simply keep a reference to the chunk
+                        chunks_map[expr][i1] = blocks[i]
+                    else:
+                        # for primitive arrays (and no filter/selection) we directly add it to the right place in contiguous numpy array
+                        arrays[expr][i1:i2] = blocks[i]
+
+            self.map_reduce(assign, lambda *_: None, expressions, ignore_filter=False, selection=selection, pre_filter=use_filter, info=True, to_numpy=False)
+            def finalize_result(expression):
+                if expression in chunks_map:
+                    # put all chunks in order
+                    chunks = [chunk for (i1, chunk) in sorted(chunks_map[expression].items(), key=lambda i1_and_chunk: i1_and_chunk[0])]
+                    assert len(chunks) > 0
+                    if len(chunks) == 1:
+                        # TODO: For NEP Branch
+                        # return pa.array(chunks[0])
+                        if internal:
+                            return chunks[0]
+                        else:
+                            values = to_numpy(chunks[0])
+                            return values
+                    else:
+                        # TODO: For NEP Branch
+                        # return pa.chunked_array(chunks)
+                        if internal:
+                            return chunks  # Returns a list of StringArrays
+                        else:
+                            # if isinstance(value, ColumnString) and not internal:
+                            return np.concatenate([to_numpy(k) for k in chunks])
+                else:
+                    return arrays[expression]
+            result = [finalize_result(k) for k in expressions]
+            if not was_list:
+                result = result[0]
+            return result
+        else:
+            if self.filtered and filtered:
+                count_check = len(self)  # fill caches and masks
                 mask = self._selection_masks[FILTER_SELECTION_NAME]
                 if _DEBUG:
                     if i1 == 0 and i2 == count_check:
@@ -4925,21 +5203,22 @@ class DataFrameLocal(DataFrame):
                 assert i1 != -1
                 assert i2 != -1
                 i2 = i2+1  # +1 to make it inclusive
-            else:
-                indices = self._filtered_range_to_unfiltered_indices(i1, i2)
-                i1 = indices[0]
-                i2 = indices[-1] + 1
-        # for both a selection or filtering we have a mask
-        if selection is not None or (self.filtered and filtered):
-            mask = self.evaluate_selection_mask(selection, i1, i2)
-        scope = scopes._BlockScope(self, i1, i2, mask=mask, **self.variables)
-        # value = value[mask]
-        if out is not None:
-            scope.buffers[expression] = out
-        value = scope.evaluate(expression)
-        if isinstance(value, ColumnString) and not internal:
-            value = value.to_numpy()
-        return value
+            values = []
+            for expression in expressions:
+                # for both a selection or filtering we have a mask
+                if selection not in [None, False] or (self.filtered and filtered):
+                    mask = self.evaluate_selection_mask(selection, i1, i2)
+                scope = scopes._BlockScope(self, i1, i2, mask=mask, **self.variables)
+                # value = value[mask]
+                if out is not None:
+                    scope.buffers[expression] = out
+                value = scope.evaluate(expression)
+                if isinstance(value, ColumnString) and not internal:
+                    value = value.to_numpy()
+                values.append(value)
+            if not was_list:
+                return values[0]
+            return values
 
     def _equals(self, other):
         values = self.compare(other)
@@ -5048,7 +5327,7 @@ class DataFrameLocal(DataFrame):
         return different_values, missing, type_mismatch, meta_mismatch
 
     @docsubst
-    def join(self, other, on=None, left_on=None, right_on=None, lsuffix='', rsuffix='', how='left', inplace=False):
+    def join(self, other, on=None, left_on=None, right_on=None, lprefix='', rprefix='', lsuffix='', rsuffix='', how='left', allow_duplication=False, inplace=False):
         """Return a DataFrame joined with other DataFrames, matched by columns/expression on/left_on/right_on
 
         If neither on/left_on/right_on is given, the join is done by simply adding the columns (i.e. on the implicit
@@ -5072,27 +5351,38 @@ class DataFrameLocal(DataFrame):
         :param on: default key for the left table (self)
         :param left_on: key for the left table (self), overrides on
         :param right_on: default key for the right table (other), overrides on
+        :param lprefix: prefix to add to the left column names in case of a name collision
+        :param rprefix: similar for the right
         :param lsuffix: suffix to add to the left column names in case of a name collision
         :param rsuffix: similar for the right
         :param how: how to join, 'left' keeps all rows on the left, and adds columns (with possible missing values)
-                'right' is similar with self and other swapped.
+                'right' is similar with self and other swapped. 'inner' will only return rows which overlap.
+        :param bool allow_duplication: Allow duplication of rows when the joined column contains non-unique values.
         :param inplace: {inplace}
         :return:
         """
-        ds = self if inplace else self.copy()
+        inner = False
+        left = self
+        right = other
         if how == 'left':
-            left = ds
-            right = other
+            pass
         elif how == 'right':
-            left = other
-            right = ds
+            left, right = right, left
+            lprefix, rprefix = rprefix, lprefix
             lsuffix, rsuffix = rsuffix, lsuffix
             left_on, right_on = right_on, left_on
+        elif how == 'inner':
+            inner = True
         else:
             raise ValueError('join type not supported: {}, only left and right'.format(how))
+        left = left if inplace else left.copy()
 
+        left_on = left_on or on
+        right_on = right_on or on
         for name in right:
-            if name in left and name + rsuffix == name + lsuffix:
+            if left_on and (rprefix + name + rsuffix == lprefix + left_on + lsuffix):
+                continue  # it's ok when we join on the same column name
+            if name in left and rprefix + name + rsuffix == lprefix + name + lsuffix:
                 raise ValueError('column name collision: {} exists in both column, and no proper suffix given'
                                  .format(name))
 
@@ -5100,62 +5390,75 @@ class DataFrameLocal(DataFrame):
         assert left.length_unfiltered() == left.length_original()
         N = left.length_unfiltered()
         N_other = len(right)
-        left_on = left_on or on
-        right_on = right_on or on
         if left_on is None and right_on is None:
             for name in right:
                 right_name = name
                 if name in left:
-                    left.rename_column(name, name + lsuffix)
-                    right_name = name + rsuffix
+                    left.rename_column(name, lprefix + name + lsuffix)
+                    right_name = rprefix + name + rsuffix
                 if name in right.virtual_columns:
                     left.add_virtual_column(right_name, right.virtual_columns[name])
                 else:
                     left.add_column(right_name, right.columns[name])
         else:
-            left_values = left.evaluate(left_on, filtered=False)
-            right_values = right.evaluate(right_on)
-            # maps from the left_values to row #
-            if np.ma.isMaskedArray(left_values):
-                mask = ~left_values.mask
-                left_values = left_values.data
-                index_left = dict(zip(left_values[mask], np.arange(N)[mask]))
-            else:
-                index_left = dict(zip(left_values, np.arange(N)))
-            # idem for right
-            if np.ma.isMaskedArray(right_values):
-                mask = ~right_values.mask
-                right_values = right_values.data
-                index_other = dict(zip(right_values[mask], np.arange(N_other)[mask]))
-            else:
-                index_other = dict(zip(right_values, np.arange(N_other)))
+            df = left
+            # we index the right side, this assumes right is smaller in size
+            index = right._index(right_on)
+            lookup = np.zeros(left._length_original, dtype=np.int64)
+            lookup_extra_chunks = []
+            dtype = left.dtype(left_on)
+            duplicates_right = index.has_duplicates
 
-            # we do a left join, find all rows of the right DataFrame
-            # that has an entry on the left
-            # for each row in the right
-            # find which row it needs to go to in the right
-            # from_indices = np.zeros(N_other, dtype=np.int64)  # row # of right
-            # to_indices = np.zeros(N_other, dtype=np.int64)    # goes to row # on the left
-            # keep a boolean mask of which rows are found
-            left_mask = np.ones(N, dtype=np.bool)
-            # and which row they point to in the right
-            left_row_to_right = np.zeros(N, dtype=np.int64) - 1
-            for i in range(N_other):
-                left_row = index_left.get(right_values[i])
-                if left_row is not None:
-                    left_mask[left_row] = False  # unmask, it exists
-                    left_row_to_right[left_row] = i
+            if duplicates_right and not allow_duplication:
+                raise ValueError('This join will lead to duplication of rows which is disabled, pass allow_duplication=True')
 
-            lookup = np.ma.array(left_row_to_right, mask=left_mask)
+            from vaex.column import _to_string_sequence
+            def map(thread_index, i1, i2, ar):
+                if dtype == str_type:
+                    previous_ar = ar
+                    ar = _to_string_sequence(ar)
+                if np.ma.isMaskedArray(ar):
+                    mask = np.ma.getmaskarray(ar)
+                    lookup[i1:i2] = index.map_index(ar.data, mask)
+                    if duplicates_right:
+                        extra = index.map_index_duplicates(ar.data, mask, i1)
+                        lookup_extra_chunks.append(extra)
+                else:
+                    lookup[i1:i2] = index.map_index(ar)
+                    if duplicates_right:
+                        extra = index.map_index_duplicates(ar, i1)
+                        lookup_extra_chunks.append(extra)
+            def reduce(a, b):
+                pass
+            left.map_reduce(map, reduce, [left_on], delay=False, name='fill looking', info=True, to_numpy=False, ignore_filter=True)
+            if len(lookup_extra_chunks):
+                # if the right has duplicates, we increase the left of left, and the lookup array
+                lookup_left = np.concatenate([k[0] for k in lookup_extra_chunks])
+                lookup_right = np.concatenate([k[1] for k in lookup_extra_chunks])
+                left = left.concat(left.take(lookup_left))
+                lookup = np.concatenate([lookup, lookup_right])
+
+            if inner:
+                left_mask_matched = lookup != -1  # all the places where we found a match to the right
+                lookup = lookup[left_mask_matched]  # filter the lookup table to the right
+                left_indices_matched = np.where(left_mask_matched)[0]  # convert mask to indices for the left
+                # indices can still refer to filtered rows, so do not drop the filter
+                left = left.take(left_indices_matched, filtered=False, dropfilter=False)
+            else:
+                lookup = np.ma.array(lookup, mask=lookup==-1)
+            direct_indices_map = {}  # for performance, keeps a cache of two levels of indirection of indices
             for name in right:
+                if rprefix + name + rsuffix == lprefix + left_on + lsuffix:
+                    continue  # skip when it's the join column
                 right_name = name
                 if name in left:
-                    left.rename_column(name, name + lsuffix)
-                    right_name = name + rsuffix
+                    left.rename_column(name, lprefix + name + lsuffix)
+                    right_name = rprefix + name + rsuffix
                 if name in right.virtual_columns:
                     left.add_virtual_column(right_name, right.virtual_columns[name])
                 else:
-                    left.add_column(right_name, ColumnIndexed(right, lookup, name))
+                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map)
+                    left.add_column(right_name, column)
         return left
 
     def export(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=False, sort=None, ascending=True):
@@ -5275,10 +5578,10 @@ class DataFrameLocal(DataFrame):
         return int(self.count(selection=selection).item())
         # np.sum(self.mask) if self.has_selection() else None
 
-    def _set_mask(self, mask):
-        self.mask = mask
-        self._has_selection = mask is not None
-        self.signal_selection_changed.emit(self)
+    # def _set_mask(self, mask):
+    #     self.mask = mask
+    #     self._has_selection = mask is not None
+    #     # self.signal_selection_changed.emit(self)
 
     def groupby(self, by=None, agg=None):
         """Return a :class:`GroupBy` or :class:`DataFrame` object when agg is not None
@@ -5449,14 +5752,15 @@ class DataFrameConcatenated(DataFrameLocal):
                 self.column_names.append(column_name)
         self.columns = {}
         for column_name in self.get_column_names(virtual=False):
-            self.columns[column_name] = ColumnConcatenatedLazy(dfs, column_name)
+            self.columns[column_name] = ColumnConcatenatedLazy([df[column_name] for df in dfs])
             self._save_assign_expression(column_name)
 
         for name in list(first.virtual_columns.keys()):
             if all([first.virtual_columns[name] == df.virtual_columns.get(name, None) for df in tail]):
                 self.virtual_columns[name] = first.virtual_columns[name]
+                self.column_names.append(name)
             else:
-                self.columns[name] = ColumnConcatenatedLazy(dfs, name)
+                self.columns[name] = ColumnConcatenatedLazy([df[name] for df in dfs])
                 self.column_names.append(name)
             self._save_assign_expression(name)
 
@@ -5474,6 +5778,10 @@ class DataFrameConcatenated(DataFrameLocal):
     def is_masked(self, column):
         if column in self.columns:
             return self.columns[column].is_masked
+        else:
+            ar = self.evaluate(column, i1=0, i2=1, parallel=False)
+            if isinstance(ar, np.ndarray) and np.ma.isMaskedArray(ar):
+                return True
         return False
 
 
@@ -5498,7 +5806,7 @@ class DataFrameArrays(DataFrameLocal):
     # def __len__(self):
     #   return len(self.columns.values()[0])
 
-    def add_column(self, name, data):
+    def add_column(self, name, data, dtype=None):
         """Add a column to the DataFrame
 
         :param str name: name of column
@@ -5510,7 +5818,7 @@ class DataFrameArrays(DataFrameLocal):
         #     self._length_unfiltered = len(data)
         #     self._length_original = len(data)
         #     self._index_end = self._length_unfiltered
-        super(DataFrameArrays, self).add_column(name, data)
+        super(DataFrameArrays, self).add_column(name, data, dtype=dtype)
         self._length_unfiltered = int(round(self._length_original * self._active_fraction))
         # self.set_active_fraction(self._active_fraction)
 
@@ -5526,4 +5834,3 @@ class DataFrameArrays(DataFrameLocal):
         If any of the columns contain masked arrays, the masks are ignored (i.e. the masked elements are returned as well).
         """
         return self.__array__()
-

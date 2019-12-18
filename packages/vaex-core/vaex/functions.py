@@ -2,10 +2,11 @@ import vaex.serialize
 import json
 import numpy as np
 from vaex import column
-from vaex.column import _to_string_sequence, _to_string_list_sequence
+from vaex.column import _to_string_sequence, _to_string_column, _to_string_list_sequence, _is_stringy
 import re
 import vaex.expression
 import functools
+import six
 
 # @vaex.serialize.register_function
 # class Function(FunctionSerializable):
@@ -13,11 +14,15 @@ import functools
 scopes = {
     'str': vaex.expression.StringOperations,
     'str_pandas': vaex.expression.StringOperationsPandas,
-    'dt': vaex.expression.DateTime
+    'dt': vaex.expression.DateTime,
+    'td': vaex.expression.TimeDelta
 }
 
-def register_function(scope=None, as_property=False, name=None):
+def register_function(scope=None, as_property=False, name=None, on_expression=True):
     """Decorator to register a new function with vaex.
+
+    If on_expression is True, the function will be available as a method on an
+    Expression, where the first argument will be the expression itself.
 
     Example:
 
@@ -47,25 +52,26 @@ def register_function(scope=None, as_property=False, name=None):
         if name.startswith(prefix):
             name = name[len(prefix):]
         full_name = prefix + name
-        if scope:
-            def closure(name=name, full_name=full_name, function=f):
-                def wrapper(self, *args, **kwargs):
-                    lazy_func = getattr(self.expression.ds.func, full_name)
-                    args = (self.expression, ) + args
-                    return lazy_func(*args, **kwargs)
-                return functools.wraps(function)(wrapper)
-            if as_property:
-                setattr(scopes[scope], name, property(closure()))
+        if on_expression:
+            if scope:
+                def closure(name=name, full_name=full_name, function=f):
+                    def wrapper(self, *args, **kwargs):
+                        lazy_func = getattr(self.expression.ds.func, full_name)
+                        args = (self.expression, ) + args
+                        return lazy_func(*args, **kwargs)
+                    return functools.wraps(function)(wrapper)
+                if as_property:
+                    setattr(scopes[scope], name, property(closure()))
+                else:
+                    setattr(scopes[scope], name, closure())
             else:
-                setattr(scopes[scope], name, closure())
-        else:
-            def closure(name=name, full_name=full_name, function=f):
-                def wrapper(self, *args, **kwargs):
-                    lazy_func = getattr(self.ds.func, full_name)
-                    args = (self, ) + args
-                    return lazy_func(*args, **kwargs)
-                return functools.wraps(function)(wrapper)
-            setattr(vaex.expression.Expression, name, closure())
+                def closure(name=name, full_name=full_name, function=f):
+                    def wrapper(self, *args, **kwargs):
+                        lazy_func = getattr(self.ds.func, full_name)
+                        args = (self, ) + args
+                        return lazy_func(*args, **kwargs)
+                    return functools.wraps(function)(wrapper)
+                setattr(vaex.expression.Expression, name, closure())
         vaex.expression.expression_namespace[prefix + name] = f
         return f  # we leave the original function as is
     return wrapper
@@ -101,6 +107,7 @@ minimum
 maximum
 clip
 searchsorted
+isfinite
 """.strip().split()]
 for name, numpy_name in numpy_function_mapping:
     if not hasattr(np, numpy_name):
@@ -111,37 +118,122 @@ for name, numpy_name in numpy_function_mapping:
             def wrapper(*args, **kwargs):
                 return function(*args, **kwargs)
             return wrapper
-        try:
-            function = functools.wraps(function)(f())
-        except AttributeError:
-            function = f()  # python 2 case
+        function = f()
+        function.__doc__ = "Lazy wrapper around :py:data:`numpy.%s`" % name
+
         register_function(name=name)(function)
 
 
 @register_function()
-def fillna(ar, value, fill_nan=True, fill_masked=True):
+def fillmissing(ar, value):
     '''Returns an array where missing values are replaced by value.
+    See :`ismissing` for the definition of missing values.
+    '''
+    # TODO: optimize, we don't want to_numpy for strings, we want to
+    # do this in c++
+    ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
+    mask = ismissing(ar)
+    if np.any(mask):
+        if np.ma.isMaskedArray(ar):
+            ar = ar.data.copy()
+        else:
+            ar = ar.copy()
+        ar[mask] = value
+    return ar
 
-    If the dtype is object, nan values and 'nan' string values
-    are replaced by value when fill_nan==True.
+
+@register_function()
+def fillnan(ar, value):
+    '''Returns an array where nan values are replaced by value.
+    See :`isnan` for the definition of missing values.
+    '''
+    # TODO: optimize, we don't want to convert string to numpy
+    # they will never contain nan
+    if not _is_stringy(ar):
+        ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
+        if ar.dtype.kind in 'fO':
+            mask = isnan(ar)
+            if np.any(mask):
+                ar = ar.copy()
+                ar[mask] = value
+    return ar
+
+
+@register_function()
+def fillna(ar, value):
+    '''Returns an array where NA values are replaced by value.
+    See :`isna` for the definition of missing values.
+
     '''
     ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
-    if ar.dtype.kind in 'O' and fill_nan:
-        strings = ar.astype(str)
-        mask = strings == 'nan'
-        ar = ar.copy()
-        ar[mask] = value
-    elif ar.dtype.kind in 'f' and fill_nan:
-        mask = np.isnan(ar)
-        if np.any(mask):
-            ar = ar.copy()
-            ar[mask] = value
-    if fill_masked and np.ma.isMaskedArray(ar):
-        mask = ar.mask
-        if np.any(mask):
+    mask = isna(ar)
+    if np.any(mask):
+        if np.ma.isMaskedArray(ar):
             ar = ar.data.copy()
-            ar[mask] = value
+        else:
+            ar = ar.copy()
+        ar[mask] = value
     return ar
+
+@register_function()
+def ismissing(x):
+    """Returns True where there are missing values (masked arrays), missing strings or None"""
+    if np.ma.isMaskedArray(x):
+        if x.dtype.kind in 'O':
+            if x.mask is not None:
+                return (x.data == None) | x.mask
+            else:
+                return (x.data == None)
+        else:
+            return x.mask == 1
+    else:
+        if not isinstance(x, np.ndarray) or x.dtype.kind in 'US':
+            x = _to_string_sequence(x)
+            mask = x.mask()
+            if mask is None:
+                mask = np.zeros(x.length, dtype=np.bool)
+            return mask
+        elif isinstance(x, np.ndarray) and x.dtype.kind in 'O':
+            return x == None
+        else:
+            return np.zeros(len(x), dtype=np.bool)
+
+
+@register_function()
+def notmissing(x):
+    return ~ismissing(x)
+
+
+@register_function()
+def isnan(x):
+    """Returns an array where there are NaN values"""
+    if isinstance(x, np.ndarray):
+        if np.ma.isMaskedArray(x):
+            # we don't want a masked arrays
+            w = x.data != x.data
+            w[x.mask] = False
+            return w
+        else:
+            return x != x
+    else:
+        return np.zeros(len(x), dtype=np.bool)
+
+
+@register_function()
+def notnan(x):
+    return ~isnan(x)
+
+
+@register_function()
+def isna(x):
+    """Returns a boolean expression indicating if the values are Not Availiable (missing or NaN)."""
+    return isnan(x) | ismissing(x)
+
+
+@register_function()
+def notna(x):
+    """Opposite of isna"""
+    return ~isna(x)
 
 
 ########## datetime operations ##########
@@ -183,7 +275,7 @@ def dt_dayofweek(x):
     2  3
     """
     import pandas as pd
-    return pd.Series(x).dt.dayofweek.values
+    return pd.Series(_pandas_dt_fix(x)).dt.dayofweek.values
 
 @register_function(scope='dt', as_property=True)
 def dt_dayofyear(x):
@@ -212,7 +304,7 @@ def dt_dayofyear(x):
     2  316
     """
     import pandas as pd
-    return pd.Series(x).dt.dayofyear.values
+    return pd.Series(_pandas_dt_fix(x)).dt.dayofyear.values
 
 @register_function(scope='dt', as_property=True)
 def dt_is_leap_year(x):
@@ -241,7 +333,7 @@ def dt_is_leap_year(x):
     2  False
     """
     import pandas as pd
-    return pd.Series(x).dt.is_leap_year.values
+    return pd.Series(_pandas_dt_fix(x)).dt.is_leap_year.values
 
 @register_function(scope='dt', as_property=True)
 def dt_year(x):
@@ -270,7 +362,7 @@ def dt_year(x):
     2  2015
     """
     import pandas as pd
-    return pd.Series(x).dt.year.values
+    return pd.Series(_pandas_dt_fix(x)).dt.year.values
 
 @register_function(scope='dt', as_property=True)
 def dt_month(x):
@@ -299,7 +391,7 @@ def dt_month(x):
     2  11
     """
     import pandas as pd
-    return pd.Series(x).dt.month.values
+    return pd.Series(_pandas_dt_fix(x)).dt.month.values
 
 @register_function(scope='dt', as_property=True)
 def dt_month_name(x):
@@ -357,7 +449,7 @@ def dt_day(x):
     2  12
     """
     import pandas as pd
-    return pd.Series(x).dt.day.values
+    return pd.Series(_pandas_dt_fix(x)).dt.day.values
 
 @register_function(scope='dt', as_property=True)
 def dt_day_name(x):
@@ -415,7 +507,7 @@ def dt_weekofyear(x):
     2  46
     """
     import pandas as pd
-    return pd.Series(x).dt.weekofyear.values
+    return pd.Series(_pandas_dt_fix(x)).dt.weekofyear.values
 
 @register_function(scope='dt', as_property=True)
 def dt_hour(x):
@@ -444,7 +536,7 @@ def dt_hour(x):
     2  11
     """
     import pandas as pd
-    return pd.Series(x).dt.hour.values
+    return pd.Series(_pandas_dt_fix(x)).dt.hour.values
 
 @register_function(scope='dt', as_property=True)
 def dt_minute(x):
@@ -473,7 +565,7 @@ def dt_minute(x):
     2  34
     """
     import pandas as pd
-    return pd.Series(x).dt.minute.values
+    return pd.Series(_pandas_dt_fix(x)).dt.minute.values
 
 @register_function(scope='dt', as_property=True)
 def dt_second(x):
@@ -502,10 +594,215 @@ def dt_second(x):
     2  22
     """
     import pandas as pd
-    return pd.Series(x).dt.second.values
+    return pd.Series(_pandas_dt_fix(x)).dt.second.values
+
+########## timedelta operations ##########
+
+@register_function(scope='td', as_property=True)
+def td_days(x):
+    """Number of days in each timedelta sample.
+
+    :returns: an expression containing the number of days in a timedelta sample.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> delta = np.array([17658720110,   11047049384039, 40712636304958, -18161254954], dtype='timedelta64[s]')
+    >>> df = vaex.from_arrays(delta=delta)
+    >>> df
+      #  delta
+      0  204 days +9:12:00
+      1  1 days +6:41:10
+      2  471 days +5:03:56
+      3  -22 days +23:31:15
+
+    >>> df.delta.td.days
+    Expression = td_days(delta)
+    Length: 4 dtype: int64 (expression)
+    -----------------------------------
+    0  204
+    1    1
+    2  471
+    3  -22
+    """
+    import pandas as pd
+    return pd.Series(_pandas_dt_fix(x)).dt.days.values
+
+@register_function(scope='td', as_property=True)
+def td_microseconds(x):
+    """Number of microseconds (>= 0 and less than 1 second) in each timedelta sample.
+
+    :returns: an expression containing the number of microseconds in a timedelta sample.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> delta = np.array([17658720110,   11047049384039, 40712636304958, -18161254954], dtype='timedelta64[s]')
+    >>> df = vaex.from_arrays(delta=delta)
+    >>> df
+      #  delta
+      0  204 days +9:12:00
+      1  1 days +6:41:10
+      2  471 days +5:03:56
+      3  -22 days +23:31:15
+
+    >>> df.delta.td.microseconds
+    Expression = td_microseconds(delta)
+    Length: 4 dtype: int64 (expression)
+    -----------------------------------
+    0  290448
+    1  978582
+    2   19583
+    3  709551
+    """
+    import pandas as pd
+    return pd.Series(_pandas_dt_fix(x)).dt.microseconds.values
+
+@register_function(scope='td', as_property=True)
+def td_nanoseconds(x):
+    """Number of nanoseconds (>= 0 and less than 1 microsecond) in each timedelta sample.
+
+    :returns: an expression containing the number of nanoseconds in a timedelta sample.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> delta = np.array([17658720110,   11047049384039, 40712636304958, -18161254954], dtype='timedelta64[s]')
+    >>> df = vaex.from_arrays(delta=delta)
+    >>> df
+      #  delta
+      0  204 days +9:12:00
+      1  1 days +6:41:10
+      2  471 days +5:03:56
+      3  -22 days +23:31:15
+
+    >>> df.delta.td.nanoseconds
+    Expression = td_nanoseconds(delta)
+    Length: 4 dtype: int64 (expression)
+    -----------------------------------
+    0  384
+    1   16
+    2  488
+    3  616
+    """
+    import pandas as pd
+    return pd.Series(_pandas_dt_fix(x)).dt.nanoseconds.values
+
+@register_function(scope='td', as_property=True)
+def td_seconds(x):
+    """Number of seconds (>= 0 and less than 1 day) in each timedelta sample.
+
+    :returns: an expression containing the number of seconds in a timedelta sample.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> delta = np.array([17658720110,   11047049384039, 40712636304958, -18161254954], dtype='timedelta64[s]')
+    >>> df = vaex.from_arrays(delta=delta)
+    >>> df
+      #  delta
+      0  204 days +9:12:00
+      1  1 days +6:41:10
+      2  471 days +5:03:56
+      3  -22 days +23:31:15
+
+    >>> df.delta.td.seconds
+    Expression = td_seconds(delta)
+    Length: 4 dtype: int64 (expression)
+    -----------------------------------
+    0  30436
+    1  39086
+    2  28681
+    3  23519
+    """
+    import pandas as pd
+    return pd.Series(_pandas_dt_fix(x)).dt.seconds.values
+
+@register_function(scope='td', as_property=False)
+def td_total_seconds(x):
+    """Total duration of each timedelta sample expressed in seconds.
+
+    :return: an expression containing the total number of seconds in a timedelta sample.
+
+    Example:
+    >>> import vaex
+    >>> import numpy as np
+    >>> delta = np.array([17658720110,   11047049384039, 40712636304958, -18161254954], dtype='timedelta64[s]')
+    >>> df = vaex.from_arrays(delta=delta)
+    >>> df
+      #  delta
+      0  204 days +9:12:00
+      1  1 days +6:41:10
+      2  471 days +5:03:56
+      3  -22 days +23:31:15
+
+    >>> df.delta.td.total_seconds()
+    Expression = td_total_seconds(delta)
+    Length: 4 dtype: float64 (expression)
+    -------------------------------------
+    0  -7.88024e+08
+    1  -2.55032e+09
+    2   6.72134e+08
+    3   2.85489e+08
+    """
+    import pandas as pd
+    return pd.Series(_pandas_dt_fix(x)).dt.total_seconds().values
 
 
 ########## string operations ##########
+
+@register_function(scope='str')
+def str_equals(x, y):
+    """Tests if strings x and y are the same
+
+    :returns: a boolean expression
+
+    Example:
+
+    >>> import vaex
+    >>> text = ['Something', 'very pretty', 'is coming', 'our', 'way.']
+    >>> df = vaex.from_arrays(text=text)
+    >>> df
+      #  text
+      0  Something
+      1  very pretty
+      2  is coming
+      3  our
+      4  way.
+
+    >>> df.text.str.equals(df.text)
+    Expression = str_equals(text, text)
+    Length: 5 dtype: bool (expression)
+    ----------------------------------
+    0  True
+    1  True
+    2  True
+    3  True
+    4  True
+
+    >>> df.text.str.equals('our')
+    Expression = str_equals(text, 'our')
+    Length: 5 dtype: bool (expression)
+    ----------------------------------
+    0  False
+    1  False
+    2  False
+    3   True
+    4  False
+    """
+    xmask = None
+    ymask = None
+    if not isinstance(x, six.string_types):
+        x = _to_string_sequence(x)
+    if not isinstance(y, six.string_types):
+        y = _to_string_sequence(y)
+    equals_mask = x.equals(y)
+    return equals_mask
+
 
 @register_function(scope='str')
 def str_capitalize(x):
@@ -569,9 +866,14 @@ def str_cat(x, other):
     3                  ourour
     4                way.way.
     """
-    sl1 = _to_string_sequence(x)
-    sl2 = _to_string_sequence(other)
-    sl = sl1.concat(sl2)
+    if isinstance(x, six.string_types):
+        other = _to_string_sequence(other)
+        sl = other.concat_reverse(x)
+    else:
+        x = _to_string_sequence(x)
+        if not isinstance(other, six.string_types):
+            other = _to_string_sequence(other)
+        sl = x.concat(other)
     return column.ColumnStringArrow.from_string_sequence(sl)
 
 @register_function(scope='str')
@@ -584,6 +886,7 @@ def str_center(x, width, fillchar=' '):
     :returns: an expression containing the filled strings.
 
     Example:
+
     >>> import vaex
     >>> text = ['Something', 'very pretty', 'is coming', 'our', 'way.']
     >>> df = vaex.from_arrays(text=text)
@@ -1720,6 +2023,9 @@ def to_string(x):
 def format(x, format):
     """Uses http://www.cplusplus.com/reference/string/to_string/ for formatting"""
     # don't change the dtype, otherwise for each block the dtype may be different (string length)
+    if not isinstance(x, np.ndarray) or x.dtype.kind in 'US':
+        # sometimes the dtype can be object, but seen as an string array
+        x = _to_string_sequence(x)
     sl = vaex.strings.format(x, format)
     return column.ColumnStringArrow(sl.bytes, sl.indices, sl.length, sl.offset, string_sequence=sl)
 
@@ -1727,6 +2033,7 @@ def format(x, format):
 for name in dir(scopes['str']):
     if name.startswith('__'):
         continue
+    force_string = ['get']
     def pandas_wrapper(name=name):
         def wrapper(*args, **kwargs):
             import pandas
@@ -1739,7 +2046,10 @@ for name in dir(scopes['str']):
             args = args[1:]
             series = pandas.Series(x)
             method = getattr(series.str, name)
-            return method(*args, **kwargs)
+            value = method(*args, **kwargs)
+            if name in force_string:
+                value = _to_string_column(value.values, force=True)
+            return value
         return wrapper
     wrapper = pandas_wrapper()
     wrapper.__doc__ = "Wrapper around pandas.Series.%s" % name
@@ -1786,9 +2096,26 @@ def _choose_masked(ar, choices):
 def _float(x):
     return x.astype(np.float64)
 
-@register_function(name='astype')
+@register_function(name='astype', on_expression=False)
 def _astype(x, dtype):
+    if dtype == 'str':
+        mask = np.isnan(x)
+        x = x.astype(dtype).astype('O')
+        x[mask] = None
+        return _to_string_column(x)
+    # we rely on numpy for astype conversions (TODO: possible performance hit?)
+    if isinstance(x, vaex.column.ColumnString):
+        x = x.to_numpy()
     return x.astype(dtype)
+
+
+@register_function(name='isin', on_expression=False)
+def _isin(x, values):
+    if vaex.column._is_stringy(x):
+        x = vaex.column._to_string_column(x)
+        return x.string_sequence.isin(values)
+    else:
+        return np.isin(x, values)
 
 
 def add_geo_json(ds, json_or_file, column_name, longitude_expression, latitude_expresion, label=None, persist=True, overwrite=False, inplace=False, mapping=None):

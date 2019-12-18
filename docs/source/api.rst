@@ -61,7 +61,7 @@ vaex-core
 
 
 DataFrame class
-~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~
 
 .. autoclass:: vaex.dataframe.DataFrame
      :members:
@@ -69,7 +69,7 @@ DataFrame class
 
 
 DataFrameLocal class
-~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: vaex.dataframe.DataFrameLocal
      :members:
@@ -83,29 +83,65 @@ Expression class
      :members:
      :special-members:
 
-
-
-String operations
-~~~~~~~~~~~~~~~~
-
-.. autoclass:: vaex.expression.StringOperations
-     :members:
-     :special-members:
-
-.. autoclass:: vaex.expression.StringOperationsPandas
-     :members:
-     :special-members:
-
-
-vaex.stat module
-~~~~~~~~~~~~~~~~
+Aggregation and statistics
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: vaex.stat
     :members:
 
 
+.. automodule:: vaex.agg
+    :members:
+
 .. .. autoclass:: vaex.stat.Statistic
 ..     :members:
+
+
+Extensions
+----------
+
+String operations
+~~~~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.expression.StringOperations
+     :members:
+     :special-members:
+
+String (pandas) operations
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.expression.StringOperationsPandas
+     :members:
+     :special-members:
+
+Date/time operations
+~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.expression.DateTime
+     :members:
+     :special-members:
+
+Timedelta operations
+~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.expression.TimeDelta
+     :members:
+     :special-members:
+
+Geo operations
+~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.geo.DataFrameAccessorGeo
+     :members:
+     :special-members:
+
+GraphQL operations
+~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: vaex.graphql.DataFrameAccessorGraphQL
+     :members:
+     :special-members:
+
 
 
 .. .. Subpackages
@@ -226,8 +262,6 @@ vaex.stat module
 Machine learning with vaex.ml
 -----------------------------
 
-Note that vaex.ml does not fall under the MIT, but the `CC BY-CC-ND <https://creativecommons.org/licenses/by-nc-nd/4.0/>`_ LICENSE, which means it's ok for personal or academic use. You can install vaex-ml using `pip install vaex-ml`.
-
 
 Clustering
 ~~~~~~~~~~
@@ -266,9 +300,6 @@ Boosted trees
 ~~~~~~~~~~~~~
 
 .. autoclass:: vaex.ml.lightgbm.LightGBMModel
-     :members:
-
-.. autoclass:: vaex.ml.lightgbm.LightGBMClassifier
      :members:
 
 .. autoclass:: vaex.ml.xgboost.XGBoostModel

@@ -124,7 +124,7 @@ class Executor(object):
             # Qt's eventloop, which may execute code that will call execute again
             # as long as that code is using delay tasks (i.e. promises) we can simple return here, since after
             # the execute is almost finished, any new tasks added to the task_queue will get executing
-            return
+            raise RuntimeError("nested execute call")
         # u 'column' is uniquely identified by a tuple of (df, expression)
         self._is_executing = True
         try:
@@ -156,7 +156,23 @@ class Executor(object):
                 for df in dfs:
                     self.passes += 1
                     task_queue = [task for task in task_queue_all if task.df == df]
+                    pre_filter = task_queue[0].pre_filter
+                    if any(pre_filter != task.pre_filter for task in task_queue[1:]):
+                        raise ValueError("All tasks need to be pre_filter'ed or not pre_filter'ed, it cannot be mixed")
+                    if pre_filter and not df.filtered:
+                        raise ValueError("Requested pre_filter for task while DataFrame is not filtered")
                     expressions = list(set(expression for task in task_queue for expression in task.expressions_all))
+
+                    # (re) thrown exceptions as soon as possible to avoid complicated stack traces
+                    for task in task_queue:
+                        if task.isRejected:
+                            task.get()
+                        if hasattr(task, "check"):
+                            try:
+                                task.check()
+                            except Exception as e:
+                                task.reject(e)
+                                raise
 
                     for task in task_queue:
                         task._results = []
@@ -167,12 +183,22 @@ class Executor(object):
                         if not cancelled[0]:
                             block_scope = block_scopes[thread_index]
                             block_scope.move(i1, i2)
+                            if pre_filter:
+                                filter_mask = df.evaluate_selection_mask(None, i1=i1, i2=i2, cache=True)
+                            else:
+                                filter_mask = None
+                            block_scope.mask = filter_mask
                             # with ne_lock:
                             block_dict = {expression: block_scope.evaluate(expression) for expression in expressions}
                             for task in task_queue:
                                 blocks = [block_dict[expression] for expression in task.expressions_all]
                                 if not cancelled[0]:
-                                    task._results.append(task.map(thread_index, i1, i2, *blocks))
+                                    try:
+                                        task._results.append(task.map(thread_index, i1, i2, filter_mask, *blocks))
+                                    except Exception as e:
+                                        task.reject(e)
+                                        cancelled[0] = True
+                                        raise
                                 # don't call directly, since ui's don't like being updated from a different thread
                                 # self.thread_mover(task.signal_progress, float(i2)/length)
 # time.sleep(0.1)

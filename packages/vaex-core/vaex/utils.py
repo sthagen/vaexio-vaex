@@ -13,6 +13,7 @@ import sys
 import time
 import warnings
 import numbers
+import keyword
 
 import numpy as np
 import progressbar
@@ -207,8 +208,6 @@ def get_private_dir(subdir=None, *extra):
         os.makedirs(path)
     return path
 
-def should_cache():
-    return os.path.exists(os.path.join(get_private_dir(), 'file-cache'))
 
 def make_list(sequence):
     if isinstance(sequence, np.ndarray):
@@ -539,7 +538,8 @@ def filename_shorten(path, max_length=150):
 
 
 def listify(*args):
-    if isinstance(args[0], six.string_types):
+    import vaex.expression
+    if isinstance(args[0], (six.string_types, vaex.expression.Expression)):
         return False, [[x] for x in args]
     try:
         _ = args[0][0]
@@ -562,6 +562,8 @@ def unlistify(waslist, *args):
 def find_valid_name(name, used=[]):
     first, rest = name[0], name[1:]
     name = re.sub("[^a-zA-Z_]", "_", first) + re.sub("[^a-zA-Z_0-9]", "_", rest)
+    if keyword.iskeyword(name):
+        name += '_'
     if name in used:
         nr = 1
         while name + ("_%d" % nr) in used:
@@ -876,8 +878,10 @@ def find_type_from_dtype(namespace, prefix, dtype, transient=True):
         postfix = str(dtype)
         if postfix == '>f8':
             postfix = 'float64'
-        if dtype.kind in "mM":
+        if dtype.kind == "M":
             postfix = "uint64"
+        if dtype.kind == "m":
+            postfix = "int64"
         # for object there is no non-native version
         if dtype.kind != 'O' and dtype.byteorder not in ["<", "=", "|"]:
             postfix += "_non_native"
@@ -895,5 +899,32 @@ def to_native_dtype(dtype):
         return dtype
 
 
+def to_native_array(ar):
+    if ar.dtype.byteorder not in "<=|":
+        return ar.astype(to_native_dtype(ar.dtype))
+    else:
+        return ar
+
+
 def extract_central_part(ar):
     return ar[(slice(2,-1), ) * ar.ndim]
+
+def unmask_selection_mask(selection_mask):
+    if np.ma.isMaskedArray(selection_mask):
+        # if we are doing a selection on a masked array
+        selection_mask, mask = selection_mask.data, np.ma.getmaskarray(selection_mask)
+        # exclude the masked values
+        selection_mask = selection_mask & ~mask
+    return selection_mask
+
+
+def upcast(dtype):
+    if dtype.kind == "b":
+        return np.dtype('int64')
+    if dtype.kind == "i":
+        return np.dtype('int64')
+    if dtype.kind == "u":
+        return np.dtype('uint64')
+    if dtype.kind == "f":
+        return np.dtype('float64')
+    return dtype

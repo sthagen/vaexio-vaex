@@ -6,7 +6,7 @@ import threading
 import uuid
 import time
 import ast
-from .dataset import Dataset
+from .dataframe import DataFrame, default_shape
 from .utils import _issequence
 from .tasks import Task
 from .legacy import Subspace
@@ -18,7 +18,6 @@ import tornado.httputil
 import tornado.websocket
 from tornado.concurrent import Future
 from tornado import gen
-from .dataset import default_shape
 import tornado.ioloop
 import json
 import astropy.units
@@ -38,8 +37,8 @@ except ImportError:
 
 
 logger = logging.getLogger("vaex.remote")
-
 DEFAULT_REQUEST_TIMEOUT = 60 * 5  # 5 minutes
+forwarded_method_names = []  # all method names on DataFrame that get forwarded to the server
 
 
 def wrap_future_with_promise(future):
@@ -84,10 +83,12 @@ def _check_error(object):
 
 
 class ServerRest(object):
-    def __init__(self, hostname, port=5000, base_path="/", background=False, thread_mover=None, websocket=True):
+    def __init__(self, hostname, port=5000, base_path="/", background=False, thread_mover=None, websocket=True, token=None, token_trusted=None):
         self.hostname = hostname
         self.port = port
         self.base_path = base_path if base_path.endswith("/") else (base_path + "/")
+        self.token = token
+        self.token_trusted = token_trusted
         # if delay:
         event = threading.Event()
         self.thread_mover = thread_mover or (lambda fn, *args, **kwargs: fn(*args, **kwargs))
@@ -157,6 +158,7 @@ class ServerRest(object):
         def do():
             try:
                 logger.debug("wrapping promise")
+                logger.debug("connecting to: %s", self._build_url("websocket"))
                 connected = wrap_future_with_promise(tornado.websocket.websocket_connect(self._build_url("websocket"), on_message_callback=self._on_websocket_message))
                 logger.debug("continue")
                 self.websocket_connected.fulfill(connected)
@@ -269,6 +271,10 @@ class ServerRest(object):
         arguments["job_id"] = job_id
         arguments["path"] = path
         arguments["user_id"] = self.user_id
+        if self.token:
+            arguments["token"] = self.token
+        if self.token_trusted:
+            arguments["token_trusted"] = self.token_trusted
         # arguments = dict({key: (value.tolist() if hasattr(value, "tolist") else value) for key, value in arguments.items()})
         arguments = dict({key: listify(value) for key, value in arguments.items()})
 
@@ -374,7 +380,12 @@ class ServerRest(object):
             datasets = [create(self, kwargs) for kwargs in result]
             logger.debug("datasets: %r", datasets)
             return datasets if not as_dict else dict([(ds.name, ds) for ds in datasets])
-        return self.submit(path="datasets", arguments={}, post_process=post, delay=delay)
+        arguments = {}
+        if self.token:
+            arguments["token"] = self.token
+        if self.token_trusted:
+            arguments["token_trusted"] = self.token_trusted
+        return self.submit(path="datasets", arguments=arguments, post_process=post, delay=delay)
 
     def _build_url(self, method):
         protocol = "ws" if self.use_websocket else "http"
@@ -397,13 +408,13 @@ class ServerRest(object):
                     return np.array(result)
                 except ValueError:
                     return result
-        dataset_name = subspace.dataset.name
+        dataset_name = subspace.df.name
         expressions = subspace.expressions
         delay = subspace.delay
         path = "datasets/%s/%s" % (dataset_name, method_name)
         url = self._build_url(path)
         arguments = dict(kwargs)
-        dataset_remote = subspace.dataset
+        dataset_remote = subspace.df
         arguments["selection"] = subspace.is_masked
         arguments['state'] = dataset_remote.state_get()
         arguments['auto_fraction'] = dataset_remote.get_auto_fraction()
@@ -414,12 +425,8 @@ class ServerRest(object):
         def post_process(result):
             # result = self._check_exception(json.loads(result.body))["result"]
             if numpy:
-                return np.fromstring(result, dtype=np.float64)
-            else:
-                try:
-                    return np.array(result)
-                except ValueError:
-                    return result
+                result = np.fromstring(result, dtype=np.float64)
+            return result
         path = "datasets/%s/%s" % (dataset_remote.name, method_name)
         arguments = dict(kwargs)
         arguments['state'] = dataset_remote.state_get()
@@ -466,48 +473,61 @@ class SubspaceRemote(Subspace):
             return promise
 
     def sleep(self, seconds, delay=False):
-        return self.dataset.server.call("sleep", seconds, delay=delay)
+        return self.df.server.call("sleep", seconds, delay=delay)
 
     def minmax(self):
-        return self._task(self.dataset.server._call_subspace("minmax", self))
+        return self._task(self.df.server._call_subspace("minmax", self))
         # return self._task(task)
 
     def histogram(self, limits, size=256, weight=None):
-        return self._task(self.dataset.server._call_subspace("histogram", self, size=size, limits=limits, weight=weight))
+        return self._task(self.df.server._call_subspace("histogram", self, size=size, limits=limits, weight=weight))
 
     def nearest(self, point, metric=None):
         point = vaex.utils.make_list(point)
-        result = self.dataset.server._call_subspace("nearest", self, point=point, metric=metric)
+        result = self.df.server._call_subspace("nearest", self, point=point, metric=metric)
         return self._task(result)
 
     def mean(self):
-        return self.dataset.server._call_subspace("mean", self)
+        return self.df.server._call_subspace("mean", self)
 
     def correlation(self, means=None, vars=None):
-        return self.dataset.server._call_subspace("correlation", self, means=means, vars=vars)
+        return self.df.server._call_subspace("correlation", self, means=means, vars=vars)
 
     def var(self, means=None):
-        return self.dataset.server._call_subspace("var", self, means=means)
+        return self.df.server._call_subspace("var", self, means=means)
 
     def sum(self):
-        return self.dataset.server._call_subspace("sum", self)
+        return self.df.server._call_subspace("sum", self)
 
     def limits_sigma(self, sigmas=3, square=False):
-        return self.dataset.server._call_subspace("limits_sigma", self, sigmas=sigmas, square=square)
+        return self.df.server._call_subspace("limits_sigma", self, sigmas=sigmas, square=square)
 
     def mutual_information(self, limits=None, size=256):
-        return self.dataset.server._call_subspace("mutual_information", self, limits=limits, size=size)
+        return self.df.server._call_subspace("mutual_information", self, limits=limits, size=size)
 
 
-class DatasetRemote(Dataset):
+class DataFrameRemote(DataFrame):
     def __init__(self, name, server, column_names):
-        super(DatasetRemote, self).__init__(name, column_names)
+        super(DataFrameRemote, self).__init__(name, column_names)
         self.server = server
 
+def forward(f=None, has_delay=False):
+    assert not has_delay
+    def decorator(method):
+        method_name = method.__name__
+        forwarded_method_names.append(method_name)
+        def wrapper(df, *args, **kwargs):
+            return df.server._call_dataset(method_name, df, delay=has_delay, *args, **kwargs)
+        return wrapper
+    if f is None:
+        return decorator
+    else:
+        return decorator(f)
 
-class DatasetRest(DatasetRemote):
+
+class DatasetRest(DataFrameRemote):
     def __init__(self, server, name, column_names, dtypes, length_original):
-        DatasetRemote.__init__(self, name, server.hostname, column_names)
+        DataFrameRemote.__init__(self, name, server.hostname, column_names)
         self.server = server
         self.name = name
         self.column_names = column_names
@@ -550,6 +570,12 @@ class DatasetRest(DatasetRemote):
     def minmax(self, expression, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
         return self._delay(delay, self.server._call_dataset("minmax", self, delay=True, progress=progress, expression=expression, binby=binby, limits=limits, shape=shape, selection=selection))
 
+    def min(self, expression, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
+        return self._delay(delay, self.server._call_dataset("min", self, delay=True, progress=progress, expression=expression, binby=binby, limits=limits, shape=shape, selection=selection))
+
+    def max(self, expression, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
+        return self._delay(delay, self.server._call_dataset("max", self, delay=True, progress=progress, expression=expression, binby=binby, limits=limits, shape=shape, selection=selection))
+
     # def count(self, expression=None, binby=[], limits=None, shape=default_shape, selection=False, delay=False):
     def cov(self, x, y=None, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
         return self._delay(delay, self.server._call_dataset("cov", self, delay=True, progress=progress, x=x, y=y, binby=binby, limits=limits, shape=shape, selection=selection))
@@ -574,6 +600,10 @@ class DatasetRest(DatasetRemote):
 
     def is_local(self): return False
 
+    @forward()
+    def _head_and_tail_table(self, n=5, format='html'):
+        raise NotImplemented
+
     def __repr__(self):
         name = self.__class__.__module__ + "." + self.__class__.__name__
         return "<%s(server=%r, name=%r, column_names=%r, __len__=%r)> instance at 0x%x" % (name, self.server, self.name, self.column_names, len(self), id(self))
@@ -581,10 +611,10 @@ class DatasetRest(DatasetRemote):
     def __call__(self, *expressions, **kwargs):
         return SubspaceRemote(self, expressions, kwargs.get("executor") or self.executor, delay=kwargs.get("delay", False))
 
-    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, delay=False):
+    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, parallel=True, delay=False):
         expression = _ensure_strings_from_expressions(expression)
         """basic support for evaluate at server, at least to run some unittest, do not expect this to work from strings"""
-        result = self.server._call_dataset("evaluate", self, expression=expression, i1=i1, i2=i2, selection=selection, delay=delay)
+        result = self.server._call_dataset("evaluate", self, expression=expression, i1=i1, i2=i2, selection=selection, parallel=parallel, delay=delay)
         # TODO: we ignore out
         return result
 
