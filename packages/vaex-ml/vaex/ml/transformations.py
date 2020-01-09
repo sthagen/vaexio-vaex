@@ -573,3 +573,209 @@ class RobustScaler(Transformer):
                 expr = expr / self.scale_[i]
             copy[name] = expr
         return copy
+
+
+@register
+@generate.register
+class CycleTransformer(Transformer):
+    '''A strategy for transforming cyclical features (e.g. angles, time).
+
+    Think of each feature as an angle of a unit circle in polar coordinates,
+    and then and then obtaining the x and y coordinate projections,
+    or the cos and sin components respectively.
+
+    Suitable for a variaty of machine learning tasks.
+    It preserves the cyclical continuity of the feature.
+    Inspired by: http://blog.davidkaleko.com/feature-engineering-cyclical-features.html
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(days=[0, 1, 2, 3, 4, 5, 6])
+    >>> cyctrans = vaex.ml.CycleTransformer(n=7, features=['days'])
+    >>> cyctrans.fit_transform(df)
+      #    days     days_x     days_y
+      0       0   1          0
+      1       1   0.62349    0.781831
+      2       2  -0.222521   0.974928
+      3       3  -0.900969   0.433884
+      4       4  -0.900969  -0.433884
+      5       5  -0.222521  -0.974928
+      6       6   0.62349   -0.781831
+    '''
+    n = traitlets.CInt(allow_none=False, help='The number of elements in one cycle.')
+    prefix_x = traitlets.Unicode(default_value="", help='Prefix for the x-component of the transformed features.').tag(ui='Text')
+    prefix_y = traitlets.Unicode(default_value="", help='Prefix for the y-component of the transformed features.').tag(ui='Text')
+    suffix_x = traitlets.Unicode(default_value="_x", help='Suffix for the x-component of the transformed features.').tag(ui='Text')
+    suffix_y = traitlets.Unicode(default_value="_y", help='Suffix for the y-component of the transformed features.').tag(ui='Text')
+
+    def fit(self, df):
+        '''
+        Fit a CycleTransformer to the DataFrame.
+
+        This is a dummy method, as it is not needed for the transformation to be applied.
+
+        :param df: A vaex DataFrame.
+        '''
+        pass
+
+    def transform(self, df):
+        '''
+        Transform a DataFrame with a CycleTransformer.
+
+        :param df: A vaex DataFrame.
+        '''
+        copy = df.copy()
+        for feature in self.features:
+            name_x = self.prefix_x + feature + self.suffix_x
+            copy[name_x] = np.cos(2 * np.pi * copy[feature] / self.n)
+            name_y = self.prefix_y + feature + self.suffix_y
+            copy[name_y] = np.sin(2 * np.pi * copy[feature] / self.n)
+
+        return copy
+
+
+class BayesianTargetEncoder(Transformer):
+    '''Encode categorical variables with a Bayesian Target Encoder.
+
+    The categories are encoded by the mean of their target value,
+    which is adjusted by the global mean value of the target variable
+    using a Bayesian schema. For a larger `weight` value, the target
+    encodings are smoothed toward the global mean, while for a
+    `weight` of 0, the encodings are just the mean target value per
+    class.
+
+    Reference: https://www.wikiwand.com/en/Bayes_estimator#/Practical_example_of_Bayes_estimators
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(x=['a', 'a', 'a', 'a', 'b', 'b', 'b', 'b'],
+    ...                       y=[1, 1, 1, 0, 0, 0, 0, 1])
+    >>> target_encoder = vaex.ml.BayesianTargetEncoder(features=['x'], weight=4)
+    >>> target_encoder.fit_transform(df, 'y')
+      #  x      y    mean_encoded_x
+      0  a      1             0.625
+      1  a      1             0.625
+      2  a      1             0.625
+      3  a      0             0.625
+      4  b      0             0.375
+      5  b      0             0.375
+      6  b      0             0.375
+      7  b      1             0.375
+    '''
+    target = traitlets.Unicode(help='The name of the column containing the target variable.')
+    weight = traitlets.CFloat(default_value=100, allow_none=False, help='Weight to be applied to the mean encodings (smoothing parameter).')
+    prefix = traitlets.Unicode(default_value='mean_encoded_', help=help_prefix)
+    unseen = traitlets.Enum(values=['zero', 'nan'], default_value='nan', help='Strategy to deal with unseen values.')
+    mappings_ = traitlets.Dict()
+
+    def fit(self, df):
+        '''Fit a BayesianTargetEncoder to the DataFrame.
+
+        :param df: A vaex DataFrame
+        '''
+
+        # The global target mean - used for the smoothing
+        global_target_mean = df[self.target].mean().item()
+
+        # TODO: we don't have delayed groupby yet, which could speed up the case with many features (1 pass over the data)
+        for feature in self.features:
+            agg = df.groupby(feature, agg={'count': vaex.agg.count(), 'mean': vaex.agg.mean(self.target)})
+            agg['encoding'] = (agg['count'] * agg['mean'] + self.weight * global_target_mean) / (agg['count'] + self.weight)
+            self.mappings_[feature] = {value[feature]: value['encoding'] for index, value in agg.iterrows()}
+
+    def transform(self, df):
+        '''Transform a DataFrame with a fitted BayesianTargetEncoder.
+
+        :param df: A vaex DataFrame.
+        :return: A shallow copy of the DataFrame that includes the encodings.
+        :rtype: DataFrame
+        '''
+        copy = df.copy()
+        default_value = {'zero': 0., 'nan': np.nan}[self.unseen]
+        for feature in self.features:
+            name = self.prefix + feature
+            copy[name] = copy[feature].map(self.mappings_[feature],
+                                           nan_value=np.nan,
+                                           missing_value=np.nan,
+                                           default_value=default_value,
+                                           allow_missing=True)
+        return copy
+
+class WeightOfEvidenceEncoder(Transformer):
+    '''Encode categorical variables with a Weight of Evidence Encoder.
+
+    Weight of Evidence measures how well a particular feature supports
+    the given hypothesis (i.e. the target variable). With this
+    encoder, each category in a categorical feature is encoded by its
+    "strength" i.e. Weight of Evidence value. The target feature can be
+    a boolean or numerical column, where True/1 is seen as 'Good', and
+    False/0 is seen as 'Bad'
+
+    Reference: https://www.listendata.com/2015/03/weight-of-evidence-woe-and-information.html
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(x=['a', 'a', 'b', 'b', 'b', 'c', 'c'],
+    ...                       y=[1, 1, 0, 0, 1, 1, 0])
+    >>> woe_encoder = vaex.ml.WeightOfEvidenceEncoder(target='y', features=['x'])
+    >>> woe_encoder.fit_transform(df)
+      #  x      y    mean_encoded_x
+      0  a      1         13.8155
+      1  a      1         13.8155
+      2  b      0         -0.693147
+      3  b      0         -0.693147
+      4  b      1         -0.693147
+      5  c      1          0
+      6  c      0          0
+    '''
+    target = traitlets.Unicode(help='The name of the column containing the target variable.')
+    prefix = traitlets.Unicode(default_value='woe_encoded_', help=help_prefix)
+    unseen = traitlets.Enum(values=['zero', 'nan'], default_value='nan', help='Strategy to deal with unseen values.')
+    epsilon = traitlets.Float(0.000001, help="Small value taken as minimum fot the negatives, to avoid a division by zero")
+    mappings_ = traitlets.Dict()
+
+    def fit(self, df):
+        '''Fit a WeightOfEvidenceEncoder to the DataFrame.
+
+        :param df: A vaex DataFrame
+        '''
+        values = df[self.target].unique(dropna=True)
+        if not (
+                (len(values) == 2 and (0 in values and 1 in values)) or \
+                (len(values) == 1 and (0 in values or 1 in values)) or
+                len(values) == 0 # all missing values
+            ):
+            raise ValueError("Target contains values different from True/1 and False/0: %r" % values)
+        for feature in self.features:
+            # Instead of counting the goods and bad, we divide by the count
+            # which reduces to the mean
+            agg = df.groupby(feature, agg={'positive': vaex.agg.mean(self.target)})
+            agg['negative'] = 1 - agg.positive
+            agg['negative'] = agg.func.where(agg['negative'] == 0, self.epsilon, agg['negative'])
+            agg['woe'] = np.log(agg.positive/agg.negative)
+            self.mappings_[feature] = {value[feature]: value['woe'] for index, value in agg.iterrows()}
+
+    def transform(self, df):
+        '''Transform a DataFrame with a fitted WeightOfEvidenceEncoder.
+
+        :param df: A vaex DataFrame.
+        :return: A shallow copy of the DataFrame that includes the encodings.
+        :rtype: DataFrame
+        '''
+        copy = df.copy()
+        default_value = {'zero': 0., 'nan': np.nan}[self.unseen]
+        for feature in self.features:
+            name = self.prefix + feature
+            copy[name] = copy[feature].map(self.mappings_[feature],
+                                           nan_value=np.nan,
+                                           missing_value=np.nan,
+                                           default_value=default_value,
+                                           allow_missing=True)
+
+        return copy
