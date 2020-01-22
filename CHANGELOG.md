@@ -1,13 +1,17 @@
-# vaex 2.6.0-dev (unreleased)
+# vaex 3.0.0-dev (unreleased)
+   * Breaking changes:
+     * Python 2 is not supported anymore
 
-# vaex-core 1.5.0-dev
+# vaex 2.6.0 (2020-1-21)
+
+# vaex-core 1.5.0
    * Features
       * df.evalute_iterator for efficient parallel chunked evaluation [#515](https://github.com/vaexio/vaex/pull/515)
       * Widget progress bar has time estimation [#545](https://github.com/vaexio/vaex/pull/545)
    * Fixes
      * Slicing arrow string arrays with masked arrays is respected/working [#530](https://github.com/vaexio/vaex/pull/530)]
 
-# vaex-ml 0.8.0-dev
+# vaex-ml 0.8.0
    * Performance
       * IncrementalPredictor uses parallel chunked support (2x speedup possible) [#515](https://github.com/vaexio/vaex/pull/515)
    * Fix
