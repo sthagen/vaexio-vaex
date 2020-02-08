@@ -1,5 +1,6 @@
 import vaex.misc.progressbar
 import pytest
+from common import *
 
 def test_progress_bar():
     pb = vaex.misc.progressbar.ProgressBar(0, 100)
@@ -22,3 +23,32 @@ def test_progress_bar_widget():
 def test_progress(progress):
     df = vaex.from_arrays(x=vaex.vrange(0, 10000))
     df.sum('x', progress=progress)
+
+
+def test_progress_calls(df):
+    x, y = df.sum([df.x, df.y], progress=True)
+    counter = CallbackCounter(True)
+    task = df.sum([df.x, df.y], delay=True, progress=counter)
+    df.executor.execute()
+    x2, y2 = task.get()
+    assert x == x2
+    assert y == y2
+    assert counter.counter > 0
+    assert counter.last_args[0], 1.0
+
+
+def test_cancel(df):
+    def progress(f):
+        return False
+    with pytest.raises(vaex.execution.UserAbort):
+        assert df.x.min(progress=progress) is None
+
+
+# @pytest.mark.timeout(1)
+def test_cancel_huge(client):
+    df = client['huge']
+
+    def progress(f):
+        return False
+    with pytest.raises(vaex.execution.UserAbort):
+        assert df.x.min(progress=progress) is None
