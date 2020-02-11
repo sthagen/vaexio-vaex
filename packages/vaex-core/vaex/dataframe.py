@@ -646,6 +646,9 @@ class DataFrame(object):
         if extra_expressions:
             extra_expressions = _ensure_strings_from_expressions(extra_expressions)
         expression_waslist, [expressions,] = vaex.utils.listify(expression)
+        for expression in expressions:
+            if expression and expression != "*":
+                self.validate_expression(expression)
         assert self._aggregator_nest_count == 0, "detected nested aggregator call"
         # Instead of 'expression is not None', we would like to have 'not virtual'
         # but in agg.py we do some casting, which results in calling .dtype(..) with a non-column
@@ -2849,9 +2852,16 @@ class DataFrame(object):
     def validate_expression(self, expression):
         """Validate an expression (may throw Exceptions)"""
         # return self.evaluate(expression, 0, 2)
-        vars = set(self.get_column_names()) | set(self.variables.keys())
-        funcs = set(expression_namespace.keys())
-        return vaex.expresso.validate_expression(expression, vars, funcs)
+        if str(expression) in self.virtual_columns:
+            return
+        if self.is_local() and str(expression) in self.columns:
+            return
+        vars = set(self.get_names(hidden=True))
+        funcs = set(expression_namespace.keys())  | set(self.functions.keys())
+        try:
+            return vaex.expresso.validate_expression(expression, vars, funcs)
+        except NameError as e:
+            raise NameError(str(e)) from None
 
     def _block_scope(self, i1, i2):
         variables = {key: self.evaluate_variable(key) for key in self.variables.keys()}
@@ -4497,6 +4507,7 @@ class DataFrame(object):
                 item = self._column_aliases[item]  # translate the alias name into the real name
             # if item in self._virtual_expressions:
             #     return self._virtual_expressions[item]
+            self.validate_expression(item)
             return Expression(self, item)  # TODO we'd like to return the same expression if possible
         elif isinstance(item, Expression):
             expression = item.expression
@@ -4512,6 +4523,8 @@ class DataFrame(object):
                 elif isinstance(item[1], slice):
                     names = self.get_column_names().__getitem__(item[1])
                     return df[names]
+            for expression in item:
+                self.validate_expression(expression)
             df = self.copy(column_names=item)
             return df
         elif isinstance(item, slice):
@@ -4722,6 +4735,9 @@ class DataFrame(object):
         else:
             binbys = [binby]
         binbys = _ensure_strings_from_expressions(binbys)
+        for expression in binbys:
+            if expression:
+                self.validate_expression(expression)
         binners = []
         if len(binbys):
             limits = _expand_limits(limits, len(binbys))
@@ -4910,6 +4926,7 @@ class DataFrameLocal(DataFrame):
                         depending.update(deps)
                 else:
                     # this might be an expression, create a valid name
+                    self.validate_expression(name)
                     expression = name
                     name = vaex.utils.find_valid_name(name)
                     # add the expression
@@ -5450,6 +5467,9 @@ class DataFrameLocal(DataFrame):
             raise ValueError('join type not supported: {}, only left and right'.format(how))
         left = left if inplace else left.copy()
 
+        on = _ensure_string_from_expression(on)
+        left_on = _ensure_string_from_expression(left_on)
+        right_on = _ensure_string_from_expression(right_on)
         left_on = left_on or on
         right_on = right_on or on
         for name in right:
@@ -5469,27 +5489,33 @@ class DataFrameLocal(DataFrame):
             df = left
             # we index the right side, this assumes right is smaller in size
             index = right._index(right_on)
-            lookup = np.zeros(left._length_original, dtype=np.int64)
-            lookup_extra_chunks = []
             dtype = left.dtype(left_on)
             duplicates_right = index.has_duplicates
 
             if duplicates_right and not allow_duplication:
                 raise ValueError('This join will lead to duplication of rows which is disabled, pass allow_duplication=True')
 
+            # our max value for the lookup table is the row index number, so if we join a small
+            # df with say 100 rows, we can do it with a int8
+            lookup_dtype = vaex.utils.required_dtype_for_max(len(right))
+            lookup = np.zeros(left._length_original, dtype=lookup_dtype)
+            lookup_masked = False  # does the lookup contain masked/-1 values?
+            lookup_extra_chunks = []
+
             from vaex.column import _to_string_sequence
             def map(thread_index, i1, i2, ar):
+                nonlocal lookup_masked
                 if dtype == str_type:
                     previous_ar = ar
                     ar = _to_string_sequence(ar)
                 if np.ma.isMaskedArray(ar):
                     mask = np.ma.getmaskarray(ar)
-                    lookup[i1:i2] = index.map_index(ar.data, mask)
+                    lookup_masked = lookup_masked or index.map_index_masked(ar.data, mask, lookup[i1:i2])
                     if duplicates_right:
                         extra = index.map_index_duplicates(ar.data, mask, i1)
                         lookup_extra_chunks.append(extra)
                 else:
-                    lookup[i1:i2] = index.map_index(ar)
+                    lookup_masked = lookup_masked or index.map_index(ar, lookup[i1:i2])
                     if duplicates_right:
                         extra = index.map_index_duplicates(ar, i1)
                         lookup_extra_chunks.append(extra)
@@ -5509,8 +5535,6 @@ class DataFrameLocal(DataFrame):
                 left_indices_matched = np.where(left_mask_matched)[0]  # convert mask to indices for the left
                 # indices can still refer to filtered rows, so do not drop the filter
                 left = left.take(left_indices_matched, filtered=False, dropfilter=False)
-            else:
-                lookup = np.ma.array(lookup, mask=lookup==-1)
         direct_indices_map = {}  # for performance, keeps a cache of two levels of indirection of indices
 
         def mangle_name(prefix, name, suffix):
@@ -5558,7 +5582,7 @@ class DataFrameLocal(DataFrame):
                 left.add_virtual_column(name, right.virtual_columns[name])
             else:
                 if lookup is not None:
-                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map)
+                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map, lookup_masked)
                 else:
                     column = right.columns[name]
                 left.add_column(name, column)
