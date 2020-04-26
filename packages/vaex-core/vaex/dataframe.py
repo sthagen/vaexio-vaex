@@ -34,7 +34,7 @@ from . import selections, tasks, scopes
 from .expression import expression_namespace
 from .delayed import delayed, delayed_args, delayed_list
 from .column import Column, ColumnIndexed, ColumnSparse, ColumnString, ColumnConcatenatedLazy, str_type
-from .array_types import to_numpy
+from .array_types import to_numpy, to_array_type
 import vaex.events
 
 # py2/p3 compatibility
@@ -100,7 +100,8 @@ from .expression import Expression
 
 
 _doc_snippets = {}
-_doc_snippets["expression"] = "expression or list of expressions, e.g. 'x', or ['x, 'y']"
+_doc_snippets["expression"] = "expression or list of expressions, e.g. df.x, 'x', or ['x, 'y']"
+_doc_snippets["expression_one"] = "expression in the form of a string, e.g. 'x' or 'x+y' or vaex expression object, e.g. df.x or df.x+df.y "
 _doc_snippets["expression_single"] = "if previous argument is not a list, this argument should be given"
 _doc_snippets["binby"] = "List of expressions for constructing a binned grid"
 _doc_snippets["limits"] = """description for the min and max values for the expressions, e.g. 'minmax' (default), '99.7%', [0, 10], or a list of, e.g. [[0, 10], [0, 20], 'minmax']"""
@@ -108,6 +109,7 @@ _doc_snippets["shape"] = """shape for the array where the statistic is calculate
 _doc_snippets["percentile_limits"] = """description for the min and max values to use for the cumulative histogram, should currently only be 'minmax'"""
 _doc_snippets["percentile_shape"] = """shape for the array where the cumulative histogram is calculated on, integer type"""
 _doc_snippets["selection"] = """Name of selection to use (or True for the 'default'), or all the data (when selection is None or False), or a list of selections"""
+_doc_snippets["selection1"] = """Name of selection to use (or True for the 'default'), or all the data (when selection is None or False)"""
 _doc_snippets["delay"] = """Do not return the result, but a proxy for delayhronous calculations (currently only for internal use)"""
 _doc_snippets["progress"] = """A callable that takes one argument (a floating point value between 0 and 1) indicating the progress, calculations are cancelled when this callable returns False"""
 _doc_snippets["expression_limits"] = _doc_snippets["expression"]
@@ -127,8 +129,9 @@ _doc_snippets['note_filter'] = '.. note:: Note that filtering will be ignored (s
 _doc_snippets['inplace'] = 'Make modifications to self or return a new DataFrame'
 _doc_snippets['return_shallow_copy'] = 'Returns a new DataFrame with a shallow copy/view of the underlying data'
 _doc_snippets['chunk_size'] = 'Return an iterator with cuts of the object in lenght of this size'
+_doc_snippets['chunk_size_export'] = 'Number of rows to be written to disk in a single iteration'
 _doc_snippets['evaluate_parallel'] = 'Evaluate the (virtual) columns in parallel'
-_doc_snippets['array_type'] = 'Type of output array, possible values are None/"numpy" (ndarray) and "xarray" for a xarray.DataArray'
+_doc_snippets['array_type'] = 'Type of output array, possible values are None/"numpy" (ndarray), "xarray" for a xarray.DataArray, or "list" for a Python list'
 
 
 def docsubst(f):
@@ -256,6 +259,9 @@ class DataFrame(object):
                             # to support numpy arrays
                             var = self.add_variable('arg_numpy_array', k, unique=True)
                             return var
+                        elif isinstance(k, list):
+                            # to support numpy scalars
+                            return '[' + ', '.join(myrepr(i) for i in k) + ']'
                         else:
                             return repr(k)
                     arg_string = ", ".join([myrepr(k) for k in args] + ['{}={}'.format(name, myrepr(value)) for name, value in kwargs.items()])
@@ -670,6 +676,8 @@ class DataFrame(object):
                     counts = counts[0]
                 import xarray
                 return xarray.DataArray(counts, dims=dims, coords=coords)
+            elif array_type == 'list':
+                return vaex.utils.unlistify(expression_waslist, counts).tolist()
             elif array_type in [None, 'numpy']:
                 return np.asarray(vaex.utils.unlistify(expression_waslist, counts))
             else:
@@ -2669,7 +2677,7 @@ class DataFrame(object):
                 yield previous_l1, previous_l2, previous_chunk
 
     @docsubst
-    def to_items(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True, chunk_size=None):
+    def to_items(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True, chunk_size=None, array_type=None):
         """Return a list of [(column_name, ndarray), ...)] pairs where the ndarray corresponds to the evaluated data
 
         :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
@@ -2678,16 +2686,17 @@ class DataFrame(object):
         :param virtual: argument passed to DataFrame.get_column_names when column_names is None
         :param parallel: {evaluate_parallel}
         :param chunk_size: {chunk_size}
+        :param array_type: {array_type}
         :return: list of (name, ndarray) pairs or iterator of
         """
         column_names = column_names or self.get_column_names(strings=strings, virtual=virtual)
         if chunk_size is not None:
             def iterator():
                 for i1, i2, chunks in self.evaluate_iterator(column_names, selection=selection, parallel=parallel, chunk_size=chunk_size):
-                    yield i1, i2, list(zip(column_names, chunks))
+                    yield i1, i2, list(zip(column_names, [to_array_type(chunk, array_type) for chunk in chunks]))
             return iterator()
         else:
-            return list(zip(column_names, self.evaluate(column_names, selection=selection, parallel=parallel)))
+            return list(zip(column_names, [to_array_type(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)]))
 
     @docsubst
     def to_arrays(self, column_names=None, selection=None, strings=True, virtual=True, parallel=True):
@@ -2702,16 +2711,17 @@ class DataFrame(object):
         return self.evaluate(column_names or self.get_column_names(strings=strings, virtual=virtual), selection=selection, parallel=parallel)
 
     @docsubst
-    def to_dict(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True):
+    def to_dict(self, column_names=None, selection=None, strings=True, virtual=False, parallel=True, array_type=None):
         """Return a dict containing the ndarray corresponding to the evaluated data
 
         :param column_names: list of column names, to export, when None DataFrame.get_column_names(strings=strings, virtual=virtual) is used
         :param selection: {selection}
         :param strings: argument passed to DataFrame.get_column_names when column_names is None
         :param virtual: argument passed to DataFrame.get_column_names when column_names is None
+        :param array_type: {array_type}
         :return: dict
         """
-        return dict(self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=parallel))
+        return dict(self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=parallel, array_type=array_type))
 
     @docsubst
     def to_copy(self, column_names=None, selection=None, strings=True, virtual=False, selections=True):
@@ -5675,8 +5685,12 @@ class DataFrameLocal(DataFrame):
             self.export_hdf5(path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
         elif path.endswith('.fits'):
             self.export_fits(path, column_names, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
-        if path.endswith('.parquet'):
+        elif path.endswith('.parquet'):
             self.export_parquet(path, column_names, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+        elif path.endswith('.csv'):
+            self.export_csv(path, selection=selection, progress=progress, virtual=virtual)
+        else:
+            raise ValueError('''Unrecognized file extension. Please use .arrow, .hdf5, .parquet, .fits, or .csv to export to the particular file format.''')
 
     def export_arrow(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=False, sort=None, ascending=True):
         """Exports the DataFrame to a file written with arrow
@@ -5752,6 +5766,41 @@ class DataFrameLocal(DataFrame):
         """
         import vaex.export
         vaex.export.export_fits(self, path, column_names, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+
+    @docsubst
+    def export_csv(self, path, virtual=False, selection=False, progress=None, chunk_size=1_000_000, **kwargs):
+        """ Exports the DataFrame to a CSV file.
+
+        :param str path: Path for file
+        :param bool virtual: If True, export virtual columns as well
+        :param bool selection: {selection1}
+        :param progress: {progress}
+        :param int chunk_size: {chunk_size_export}
+        :param **kwargs: Extra keyword arguments to be passed on pandas.DataFrame.to_csv()
+        :return:
+        """
+        import pandas as pd
+
+        expressions = self.get_column_names(virtual=virtual)
+        progressbar = vaex.utils.progressbars(progress)
+        dtypes = self[expressions].dtypes
+        n_samples = len(self)
+
+        for i1, i2, chunks in self.evaluate_iterator(expressions, chunk_size=chunk_size, selection=selection):
+            progressbar( i1 / n_samples)
+            chunk_dict = {col: values for col, values in zip(expressions, chunks)}
+            chunk_pdf = pd.DataFrame(chunk_dict)
+
+            if i1 == 0:  # Only the 1st chunk should have a header and the rest will be appended
+                mode = 'w'
+                header = True
+            else:
+                mode = 'a'
+                header = False
+
+            chunk_pdf.to_csv(path_or_buf=path, mode=mode, header=header, index=False, **kwargs)
+        progressbar(1.0)
+        return
 
     def _needs_copy(self, column_name):
         import vaex.file.other
@@ -5879,7 +5928,6 @@ class DataFrameConcatenated(DataFrameLocal):
         for name in list(first.virtual_columns.keys()):
             if all([first.virtual_columns[name] == df.virtual_columns.get(name, None) for df in tail]):
                 self.add_virtual_column(name, first.virtual_columns[name])
-                self.column_names.append(name)
             else:
                 self.columns[name] = ColumnConcatenatedLazy([df[name] for df in dfs])
                 self.column_names.append(name)

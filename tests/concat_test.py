@@ -106,6 +106,31 @@ def test_sliced_concat(i1, length, df_concat):
     assert df.x.tolist() == x[i1:i2]
 
 
+def test_concat_masked_values(df_concat):
+    df = df_concat
+    # evaluate a piece not containing masked values
+    assert df.m.evaluate(0, 3).tolist() == df.x[:3].tolist()
+
+
+def test_concat_masked_with_unmasked():
+    # Exposes https://github.com/vaexio/vaex/issues/661
+    df1 = vaex.from_arrays(x=np.arange(3.))
+    df2 = vaex.from_arrays(x=np.ma.masked_all(2, dtype='f8'))
+    df = df1.concat(df2)
+    assert df.x.tolist() == [0, 1, 2, None, None]
+
+
+def test_concat_virtual_column_names():
+    df1 = vaex.from_arrays(x=np.arange(3.))
+    df2 = vaex.from_arrays(x=np.arange(4.))
+    df1['z'] = df1.x ** 2
+    df2['z'] = df2.x ** 2
+    df = df1.concat(df2)
+    # test that we get the correct column names (we had duplicates before)
+    assert df.get_column_names() == ['x', 'z']
+    assert list(df) == ['x', 'z']
+
+
 def test_concat_missing_values():
     df1 = vaex.from_arrays(x=[1, 2, 3], y=[np.nan, 'b', 'c'])
     df2 = vaex.from_arrays(x=[4, 5, np.nan], y=['d', 'e', 'f'])
