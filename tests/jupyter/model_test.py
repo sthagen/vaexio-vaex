@@ -14,8 +14,8 @@ def df():
     g1 = np.array([0, 1, 1, 2, 2, 2])
     g2 = np.array([0, 0, 1, 1, 2, 3])
     ds = vaex.from_arrays(x=x, y=y, g1=g1, g2=g2)
-    ds.categorize(ds.g1)
-    ds.categorize(ds.g2)
+    ds.categorize(ds.g1, inplace=True)
+    ds.categorize(ds.g2, inplace=True)
     return ds
 
 
@@ -24,28 +24,45 @@ def test_axis_basics(df, flush_guard):
     flush()
     assert x.min == df.x.min()
     assert x.max == df.x.max()
-    assert x.centers.shape[0] == x.shape_default
+    assert x.bin_centers.shape[0] == x.shape_default
 
-    center_last = x.centers[-1]
+    center_last = x.bin_centers[-1]
     x.max += 1
     flush()
-    assert x.centers[-1] > center_last
+    assert x.bin_centers[-1] > center_last
 
     x.shape = 5
     flush()
-    assert x.centers.shape[0] == 5
+    assert x.bin_centers.shape[0] == 5
 
     x.shape = 6
     flush()
-    assert x.centers.shape[0] == 6
+    assert x.bin_centers.shape[0] == 6
 
     x.shape_default = 7
     flush()
-    assert x.centers.shape[0] == 6
+    assert x.bin_centers.shape[0] == 6
 
     x.shape = None
     flush(all=True)
-    assert x.centers.shape[0] == 7
+    assert x.bin_centers.shape[0] == 7
+
+
+def test_model_selection(df, flush_guard):
+    x = vaex.jupyter.model.Axis(df=df, expression='g1')
+    df.select(df.x > 0)
+    model = vaex.jupyter.model.Histogram(df=df, x=x, selection=[None, 'default'])
+    grid = vaex.jupyter.model.GridCalculator(df, [model])
+    flush()
+    assert model.x.min == -0.5
+    assert model.x.max == 2.5
+    assert model.x.shape == 3
+    assert model.grid.data.tolist() == [[1, 2, 3], [0, 2, 3]]
+    assert model.grid.dims == ('selection', 'g1')
+    assert model.grid.coords['selection'].data.tolist() == [None, 'default']
+    assert model.grid.coords['g1'].data.tolist() == [0, 1, 2]
+
+
 
 
 def test_data_array_attrs(df, flush_guard):
@@ -239,7 +256,7 @@ async def test_model_status(df_executor, flush_guard, server_latency):
     assert x.max is None
 
     await x._allow_state_change_to(x.Status.STAGED_CALCULATING_LIMITS)
-    calculation_task = x.calculation
+    calculation_task = x._calculation
     # df.executor.thread_pool._debug_sleep = 0.05  # make it slow, so we can cancel the task
     assert hasattr(calculation_task, 'then')  # make sure we have the promise
     await x._allow_state_change_to(x.Status.CALCULATING_LIMITS)
@@ -343,7 +360,7 @@ async def test_model_status(df_executor, flush_guard, server_latency):
     model._debug = True
     x.min = -3
     await model._allow_state_change_to(model.Status.STAGED_CALCULATING_GRID)
-    calculation_task = grid.calculation
+    calculation_task = grid._calculation
     assert calculation_task.isPending
     x.min = -4
     assert model.status == model.Status.NEEDS_CALCULATING_GRID
@@ -468,9 +485,8 @@ def test_histogram_model(df, flush_guard):
     assert model.x.min == -0.5
     assert model.x.max == 2.5
     assert model.x.shape == 3
-    assert model.grid.data.tolist() == [[1, 2, 3]]
-    assert model.grid.dims == ('selection', 'g1')
-    assert model.grid.coords['selection'].data.tolist() == [None]
+    assert model.grid.data.tolist() == [1, 2, 3]
+    assert model.grid.dims == ('g1', )
     assert model.grid.coords['g1'].data.tolist() == [0, 1, 2]
 
     viz = vaex.jupyter.view.Histogram(model=model, dimension_groups='slice')
@@ -483,16 +499,15 @@ def test_histogram_model(df, flush_guard):
     assert model.x.min == -0.5
     assert model.x.max == 3.5
     assert model.x.shape == 4
-    assert model.grid.data.tolist() == [[2, 2, 1, 1]]
-    assert model.grid.dims == ('selection', 'g2')
-    assert model.grid.coords['selection'].data.tolist() == [None]
+    assert model.grid.data.tolist() == [2, 2, 1, 1]
+    assert model.grid.dims == ('g2',)
     assert model.grid.coords['g2'].data.tolist() == [0, 1, 2, 3]
     assert viz.plot.x_axis.label == 'g2'
 
     x = vaex.jupyter.model.Axis(df=df, expression='x', min=-0.5, max=5.5)
     model = vaex.jupyter.model.Histogram(df=df, x=x, shape=6)
     flush()
-    assert model.x.centers.tolist() == [0, 1, 2, 3, 4, 5]
+    assert model.x.bin_centers.tolist() == [0, 1, 2, 3, 4, 5]
     assert model.x.min == -0.5
     assert model.x.max == 5.5
     grid = vaex.jupyter.model.GridCalculator(df, [model])  # noqa
@@ -509,17 +524,17 @@ def test_histogram_sliced(df, flush_guard):
     grid = vaex.jupyter.model.GridCalculator(df, [model1, model2])  # noqa
     flush(all=True)
     assert model1.grid.data is not None
-    assert model1.x.centers.tolist() == [0, 1, 2]
+    assert model1.x.bin_centers.tolist() == [0, 1, 2]
 
-    assert model1.grid.data.tolist() == [[1, 2, 3]]
-    assert model2.grid.data.tolist() == [[2, 2, 1, 1]]
+    assert model1.grid.data.tolist() == [1, 2, 3]
+    assert model2.grid.data.tolist() == [2, 2, 1, 1]
 
     viz = vaex.jupyter.view.Histogram(model=model1, dimension_groups='slice')
     assert viz.plot.mark.y.tolist() == [[1, 2, 3]]
     assert model1.grid_sliced is None
     model2.x.slice = 0
-    assert model1.grid.data.tolist() == [[1, 2, 3]]
-    assert model1.grid_sliced.data.tolist() == [[1, 1, 0]]
+    assert model1.grid.data.tolist() == [1, 2, 3]
+    assert model1.grid_sliced.data.tolist() == [1, 1, 0]
     assert viz.plot.mark.y.tolist() == [[1, 2, 3], [1, 1, 0]]
 
 
@@ -527,8 +542,8 @@ def test_histogram_selections(df, flush_guard):
     g1 = vaex.jupyter.model.Axis(df=df, expression='g1')
     g2 = vaex.jupyter.model.Axis(df=df, expression='g2')
     df.select(df.g1 == 1)
-    model1 = vaex.jupyter.model.Histogram(df=df, x=g1, selections=[None, True])
-    model2 = vaex.jupyter.model.Histogram(df=df, x=g2, selections=[None, True])
+    model1 = vaex.jupyter.model.Histogram(df=df, x=g1, selection=[None, True])
+    model2 = vaex.jupyter.model.Histogram(df=df, x=g2, selection=[None, True])
     grid = vaex.jupyter.model.GridCalculator(df, [model1, model2])  # noqa
     flush(all=True)
     assert model1.grid.data.tolist() == [[1, 2, 3], [0, 2, 0]]
@@ -551,7 +566,7 @@ def test_heatmap_model_basics(df, flush_guard):
     assert model.shape == 2
     assert model.x.shape is None
     assert model.y.shape == 3
-    assert model.grid.data.tolist() == [[[1, 2, 0], [0, 0, 2]]]
+    assert model.grid.data.tolist() == [[1, 2, 0], [0, 0, 2]]
 
     viz = vaex.jupyter.view.Heatmap(model=model)
     flush()
@@ -567,7 +582,7 @@ def test_heatmap_model_basics(df, flush_guard):
     assert model.x.shape == 4
     assert model.shape == 2
     grid = [[1, 1, 0], [0, 1, 1], [0, 0, 1], [0, 0, 1]]
-    assert model.grid.data.tolist() == [grid]
+    assert model.grid.data.tolist() == grid
     flush(all=True)
     # TODO: if we use bqplot-image-gl we can test the data again
     # assert viz.heatmap.color.T.tolist() == grid

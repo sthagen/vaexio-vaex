@@ -19,7 +19,7 @@ class Client(client.Client):
                  token_trusted=None):
         super().__init__()
         self.hostname = hostname
-        self.port = port
+        self.port = port or 80
         self.base_path = base_path if base_path.endswith("/") else (base_path + "/")
         self.token = token
         self.token_trusted = token_trusted
@@ -127,11 +127,11 @@ class ClientWebsocket(Client):
 
 def connect(url, **kwargs):
     url = urlparse(url)
-    if url.scheme == "ws":
+    if url.scheme in ["vaex+ws", "ws"]:
         websocket = True
     else:
         websocket = False
-    assert url.scheme in ["ws", "http"]
+    assert url.scheme in ["ws", "http", "vaex+ws", "vaex+http"]
     port = url.port
     base_path = url.path
     hostname = url.hostname

@@ -3,8 +3,13 @@ name: Build universal wheel
 on:
   push:
     tags:
-      - viz-*
+      - meta-*
+      - arrow-*
+      - astro-*
+      - graphql-*
       - jupyter-*
+      - ml-*
+      - viz-*
       - hdf5-*
       - server-*
 
@@ -35,18 +40,45 @@ jobs:
       run: |
         mkdir dist
 
-    - name: Build vaex-viz
-      if: startsWith(github.ref, 'refs/tags/viz')
+    - name: Build vaex (meta)
+      if: startsWith(github.ref, 'refs/tags/meta')
       run: |
-        (cd packages/vaex-viz && python setup.py sdist bdist_wheel); cp packages/vaex-viz/dist/* dist
+        (cp README.md packages/vaex-meta/ && cd packages/vaex-meta && python setup.py sdist bdist_wheel); cp packages/vaex-meta/dist/* dist
 
     - name: Publish a Python distribution to PyPI
-      if: startsWith(github.ref, 'refs/tags/viz')
+      if: startsWith(github.ref, 'refs/tags/meta')
       env:
         TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_viz }}
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex }}
       run: |
-        twine upload dist/vaex-viz* dist/vaex_viz*
+        twine upload dist/vaex* dist/vaex*
+
+    - name: Build vaex-arrow
+      if: startsWith(github.ref, 'refs/tags/arrow')
+      run: |
+        (cd packages/vaex-arrow && python setup.py sdist bdist_wheel); cp packages/vaex-arrow/dist/* dist
+
+    - name: Publish a Python distribution to PyPI
+      if: startsWith(github.ref, 'refs/tags/arrow')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_arrow }}
+      run: |
+        twine upload dist/vaex-arrow* dist/vaex_arrow*
+
+    - name: Build vaex-graphql
+      if: startsWith(github.ref, 'refs/tags/graphql')
+      run: |
+        (cd packages/vaex-graphql && python setup.py sdist bdist_wheel); cp packages/vaex-graphql/dist/* dist
+
+    - name: Publish a Python distribution to PyPI
+      if: startsWith(github.ref, 'refs/tags/graphql')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_graphql }}
+      run: |
+        twine upload dist/vaex-graphql* dist/vaex_graphql*
+
 
     - name: Build vaex-jupyter
       if: startsWith(github.ref, 'refs/tags/jupyter')
@@ -60,6 +92,46 @@ jobs:
         TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_jupyter }}
       run: |
         twine upload dist/vaex-jupyter* dist/vaex_jupyter*
+
+    - name: Build vaex-ml
+      if: startsWith(github.ref, 'refs/tags/ml')
+      run: |
+        (cd packages/vaex-ml && python setup.py sdist bdist_wheel); cp packages/vaex-ml/dist/* dist
+
+    - name: Publish a Python distribution to PyPI
+      if: startsWith(github.ref, 'refs/tags/ml')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_ml }}
+      run: |
+        twine upload dist/vaex-ml* dist/vaex_ml*
+
+
+    - name: Build vaex-viz
+      if: startsWith(github.ref, 'refs/tags/viz')
+      run: |
+        (cd packages/vaex-viz && python setup.py sdist bdist_wheel); cp packages/vaex-viz/dist/* dist
+
+    - name: Publish a Python distribution to PyPI
+      if: startsWith(github.ref, 'refs/tags/viz')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_viz }}
+      run: |
+        twine upload dist/vaex-viz* dist/vaex_viz*
+
+    - name: Build vaex-astro
+      if: startsWith(github.ref, 'refs/tags/astro')
+      run: |
+        (cd packages/vaex-astro && python setup.py sdist bdist_wheel); cp packages/vaex-astro/dist/* dist
+
+    - name: Publish a Python distribution to PyPI
+      if: startsWith(github.ref, 'refs/tags/astro')
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.pypi_password_vaex_astro }}
+      run: |
+        twine upload dist/vaex-astro* dist/vaex_astro*
 
     - name: Build vaex-hdf5
       if: startsWith(github.ref, 'refs/tags/hdf5')

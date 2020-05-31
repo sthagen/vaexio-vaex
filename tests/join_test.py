@@ -2,6 +2,7 @@ import pytest
 import vaex
 import numpy as np
 import numpy.ma
+from common import small_buffer
 
 df_a = vaex.from_arrays(a=np.array(['A', 'B', 'C']),
                         x=np.array([0., 1., 2.]),
@@ -112,6 +113,23 @@ def test_inner_a_b_filtered():
     assert df.evaluate('x_r').tolist() == [1]
     assert df.evaluate('y').tolist() == [None]
     assert df.evaluate('y_r').tolist() == [1]
+
+
+def test_left_a_b_filtered_right():
+    # similar to test_left_a_b_filtered, but now the df we join is filtered
+    # take b without the last tow
+    df_bf = df_b[df_b.b.str.contains('A|B')]
+    df = df_a.join(df_bf, how='left', on='x', rsuffix='_r')
+    # columns of the left df
+    assert df.x.tolist() == [0, 1, 2]
+    assert df.a.tolist() == ['A', 'B', 'C']
+    assert df.y.tolist() == [0, None, 2]
+    assert df.m.tolist() == [1, None, 3]
+    # columns of the right df
+    assert df.b.tolist() == [None, 'B', 'A']
+    assert df.x_r.tolist() == [None, 1, 2]
+    assert df.y_r.tolist() == [None, 1, None]
+    assert df.m_r.tolist() == [None, 1, None]
 
 
 def test_right_x_x():
@@ -258,3 +276,19 @@ def test_join_variables():
     assert df.r_x_rhs.values[0] == 2
     assert df.yy.values[0] == 3
     assert df.r_z_rhs.values[0] == 2*3 + 3*4
+
+
+def test_with_masked_no_short_circuit():
+    # this test that the full table is joined, in some rare condition
+    # it can happen that the left table has a value not present in the right
+    # which causes it to not evaluate the other lookups, due to Python's short circuit
+    # behaviour. E.g. True or func() will not call func
+    N = 1000
+    df = vaex.from_arrays(i=np.arange(100) % 10)
+    df_right = vaex.from_arrays(i=np.arange(9), j=np.arange(9))
+    with small_buffer(df, size=1):
+        dfj = df.join(other=df_right, on='i')
+    assert dfj.columns['j'].masked
+    assert dfj[:10].columns['j'].masked
+    assert dfj['j'][:10].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, None]
+    dfj['j'].tolist()  # make sure we can evaluate the whole column

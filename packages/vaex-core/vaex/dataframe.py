@@ -305,9 +305,12 @@ class DataFrame(object):
         column = _ensure_string_from_expression(column)
         return self._categories[column]['N']
 
+    def category_offset(self, column):
+        column = _ensure_string_from_expression(column)
+        return self._categories[column]['min_value']
+
     def execute(self):
         '''Execute all delayed jobs.'''
-        # no need to clear _task_aggs anymore, since they will be removed for the executors' task list
         from .asyncio import just_run
         just_run(self.execute_async())
 
@@ -1453,7 +1456,7 @@ class DataFrame(object):
             return task.get()
 
     @docsubst
-    def limits_percentage(self, expression, percentage=99.73, square=False, delay=False):
+    def limits_percentage(self, expression, percentage=99.73, square=False, selection=False, delay=False):
         """Calculate the [min, max] range for expression, containing approximately a percentage of the data as defined
         by percentage.
 
@@ -1479,10 +1482,10 @@ class DataFrame(object):
         waslist, [expressions, ] = vaex.utils.listify(expression)
         limits = []
         for expr in expressions:
-            limits_minmax = self.minmax(expr)
+            limits_minmax = self.minmax(expr, selection=selection)
             vmin, vmax = limits_minmax
             size = 1024 * 16
-            counts = self.count(binby=expr, shape=size, limits=limits_minmax)
+            counts = self.count(binby=expr, shape=size, limits=limits_minmax, selection=selection)
             cumcounts = np.concatenate([[0], np.cumsum(counts)])
             cumcounts = cumcounts / cumcounts.max()
             # TODO: this is crude.. see the details!
@@ -1588,11 +1591,11 @@ class DataFrame(object):
                             elif type in ["ss", "sigmasquare"]:
                                 limits = self.limits_sigma(number, square=True)
                             elif type in ["%", "percent"]:
-                                limits = self.limits_percentage(expression, number, delay=False)
+                                limits = self.limits_percentage(expression, number, selection=selection, delay=False)
                             elif type in ["%s", "%square", "percentsquare"]:
-                                limits = self.limits_percentage(expression, number, square=True, delay=True)
+                                limits = self.limits_percentage(expression, number, selection=selection, square=True, delay=True)
                 elif value is None:
-                    limits = self.minmax(expression, delay=True)
+                    limits = self.minmax(expression, selection=selection, delay=True)
                 else:
                     limits = value
             limits_list.append(limits)
@@ -3591,7 +3594,11 @@ class DataFrame(object):
         values_list = dict(values_list)
         # print(values_list)
         import tabulate
-        table_text = tabulate.tabulate(values_list, headers="keys", tablefmt=format)
+        table_text = str(tabulate.tabulate(values_list, headers="keys", tablefmt=format))
+        if tabulate.__version__ == '0.8.7':
+            # Tabulate 0.8.7 escapes html :()
+            table_text = table_text.replace('&lt;i style=&#x27;opacity: 0.6&#x27;&gt;', "<i style='opacity: 0.6'>")
+            table_text = table_text.replace('&lt;/i&gt;', "</i>")
         if i2 - i1 == 0:
             if self._length_unfiltered != len(self):
                 footer_text = 'No rows to display (because of filtering).'
@@ -3671,7 +3678,7 @@ class DataFrame(object):
     def __str__(self):
         return self._head_and_tail_table(format='plain')
 
-    if not os.environ.get('VAEX_DEBUG', ''):
+    if not _DEBUG:
         def __repr__(self):
             return self._head_and_tail_table(format='plain')
 
@@ -4758,7 +4765,8 @@ class DataFrame(object):
         if key not in self._binners:
             if expression in self._categories:
                 N = self._categories[expression]['N']
-                binner = self._binner_ordinal(expression, N)
+                min_value = self._categories[expression]['min_value']
+                binner = self._binner_ordinal(expression, N, min_value)
                 self._binners[key] = vaex.promise.Promise.fulfilled(binner)
             else:
                 self._binners[key] = vaex.promise.Promise()
@@ -4782,6 +4790,7 @@ class DataFrame(object):
         return type(expression, vmin, vmax, shape)
 
     def _binner_ordinal(self, expression, ordinal_count, min_value=0):
+        expression = _ensure_string_from_expression(expression)
         type = vaex.utils.find_type_from_dtype(vaex.superagg, "BinnerOrdinal_", self.data_type(expression))
         return type(expression, ordinal_count, min_value)
 
@@ -4834,17 +4843,45 @@ class DataFrameLocal(DataFrame):
                 ar.flags['WRITEABLE'] = False
         return df
 
-    def categorize(self, column, labels=None, check=True):
-        """Mark column as categorical, with given labels, assuming zero indexing"""
+    @docsubst
+    def categorize(self, column, min_value=0, max_value=None, labels=None, inplace=False):
+        """Mark column as categorical.
+
+        This may help speed up calculations using integer columns between a range of [min_value, max_value].
+
+        If max_value is not given, the [min_value and max_value] are calcuated from the data.
+
+        Example:
+
+        >>> import vaex
+        >>> df = vaex.from_arrays(year=[2012, 2015, 2019], weekday=[0, 4, 6])
+        >>> df.categorize('year', min_value=2020, max_value=2019)
+        >>> df.categorize('weekday', labels=['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+
+        :param column: column to assume is categorical.
+        :param labels: labels to associate to the values between min_value and max_value
+        :param min_value: minimum integer value (if max_value is not given, this is calculated)
+        :param max_value: maximum integer value (if max_value is not given, this is calculated)
+        :param labels: Labels to associate to each value, list(range(min_value, max_value+1)) by default
+        :param inplace: {inplace}
+        """
+        df = self if inplace else self.copy()
         column = _ensure_string_from_expression(column)
-        if check:
-            vmin, vmax = self.minmax(column)
+        if max_value is not None:
+            labels = list(range(min_value, max_value+1))
+            N = len(labels)
+        else:
+            vmin, vmax = df.minmax(column)
             if labels is None:
                 N = int(vmax + 1)
-                labels = list(map(str, range(N)))
+                labels = list(range(vmin, vmax+1))
+                min_value = vmin
+            else:
+                min_value = vmin
             if (vmax - vmin) >= len(labels):
                 raise ValueError('value of {} found, which is larger than number of labels {}'.format(vmax, len(labels)))
-        self._categories[column] = dict(labels=labels, N=len(labels))
+        df._categories[column] = dict(labels=labels, N=len(labels), min_value=min_value)
+        return df
 
     def ordinal_encode(self, column, values=None, inplace=False):
         """Encode column as ordinal values and mark it as categorical.
@@ -4887,9 +4924,8 @@ class DataFrameLocal(DataFrame):
                 codes = np.ma.masked_array(codes, codes==missing_value)
 
         original_column = df.rename(column, '__original_' + column, unique=True)
-        labels = [str(k) for k in values]
         df.add_column(column, codes)
-        df._categories[column] = dict(labels=labels, N=len(values), values=values)
+        df._categories[column] = dict(labels=values, N=len(values), min_value=0)
         return df
 
     # for backward compatibility
@@ -5558,24 +5594,28 @@ class DataFrameLocal(DataFrame):
             # our max value for the lookup table is the row index number, so if we join a small
             # df with say 100 rows, we can do it with a int8
             lookup_dtype = vaex.utils.required_dtype_for_max(len(right))
-            lookup = np.zeros(left._length_original, dtype=lookup_dtype)
-            lookup_masked = False  # does the lookup contain masked/-1 values?
+            # we put in the max value to maximize triggering failures in the case of a bug (we don't want
+            # to point to row 0 in case we do, we'd rather crash)
+            lookup = np.full(left._length_original, np.iinfo(lookup_dtype).max, dtype=lookup_dtype)
+            nthreads = self.executor.thread_pool.nthreads
+            lookup_masked = [False] * nthreads  # does the lookup contain masked/-1 values?
             lookup_extra_chunks = []
 
             from vaex.column import _to_string_sequence
             def map(thread_index, i1, i2, ar):
-                nonlocal lookup_masked
                 if dtype == str_type:
                     previous_ar = ar
                     ar = _to_string_sequence(ar)
                 if np.ma.isMaskedArray(ar):
                     mask = np.ma.getmaskarray(ar)
-                    lookup_masked = lookup_masked or index.map_index_masked(ar.data, mask, lookup[i1:i2])
+                    found_masked = index.map_index_masked(ar.data, mask, lookup[i1:i2])
+                    lookup_masked[thread_index] = lookup_masked[thread_index] or found_masked
                     if duplicates_right:
                         extra = index.map_index_duplicates(ar.data, mask, i1)
                         lookup_extra_chunks.append(extra)
                 else:
-                    lookup_masked = lookup_masked or index.map_index(ar, lookup[i1:i2])
+                    found_masked = index.map_index(ar, lookup[i1:i2])
+                    lookup_masked[thread_index] = lookup_masked[thread_index] or found_masked
                     if duplicates_right:
                         extra = index.map_index_duplicates(ar, i1)
                         lookup_extra_chunks.append(extra)
@@ -5642,7 +5682,7 @@ class DataFrameLocal(DataFrame):
                 left.add_virtual_column(name, right.virtual_columns[name])
             else:
                 if lookup is not None:
-                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map, lookup_masked)
+                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map, any(lookup_masked))
                 else:
                     column = right.columns[name]
                 left.add_column(name, column)
@@ -5887,9 +5927,13 @@ class DataFrameLocal(DataFrame):
             return binby.agg(agg)
 
     def _selection(self, create_selection, name, executor=None, execute_fully=False):
-        if name not in self._selection_masks:
-            self._selection_masks[name] = vaex.superutils.Mask(self._length_unfiltered)
-        return super()._selection(create_selection, name, executor, execute_fully)
+        def create_wrapper(current):
+            selection = create_selection(current)
+            # only create a mask when we have a selection, so we do not waste memory
+            if selection is not None and name not in self._selection_masks:
+                self._selection_masks[name] = vaex.superutils.Mask(self._length_unfiltered)
+            return selection
+        return super()._selection(create_wrapper, name, executor, execute_fully)
 
 class DataFrameConcatenated(DataFrameLocal):
     """Represents a set of DataFrames all concatenated. See :func:`DataFrameLocal.concat` for usage.

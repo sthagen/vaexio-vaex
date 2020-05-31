@@ -118,10 +118,10 @@ class Axis(_HasState):
     slice = traitlets.CInt(None, allow_none=True)
     min = traitlets.CFloat(None, allow_none=True)
     max = traitlets.CFloat(None, allow_none=True)
-    centers = traitlets.Any()
+    bin_centers = traitlets.Any()
     shape = traitlets.CInt(None, allow_none=True)
     shape_default = traitlets.CInt(64)
-    calculation = traitlets.Any(None, allow_none=True)
+    _calculation = traitlets.Any(None, allow_none=True)
     exception = traitlets.Any(None, allow_none=True)
     _status_change_delay = traitlets.Float(0)
 
@@ -141,7 +141,7 @@ class Axis(_HasState):
             if isinstance(value, vaex.expression.Expression):
                 return str(value)
             return value
-        args = ', '.join('{}={}'.format(key, myrepr(getattr(self, key), key)) for key in self.traits().keys() if key != 'df')
+        args = ', '.join('{}={}'.format(key, myrepr(getattr(self, key), key)) for key in self.traits().keys() if key != 'df' and not key.startswith('_'))
         return '{}({})'.format(self.__class__.__name__, args)
 
     @property
@@ -153,7 +153,7 @@ class Axis(_HasState):
         self.min = None
         self.max = None
         self.status = Axis.Status.NO_LIMITS
-        if self.calculation is not None:
+        if self._calculation is not None:
             self._cancel_computation()
         self.computation()
 
@@ -183,7 +183,7 @@ class Axis(_HasState):
                 # this happens when a user change min/max
                 pass
         else:
-            if self.calculation is not None:
+            if self._calculation is not None:
                 self._cancel_computation()
                 if self.min is not None and self.max is not None:
                     self.status = Axis.Status.READY
@@ -207,7 +207,7 @@ class Axis(_HasState):
             try:
 
                 self._continue_calculation = True
-                self.calculation = self.df.minmax(self.expression, delay=True, progress=self._progress)
+                self._calculation = self.df.minmax(self.expression, delay=True, progress=self._progress)
                 self.df.widget.execute_debounced()
                 # keep a nearly reference to this, since awaits (which trigger the execution, AND reset of this future) may change it this
                 execute_prehook_future = self.df.widget.execute_debounced.pre_hook_future
@@ -216,17 +216,17 @@ class Axis(_HasState):
                 async with self._state_change_to(Axis.Status.CALCULATING_LIMITS):
                     await execute_prehook_future
                 async with self._state_change_to(Axis.Status.CALCULATED_LIMITS):
-                    vmin, vmax = await self.calculation
+                    vmin, vmax = await self._calculation
                 # indicate we are done with the calculation
-                self.calculation = None
+                self._calculation = None
                 if not self._continue_calculation:
                     assert self.status == Axis.Status.READY
                 async with self._state_change_to(Axis.Status.READY):
                     self.min, self.max = vmin, vmax
                     self._calculate_centers()
             except vaex.execution.UserAbort:
-                # expression or min/max change, we don't have to take action
-                assert self.status in [Axis.Status.NO_LIMITS, Axis.Status.READY]
+                # probably means expression or min/max changed, we don't have to take action
+                pass
             except asyncio.CancelledError:
                 pass
 
@@ -242,7 +242,7 @@ class Axis(_HasState):
             self.shape = N
         else:
             centers = self.df.bin_centers(self.expression, [self.min, self.max], shape=self.shape or self.shape_default)
-        self.centers = centers
+        self.bin_centers = centers
 
 
 @signature_has_traits
@@ -266,15 +266,14 @@ class DataArray(_HasState):
     grid = traitlets.Instance(xarray.DataArray, allow_none=True)
     grid_sliced = traitlets.Instance(xarray.DataArray, allow_none=True)
     shape = traitlets.CInt(64)
-    selections = traitlets.List(traitlets.Union(
-        [traitlets.Bool(), traitlets.Unicode(allow_none=True)]), [None])
+    selection = traitlets.Any(None)
 
     def __init__(self, **kwargs):
         super(DataArray, self).__init__(**kwargs)
         self.signal_slice = vaex.events.Signal()
         self.signal_regrid = vaex.events.Signal()
         self.signal_grid_progress = vaex.events.Signal()
-        self.observe(lambda change: self.signal_regrid.emit(), 'selections')
+        self.observe(lambda change: self.signal_regrid.emit(), 'selection')
         self._on_axis_status_change()
 
         # keep a set of axis that need new limits
@@ -384,7 +383,7 @@ class GridCalculator(_HasState):
     status = traitlets.UseEnum(Status, Status.VOID)
     df = traitlets.Instance(vaex.dataframe.DataFrame)
     models = traitlets.List(traitlets.Instance(DataArray))
-    calculation = traitlets.Any(None, allow_none=True)
+    _calculation = traitlets.Any(None, allow_none=True)
     _debug = traitlets.Bool(False)
 
     def __init__(self, df, models):
@@ -405,13 +404,13 @@ class GridCalculator(_HasState):
     def model_add(self, model):
         self.models = self.models + [model]
         if model.status == DataArray.Status.NEEDS_CALCULATING_GRID:
-            if self.calculation is not None:
+            if self._calculation is not None:
                 self._cancel_computation()
             self.computation()
 
         def on_status_changed(change):
             if change.owner.status == DataArray.Status.NEEDS_CALCULATING_GRID:
-                if self.calculation is not None:
+                if self._calculation is not None:
                     self._cancel_computation()
                 self.computation()
         model.observe(on_status_changed, 'status')
@@ -430,15 +429,19 @@ class GridCalculator(_HasState):
         if self._testing_exeception_reslice:
             raise RuntimeError("test:reslice")
         coords = []
-        selections = self.models[0].selections
+        selection_was_list, [selections] = vaex.utils.listify(self.models[0].selection)
         selections = [k for k in selections if k is None or self.df.has_selection(k)]
         for model in self.models:
             subgrid = self.grid
+            if not selection_was_list:
+                subgrid = subgrid[0]
             subgrid_sliced = self.grid
-            axis_index = 1
+            if not selection_was_list:
+                subgrid_sliced = subgrid_sliced[0]
+            axis_index = 1 if selection_was_list else 0
             has_slice = False
-            dims = ["selection"]
-            coords = [selections.copy()]
+            dims = ["selection"] if selection_was_list else []
+            coords = [selections.copy()] if selection_was_list else []
             mins = []
             maxs = []
             for other_model in self.models:
@@ -447,7 +450,7 @@ class GridCalculator(_HasState):
                     for axis in other_model.axes:
                         axis_index += 1
                         dims.append(str(axis.expression))
-                        coords.append(axis.centers)
+                        coords.append(axis.bin_centers)
                         mins.append(axis.min)
                         maxs.append(axis.max)
                 else:
@@ -461,10 +464,11 @@ class GridCalculator(_HasState):
                             subgrid_sliced = np.sum(subgrid_sliced, axis=axis_index)
                             subgrid = np.sum(subgrid, axis=axis_index)
             grid = xarray.DataArray(subgrid, dims=dims, coords=coords)
+            # +1 to skip the selection axis
+            dim_offset = 1 if selection_was_list else 0
             for i, (vmin, vmax) in enumerate(zip(mins, maxs)):
-                # +1 to skip the selection axis
-                grid.coords[dims[i+1]].attrs['min'] = vmin
-                grid.coords[dims[i+1]].attrs['max'] = vmax
+                grid.coords[dims[i+dim_offset]].attrs['min'] = vmin
+                grid.coords[dims[i+dim_offset]].attrs['max'] = vmax
             model.grid = grid
             if has_slice:
                 model.grid_sliced = xarray.DataArray(subgrid_sliced)
@@ -497,9 +501,12 @@ class GridCalculator(_HasState):
             binby = []
             shapes = []
             limits = []
-            selections = self.models[0].selections
+            selection = self.models[0].selection
+            selection_was_list, [selections] = vaex.utils.listify(self.models[0].selection)
+            selections = [k for k in selections if k is None or self.df.has_selection(k)]
+
             for model in self.models:
-                if model.selections != selections:
+                if model.selection != selection:
                     raise ValueError('Selections for all models should be the same')
                 for axis in model.axes:
                     binby.append(axis.expression)
@@ -509,7 +516,7 @@ class GridCalculator(_HasState):
 
             self._continue_calculation = True
             logger.debug('Setting up grid computation...')
-            self.calculation = self.df.count(binby=binby, shape=shapes, limits=limits, selection=selections, progress=self.progress, delay=True)
+            self._calculation = self.df.count(binby=binby, shape=shapes, limits=limits, selection=selections, progress=self.progress, delay=True)
 
             logger.debug('Setting up grid computation done tasks=%r', self.df.executor.tasks)
 
@@ -529,9 +536,9 @@ class GridCalculator(_HasState):
                 for model in self.models:
                     await stack.enter_async_context(model._state_change_to(DataArray.Status.CALCULATED_GRID))
                 # first assign to local
-                grid = await self.calculation
+                grid = await self._calculation
                 # indicate we are done with the calculation
-                self.calculation = None
+                self._calculation = None
                 # raise asyncio.CancelledError("User abort")
             async with contextlib.AsyncExitStack() as stack:
                 for model in self.models:
