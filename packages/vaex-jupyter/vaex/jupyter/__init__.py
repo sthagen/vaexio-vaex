@@ -15,11 +15,14 @@ def _add_toolbar(viz):
     from .widgets import ToolsToolbar, tools_items_default
     from traitlets import link
     interact_items = [k for k in tools_items_default if k['value'] in viz.TOOLS_SUPPORTED]
-    toolbar = ToolsToolbar(supports_transforms=viz.supports_transforms, supports_normalize=viz.supports_normalize,
+    toolbar = ToolsToolbar(supports_transforms=viz.supports_transforms,
+                           supports_normalize=viz.supports_normalize,
                            interact_items=interact_items)
     viz.children = [toolbar, ] + viz.children
     link((viz, 'tool'), (toolbar, 'interact_value'))
     link((viz, 'transform'), (toolbar, 'transform_value'))
+    link((viz, 'normalize'), (toolbar, 'normalize'))
+    link((viz, 'selection_mode'), (toolbar, 'selection_mode'))
     return toolbar
 
 
@@ -62,6 +65,9 @@ class DataFrameAccessorWidget(object):
         grid.model_add(model)
         view = vaex.jupyter.view.DataArray(model=model, display_function=display_function)
         return view
+
+    def axis_model(self, expression, limits=None):
+        return self._axes([expression], limits=[limits])[0]
 
     def _axes(self, expressions, limits):
         limits = self.df.limits(expressions, limits)
@@ -135,9 +141,17 @@ class DataFrameAccessorWidget(object):
             traitlets.link((value, 'expression'), (expression_widget, 'value'))
         return expression_widget
 
-    def column(self, initial_value=None):
+    def column(self, value=None, label='Choose a column'):
         from .widgets import ColumnPicker
-        return ColumnPicker(df=self.df, value=str(initial_value) if initial_value is not None else None)
+        if isinstance(value, vaex.jupyter.model.Axis):
+            expression_value = str(value.expression)
+        else:
+            expression_value = str(value) if value is not None else None
+        column_widget = ColumnPicker(df=self.df, value=expression_value, label=label)
+        if isinstance(value, vaex.jupyter.model.Axis):
+            import traitlets
+            traitlets.link((value, 'expression'), (column_widget, 'value'))
+        return column_widget
 
     def selection_expression(self, initial_value=None, name='default'):
         from .widgets import ExpressionSelectionTextArea

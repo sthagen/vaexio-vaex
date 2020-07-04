@@ -1,3 +1,54 @@
+# vaex 3.1.0 (unreleased)
+
+## vaex-core 2.1.0-dev (unreleased)
+   * Features
+       * Arrow is now a core dependency, vaex-arrow is deprecated. Much better chunked array support, numpy conversion is done lazily. [#517](https://github.com/vaexio/vaex/pull/517)
+
+## vaex-arrow (DEPRECATED)
+   This is now part of vaex-core.
+
+## vaex-jupyter 0.5.2 (2020-6-12)
+   * Features
+      * Normalize histogram and change selection mode. [#826](https://github.com/vaexio/vaex/pull/826)
+
+## vaex-core 2.0.3 (unreleased)
+   * Performance
+      * isin uses hashmaps, leading to a 2x-4x performance increase for primitives, 200x for strings in some cases [#822](https://github.com/vaexio/vaex/pull/822)
+
+## vaex-jupyter 0.5.1 (2020-6-4)
+   * Features
+      * Selection toggle list. [#797](https://github.com/vaexio/vaex/pull/797)
+
+## vaex-server 0.3.1 (2020-6-4)
+   * Fixes
+      * Remote dataframe was still using dtype, not data_type. [#797](https://github.com/vaexio/vaex/pull/797)
+
+## vaex-ml 0.10.0 (2020-6-4)
+   * Features
+      * Implementation of `GroupbyTransformer` [#479](https://github.com/vaexio/vaex/pull/479)
+
+## vaex-arrow 0.6.1 (2020-6-4)
+   * Fixes
+      * Various fixes for aliased columns (column names with invalid identifiers) [#768](https://github.com/vaexio/vaex/pull/768)
+
+## vaex-hdf5 0.6.1 (2020-6-4)
+   * Fixes
+      * Masked arrays supported in hdf5 files on s3 [#781](https://github.com/vaexio/vaex/pull/781)
+      * Various fixes for aliased columns (column names with invalid identifiers) [#768](https://github.com/vaexio/vaex/pull/768)
+
+## vaex-core 2.0.2 (2020-6-4)
+   * Fixes
+      * Masked arrays supported in hdf5 files on s3 [#781](https://github.com/vaexio/vaex/pull/781)
+      * Expression.map always uses masked arrays to be state transferrable (a new dataset might have missing values) [#479](https://github.com/vaexio/vaex/pull/479)
+      * Support importing Pandas dataframes with version 0.23 [#794](https://github.com/vaexio/vaex/pull/794)
+      * Various fixes for aliased columns (column names with invalid identifiers) [#768](https://github.com/vaexio/vaex/pull/768) [#793](https://github.com/vaexio/vaex/pull/793)
+
+## vaex-core 2.0.1 (2020-5-28)
+   * Fixes
+      * Join could in rare cases point to row 0, when there were values in the left, not present in the right [#765](https://github.com/vaexio/vaex/pull/765)
+      * Tabulate 0.8.7 escaped html, undo this to print dataframes nicely.
+
+
 # vaex 3.0.0 (2020-5-24)
    * Breaking changes:
      * Python 2 is not supported anymore
@@ -12,10 +63,6 @@
      * vaex.open/from_csv etc does not copy the pandas index by default [#756](https://github.com/vaexio/vaex/pull/756)
      * df.categorize takes an inplace argument, similar to most methods, and returns the dataframe affected.
 
-# vaex-core 2.0.1 (unreleased)
-   * Fixes
-      * Join could in rare cases point to row 0, when there were values in the left, not present in the right [#765](https://github.com/vaexio/vaex/pull/765)
-      * Tabulate 0.8.7 escaped html, undo this to print dataframes nicely.
 
 # vaex-core 2.0.0 (2020-5-24)
    * Performance

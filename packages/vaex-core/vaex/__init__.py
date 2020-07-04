@@ -336,23 +336,25 @@ def from_arrays(**arrays):
     """
     import numpy as np
     import six
-    from .column import Column
+    from .column import Column, supported_column_types
     df = vaex.dataframe.DataFrameArrays("array")
     for name, array in arrays.items():
-        if isinstance(array, Column):
+        if isinstance(array, supported_column_types):
             df.add_column(name, array)
         else:
             array = np.asanyarray(array)
             df.add_column(name, array)
     return df
 
-def from_arrow_table(table):
+def from_arrow_table(table, as_numpy=True):
     """Creates a vaex DataFrame from an arrow Table.
 
+    :param as_numpy: Will lazily cast columns to a NumPy ndarray.
     :rtype: DataFrame
     """
-    from vaex_arrow.convert import vaex_df_from_arrow_table
-    return vaex_df_from_arrow_table(table=table)
+    from vaex.arrow.dataset import from_table
+    return from_table(table=table, as_numpy=as_numpy)
+
 
 def from_scalars(**kwargs):
     """Similar to from_arrays, but convenient for a DataFrame of length 1.
@@ -387,7 +389,8 @@ def from_pandas(df, name="pandas", copy_index=False, index_name="index"):
 
     def add(name, column):
         values = column.values
-        if isinstance(values, pd.core.arrays.integer.IntegerArray):
+        # the first test is to support (partially) pandas 0.23
+        if hasattr(pd.core.arrays, 'integer') and isinstance(values, pd.core.arrays.integer.IntegerArray):
             values = np.ma.array(values._data, mask=values._mask)
         try:
             vaex_df.add_column(name, values)
@@ -783,6 +786,9 @@ for entry in pkg_resources.iter_entry_points(group='vaex.dataframe.accessor'):
 
 
 for entry in pkg_resources.iter_entry_points(group='vaex.plugin'):
+    if entry.module_name == 'vaex_arrow.opener':
+        # if vaex_arrow package is installed, we ignore it
+        continue
     logger.debug('adding vaex plugin: ' + entry.name)
     try:
         add_namespace = entry.load()
@@ -805,6 +811,6 @@ def vrange(start, stop, step=1, dtype='f8'):
     return ColumnVirtualRange(start, stop, step, dtype)
 
 def string_column(strings):
-    from vaex_arrow.convert import column_from_arrow_array
+    from vaex.arrow.convert import column_from_arrow_array
     import pyarrow as pa
     return column_from_arrow_array(pa.array(strings))

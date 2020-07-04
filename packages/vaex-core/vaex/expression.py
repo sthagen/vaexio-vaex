@@ -11,9 +11,10 @@ import weakref
 from future.utils import with_metaclass
 import numpy as np
 import tabulate
+import pyarrow as pa
 
 from vaex.utils import _ensure_strings_from_expressions, _ensure_string_from_expression
-from vaex.column import ColumnString, _to_string_sequence, str_type
+from vaex.column import ColumnString, _to_string_sequence
 from .hash import counter_type_from_dtype
 import vaex.serialize
 from . import expresso
@@ -93,13 +94,13 @@ class Meta(type):
                     self = a
                     # print(op, a, b)
                     try:
-                        stringy = isinstance(b, str_type) or (isinstance(b, Expression) and b.dtype == str_type)
+                        stringy = isinstance(b, str) or b.is_string()
                     except:
                         # this can happen when expression is a literal, like '1' (used in propagate_unc)
                         # which causes the dtype to fail
                         stringy = False
                     if stringy:
-                        if isinstance(b, str_type):
+                        if isinstance(b, str):
                             b = repr(b)
                         if op['code'] == '==':
                             expression = 'str_equals({0}, {1})'.format(a.expression, b)
@@ -273,22 +274,28 @@ class Expression(with_metaclass(Meta)):
 
     @property
     def dtype(self):
-        return self.ds.data_type(self.expression)
+        return self.df.data_type(self.expression, array_type='numpy')
 
-    def data_type(self):
-        """Alias to df.data_type(self.expression)"""
-        return self.ds.data_type(self.expression)
+    def data_type(self, array_type=None):
+        return self.df.data_type(self.expression, array_type=array_type)
 
     @property
     def shape(self):
         return self.df._shape_of(self)
 
-    def to_numpy(self):
+    def to_arrow(self, convert_to_native=False):
+        '''Convert to Apache Arrow array (will byteswap/copy if convert_to_native=True).'''
+        values = self.values
+        return vaex.array_types.to_arrow(values, convert_to_native=convert_to_native)
+
+    def __arrow_array__(self, type=None):
+        values = self.to_arrow()
+        return pa.array(values, type=type)
+
+    def to_numpy(self, strict=True):
         """Return a numpy representation of the data"""
         values = self.values
-        if hasattr(values, 'to_numpy'):  # e.g. ColumnString
-            values = values.to_numpy()
-        return values
+        return vaex.array_types.to_numpy(values, strict=strict)
 
     def to_dask_array(self, chunks="auto"):
         import dask.array as da
@@ -454,7 +461,10 @@ class Expression(with_metaclass(Meta)):
 
     def tolist(self):
         '''Short for expr.evaluate().tolist()'''
-        return self.evaluate().tolist()
+        values = self.evaluate()
+        if isinstance(values, (pa.Array, pa.ChunkedArray)):
+            return values.to_pandas().values.tolist()
+        return values.tolist()
 
     if not os.environ.get('VAEX_DEBUG', ''):
         def __repr__(self):
@@ -488,9 +498,7 @@ class Expression(with_metaclass(Meta)):
         if len(expression) > 60:
             expression = expression[:57] + '...'
         info = 'Expression = ' + expression + '\n'
-        str_type = str
         dtype = self.dtype
-        dtype = (str(dtype) if dtype != str_type else 'str')
         if self.expression in self.ds.get_column_names(hidden=True):
             state = "column"
         elif self.expression in self.ds.get_column_names(hidden=True):
@@ -590,7 +598,7 @@ class Expression(with_metaclass(Meta)):
         dtype = self.dtype
 
         transient = self.transient or self.ds.filtered or self.ds.is_masked(self.expression)
-        if self.dtype == str_type and not transient:
+        if self.is_string() and not transient:
             # string is a special case, only ColumnString are not transient
             ar = self.ds.columns[self.expression]
             if not isinstance(ar, ColumnString):
@@ -601,7 +609,7 @@ class Expression(with_metaclass(Meta)):
         def map(thread_index, i1, i2, ar):
             if counters[thread_index] is None:
                 counters[thread_index] = counter_type()
-            if dtype == str_type:
+            if vaex.array_types.is_string_type(dtype):
                 previous_ar = ar
                 ar = _to_string_sequence(ar)
                 if not transient:
@@ -765,24 +773,32 @@ def f({0}):
             expression._expression = None  # resets the cached string representation
         return expression
 
-    def astype(self, dtype):
-        if dtype == str:
+    def astype(self, data_type):
+        if vaex.array_types.is_string_type(data_type) or data_type == str:
             return self.ds.func.astype(self, 'str')
         else:
-            return self.ds.func.astype(self, str(dtype))
+            return self.ds.func.astype(self, str(data_type))
 
-    def isin(self, values):
+    def isin(self, values, use_hashmap=True):
         """Lazily tests if each value in the expression is present in values.
 
         :param values: List/array of values to check
+        :param use_hashmap: use a hashmap or not (especially faster when values contains many elements)
         :return: :class:`Expression` with the lazy expression.
         """
-        if self.dtype == str_type:
-            values = vaex.column._to_string_sequence(values)
+        if use_hashmap:
+            # easiest way to create a set is using the vaex dataframe
+            df_values = vaex.from_arrays(x=values)
+            ordered_set = df_values._set(df_values.x)
+            var = self.df.add_variable('var_isin_ordered_set', ordered_set, unique=True)
+            return self.df['isin_set(%s, %s)' % (self, var)]
         else:
-            values = np.array(values, dtype=self.dtype)
-        var = self.df.add_variable('isin_values', values, unique=True)
-        return self.df['isin(%s, %s)' % (self, var)]
+            if self.is_string():
+                values = vaex.column._to_string_sequence(values)
+            else:
+                values = np.array(values, dtype=self.dtype)
+            var = self.df.add_variable('isin_values', values, unique=True)
+            return self.df['isin(%s, %s)' % (self, var)]
 
     def apply(self, f):
         """Apply a function along all values of an Expression.
@@ -916,6 +932,8 @@ def f({0}):
         use_masked_array = False
         if default_value is not None:
             allow_missing = True
+        if allow_missing:
+            use_masked_array = True
         if not set(mapper_keys).issuperset(found_keys):
             missing = set(found_keys).difference(mapper_keys)
             missing0 = list(missing)[0]
@@ -924,8 +942,6 @@ def f({0}):
                 if default_value is not None:
                     value0 = list(mapper.values())[0]
                     assert np.issubdtype(type(default_value), np.array(value0).dtype), "default value has to be of similar type"
-                else:
-                    use_masked_array = True
             else:
                 if only_has_nan:
                     pass  # we're good, the hash mapper deals with nan
@@ -964,6 +980,8 @@ def f({0}):
     def is_masked(self):
         return self.ds.is_masked(self.expression)
 
+    def is_string(self):
+        return self.df.is_string(self.expression)
 
 class FunctionSerializable(object):
     pass

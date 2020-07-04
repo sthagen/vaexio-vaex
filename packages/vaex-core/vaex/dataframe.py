@@ -19,6 +19,7 @@ import vaex.utils
 import numpy as np
 import concurrent.futures
 import numbers
+import pyarrow as pa
 
 from vaex.utils import Timer
 import vaex.events
@@ -33,8 +34,8 @@ import vaex.kld
 from . import selections, tasks, scopes
 from .expression import expression_namespace
 from .delayed import delayed, delayed_args, delayed_list
-from .column import Column, ColumnIndexed, ColumnSparse, ColumnString, ColumnConcatenatedLazy, str_type
-from .array_types import to_numpy, to_array_type
+from .column import Column, ColumnIndexed, ColumnSparse, ColumnString, ColumnConcatenatedLazy, supported_column_types
+from . import array_types
 import vaex.events
 
 # py2/p3 compatibility
@@ -53,6 +54,7 @@ sys_is_le = sys.byteorder == 'little'
 logger = logging.getLogger("vaex")
 lock = threading.Lock()
 default_shape = 128
+default_chunk_size = 1_000_000
 # executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 # executor = vaex.execution.default_executor
 
@@ -286,16 +288,41 @@ class DataFrame(object):
 
     def is_datetime(self, expression):
         dtype = self.data_type(expression)
-        return dtype != str_type and dtype.kind == 'M'
+        return isinstance(dtype, np.dtype) and dtype.kind == 'M'
+
+    def is_string(self, expression):
+        return vaex.array_types.is_string_type(self.data_type(expression))
 
     def is_category(self, column):
         """Returns true if column is a category."""
         column = _ensure_string_from_expression(column)
+        #  TODO: we don't support DictionaryType for remote dataframes
+        if self.is_local() and column in self.columns:
+            # TODO: we don't support categories as expressions
+            x = self.columns[column]
+            if isinstance(x, (pa.Array, pa.ChunkedArray)):
+                arrow_type = x.type
+                if isinstance(arrow_type, pa.DictionaryType):
+                    return True
         return column in self._categories
 
-    def category_labels(self, column):
+    def category_labels(self, column, aslist=True):
         column = _ensure_string_from_expression(column)
-        return self._categories[column]['labels']
+        if column in self._categories:
+            return self._categories[column]['labels']
+        if column in self.columns:
+            x = self.columns[column]
+            arrow_type = x.type
+            # duplicate code in array_types.py
+            if isinstance(arrow_type, pa.DictionaryType):
+                # we're interested in the type of the dictionary or the indices?
+                if isinstance(x, pa.ChunkedArray):
+                    # take the first dictionaryu
+                    x = x.chunks[0]
+                dictionary = x.dictionary
+                if aslist:
+                    dictionary = dictionary.to_pylist()
+                return dictionary
 
     def category_values(self, column):
         column = _ensure_string_from_expression(column)
@@ -384,7 +411,7 @@ class DataFrame(object):
         from vaex.column import _to_string_sequence
 
         transient = self[str(expression)].transient or self.filtered or self.is_masked(expression)
-        if self.data_type(expression) == str_type and not transient:
+        if self.is_string(expression) and not transient:
             # string is a special case, only ColumnString are not transient
             ar = self.columns[str(expression)]
             if not isinstance(ar, ColumnString):
@@ -396,7 +423,7 @@ class DataFrame(object):
         def map(thread_index, i1, i2, ar):
             if sets[thread_index] is None:
                 sets[thread_index] = ordered_set_type()
-            if dtype == str_type:
+            if vaex.array_types.is_string_type(dtype):
                 previous_ar = ar
                 ar = _to_string_sequence(ar)
                 if not transient:
@@ -417,14 +444,15 @@ class DataFrame(object):
 
     def _index(self, expression, progress=False, delay=False):
         column = _ensure_string_from_expression(expression)
+        column = self._column_aliases.get(column, column)
         columns = [column]
         from .hash import index_type_from_dtype
         from vaex.column import _to_string_sequence
 
-        transient = self[str(expression)].transient or self.filtered or self.is_masked(expression)
-        if self.data_type(expression) == str_type and not transient:
+        transient = self[column].transient or self.filtered or self.is_masked(column)
+        if self.is_string(expression) and not transient:
             # string is a special case, only ColumnString are not transient
-            ar = self.columns[str(expression)]
+            ar = self.columns[str(self[column].expand())]
             if not isinstance(ar, ColumnString):
                 transient = True
 
@@ -434,7 +462,7 @@ class DataFrame(object):
         def map(thread_index, i1, i2, ar):
             if index_list[thread_index] is None:
                 index_list[thread_index] = index_type()
-            if dtype == str_type:
+            if vaex.array_types.is_string_type(dtype):
                 previous_ar = ar
                 ar = _to_string_sequence(ar)
                 if not transient:
@@ -466,7 +494,7 @@ class DataFrame(object):
             dtype = self.data_type(expression)
             from vaex.column import _to_string_sequence
             def map(thread_index, i1, i2, ar):
-                if dtype == str_type:
+                if vaex.array_types.is_string_type(dtype):
                     previous_ar = ar
                     ar = _to_string_sequence(ar)
                     if not transient:
@@ -616,12 +644,18 @@ class DataFrame(object):
         if extra_expressions:
             extra_expressions = _ensure_strings_from_expressions(extra_expressions)
         expression_waslist, [expressions, ] = vaex.utils.listify(expression)
+        expressions = [self._column_aliases.get(k, k) for k in expressions]
+        import traceback
+        trace = ''.join(traceback.format_stack())
         for expression in expressions:
             if expression and expression != "*":
                 self.validate_expression(expression)
         if not hasattr(self.local, '_aggregator_nest_count'):
             self.local._aggregator_nest_count = 0
-        assert self.local._aggregator_nest_count == 0, "detected nested aggregator call"
+        if self.local._aggregator_nest_count != 0:
+            raise RuntimeError("nested aggregator call: \nlast trace:\n%s\ncurrent trace:\n%s" % (self.local.last_trace, trace))
+        else:
+            self.local.last_trace = trace
         # Instead of 'expression is not None', we would like to have 'not virtual'
         # but in agg.py we do some casting, which results in calling .dtype(..) with a non-column
         # expression even though all expressions passed here are column references
@@ -1217,6 +1251,7 @@ class DataFrame(object):
         expression = _ensure_strings_from_expressions(expression)
         binby = _ensure_strings_from_expressions(binby)
         waslist, [expressions, ] = vaex.utils.listify(expression)
+        expressions = [self._column_aliases.get(k, k) for k in expressions]
         dtypes = [self.data_type(expr) for expr in expressions]
         dtype0 = dtypes[0]
         if not all([k.kind == dtype0.kind for k in dtypes]):
@@ -1378,6 +1413,12 @@ class DataFrame(object):
                 waslist_percentage, [percentages, ] = vaex.utils.listify(percentage)
                 percentiles = []
                 for p in percentages:
+                    if p == 0:
+                        percentiles.append(percentile_limits[i][0])
+                        continue
+                    if p == 100:
+                        percentiles.append(percentile_limits[i][1])
+                        continue
                     values = np.array((totalcounts + 1) * p / 100.)  # make sure it's an ndarray
                     values[empty] = 0
                     floor_values = np.array(np.floor(values))
@@ -1958,36 +1999,70 @@ class DataFrame(object):
         """Alias for `df.byte_size()`, see :meth:`DataFrame.byte_size`."""
         return self.byte_size()
 
-    def _shape_of(self, expression, filtered=True):
-        sample = self.evaluate(expression, 0, 1, filtered=False, internal=True, parallel=False)
+    def _shape_of(self, expression, filtered=True, check_alias=True):
+        if check_alias:
+            if str(expression) in self._column_aliases:
+                expression = self._column_aliases[str(expression)]  # translate the alias name into the real name
+        sample = self.evaluate(expression, 0, 1, filtered=False, array_type="numpy", parallel=False)
+        sample = vaex.array_types.to_numpy(sample, strict=True)
         rows = len(self) if filtered else self.length_unfiltered()
         return (rows,) + sample.shape[1:]
 
-    def data_type(self, expression, internal=False):
-        """Return the numpy dtype for the given expression, if not a column, the first row will be evaluated to get the dtype."""
+    def data_type(self, expression, array_type=None, internal=False, check_alias=True):
+        """Return the datatype for the given expression, if not a column, the first row will be evaluated to get the data type.
+
+        Example:
+
+        >>> df = vaex.from_scalars(x=1, s='Hi')
+
+        :param str array_type: 'numpy', 'arrow' or None, to indicate if the data type should be converted
+        """
         expression = _ensure_string_from_expression(expression)
+        if check_alias:
+            if expression in self._column_aliases:
+                expression = self._column_aliases[expression]  # translate the alias name into the real name
+        data_type = None
         if expression in self._dtypes_override:
-            return self._dtypes_override[expression]
-        if expression in self.variables:
-            return np.float64(1).dtype
+            data_type = self._dtypes_override[expression]
+        elif expression in self.variables:
+            data_type = np.float64(1).dtype
         elif self.is_local() and expression in self.columns.keys():
             column = self.columns[expression]
             if hasattr(column, 'dtype'):
-                dtype = column.dtype
+                # TODO: this probably would use data_type
+                # to support Columns that wrap arrow arrays
+                data_type = column.dtype
             else:
                 data = column[0:1]
-                dtype = data.dtype
         else:
             try:
-                data = self.evaluate(expression, 0, 1, filtered=False, internal=True, parallel=False)
+                data = self.evaluate(expression, 0, 1, filtered=False, array_type=array_type, parallel=False)
             except:
-                data = self.evaluate(expression, 0, 1, filtered=True, internal=True, parallel=False)
-            dtype = data.dtype
+                data = self.evaluate(expression, 0, 1, filtered=True, array_type=array_type, parallel=False)
+        if data_type is None:
+            # means we have to determine it from the data
+            if isinstance(data, np.ndarray):
+                data_type = data.dtype
+            elif isinstance(data, Column):
+                data = data.to_arrow()
+                data_type = data.type
+            else:
+                data_type = data.type  # assuming arrow
+
+        if array_type == "arrow":
+            data_type = array_types.to_arrow_type(data_type)
+            return data_type
+        elif array_type == "numpy":
+            data_type = array_types.to_numpy_type(data_type)
+        elif array_type is None:
+            pass
+        else:
+            raise ValueError(f'Unknown array_type {array_type}')
+
         if not internal:
-            if dtype != str_type:
-                if dtype.kind in 'US':
-                    return str_type
-        return dtype
+            if isinstance(data_type, np.dtype) and data_type.kind in 'US':
+                return pa.string()
+        return data_type
 
     @property
     def dtypes(self):
@@ -2581,7 +2656,7 @@ class DataFrame(object):
 
         # if _is_string(selection):
 
-    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, internal=None, parallel=True, chunk_size=None):
+    def evaluate(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, array_type=None, parallel=True, chunk_size=None):
         """Evaluate an expression, and return a numpy array with the results for the full column or a part of it.
 
         Note that this is not how vaex should be used, since it means a copy of the data needs to fit in memory.
@@ -2597,11 +2672,11 @@ class DataFrame(object):
         :return:
         """
         if chunk_size is not None:
-            return self.evaluate_iterator(expression, s1=i1, s2=i2, out=out, selection=selection, filtered=filtered, internal=internal, parallel=parallel, chunk_size=chunk_size)
+            return self.evaluate_iterator(expression, s1=i1, s2=i2, out=out, selection=selection, filtered=filtered, array_type=array_type, parallel=parallel, chunk_size=chunk_size)
         else:
-            return self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, internal=internal, parallel=parallel, chunk_size=chunk_size)
+            return self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, array_type=array_type, parallel=parallel, chunk_size=chunk_size)
 
-    def evaluate_iterator(self, expression, s1=None, s2=None, out=None, selection=None, filtered=True, internal=None, parallel=True, chunk_size=None, prefetch=True):
+    def evaluate_iterator(self, expression, s1=None, s2=None, out=None, selection=None, filtered=True, array_type=None, parallel=True, chunk_size=None, prefetch=True):
         """Generator to efficiently evaluate expressions in chunks (number of rows).
 
         See :func:`DataFrame.evaluate` for other arguments.
@@ -2625,13 +2700,13 @@ class DataFrame(object):
         if not prefetch:
             # this is the simple implementation
             for l1, l2, i1, i2 in self._unfiltered_chunk_slices(chunk_size):
-                yield l1, l2, self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, internal=internal, parallel=parallel, raw=True)
+                yield l1, l2, self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, array_type=array_type, parallel=parallel, raw=True)
         # But this implementation is faster if the main thread work is single threaded
         else:
             with concurrent.futures.ThreadPoolExecutor(1) as executor:
                 iter = self._unfiltered_chunk_slices(chunk_size)
                 def f(i1, i2):
-                    return self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, internal=internal, parallel=parallel, raw=True)
+                    return self._evaluate_implementation(expression, i1=i1, i2=i2, out=out, selection=selection, filtered=filtered, array_type=array_type, parallel=parallel, raw=True)
                 previous_l1, previous_l2, previous_i1, previous_i2 = next(iter)
                 # we submit the 1st job
                 previous = executor.submit(f, previous_i1, previous_i2)
@@ -2663,10 +2738,10 @@ class DataFrame(object):
         if chunk_size is not None:
             def iterator():
                 for i1, i2, chunks in self.evaluate_iterator(column_names, selection=selection, parallel=parallel, chunk_size=chunk_size):
-                    yield i1, i2, list(zip(column_names, [to_array_type(chunk, array_type) for chunk in chunks]))
+                    yield i1, i2, list(zip(column_names, [array_types.convert(chunk, array_type) for chunk in chunks]))
             return iterator()
         else:
-            return list(zip(column_names, [to_array_type(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)]))
+            return list(zip(column_names, [array_types.convert(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)]))
 
     @docsubst
     def to_arrays(self, column_names=None, selection=None, strings=True, virtual=True, parallel=True, chunk_size=None, array_type=None):
@@ -2685,9 +2760,9 @@ class DataFrame(object):
         if chunk_size is not None:
             def iterator():
                 for i1, i2, chunks in self.evaluate_iterator(column_names, selection=selection, parallel=parallel, chunk_size=chunk_size):
-                    yield i1, i2, [to_array_type(chunk, array_type) for chunk in chunks]
+                    yield i1, i2, [array_types.convert(chunk, array_type) for chunk in chunks]
             return iterator()
-        return [to_array_type(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)]
+        return [array_types.convert(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)]
 
     @docsubst
     def to_dict(self, column_names=None, selection=None, strings=True, virtual=True, parallel=True, chunk_size=None, array_type=None):
@@ -2706,9 +2781,9 @@ class DataFrame(object):
         if chunk_size is not None:
             def iterator():
                 for i1, i2, chunks in self.evaluate_iterator(column_names, selection=selection, parallel=parallel, chunk_size=chunk_size):
-                    yield i1, i2, dict(list(zip(column_names, [to_array_type(chunk, array_type) for chunk in chunks])))
+                    yield i1, i2, dict(list(zip(column_names, [array_types.convert(chunk, array_type) for chunk in chunks])))
             return iterator()
-        return dict(list(zip(column_names, [to_array_type(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)])))
+        return dict(list(zip(column_names, [array_types.convert(chunk, array_type) for chunk in self.evaluate(column_names, selection=selection, parallel=parallel)])))
 
     @docsubst
     def to_copy(self, column_names=None, selection=None, strings=True, virtual=True, selections=True):
@@ -2804,7 +2879,7 @@ class DataFrame(object):
         :param chunk_size: {chunk_size}
         :return: pyarrow.Table object or iterator of
         """
-        from vaex_arrow.convert import arrow_table_from_vaex_df, arrow_array_from_numpy_array
+        from vaex.arrow.convert import arrow_array_from_numpy_array
         import pyarrow as pa
         column_names = column_names or self.get_column_names(strings=strings, virtual=virtual)
         if chunk_size is not None:
@@ -2836,7 +2911,7 @@ class DataFrame(object):
 
         table = Table(meta=meta)
         for name, data in self.to_items(column_names=column_names, selection=selection, strings=strings, virtual=virtual, parallel=parallel):
-            if self.data_type(name) == str_type:  # for astropy we convert it to unicode, it seems to ignore object type
+            if self.is_string(name):  # for astropy we convert it to unicode, it seems to ignore object type
                 data = np.array(data).astype('U')
             meta = dict()
             if name in self.ucds:
@@ -2881,7 +2956,7 @@ class DataFrame(object):
             return
         if self.is_local() and str(expression) in self.columns:
             return
-        vars = set(self.get_names(hidden=True))
+        vars = set(self.get_names(hidden=True, alias=False))
         funcs = set(expression_namespace.keys())  | set(self.functions.keys())
         try:
             return vaex.expresso.validate_expression(expression, vars, funcs)
@@ -2913,7 +2988,7 @@ class DataFrame(object):
             renamed = '__' +vaex.utils.find_valid_name(name, used=self.get_column_names())
             self._rename(name, renamed)
 
-        if isinstance(f_or_array, (np.ndarray, Column)):
+        if isinstance(f_or_array, supported_column_types):
             data = ar = f_or_array
             # it can be None when we have an 'empty' DataFrameArrays
             if self._length_original is None:
@@ -2958,7 +3033,8 @@ class DataFrame(object):
                         types = list({type(k) for k in ar_data if k is not is_missing(k)})
 
                     if len(types) == 1 and issubclass(types[0], six.string_types):
-                        self._dtypes_override[valid_name] = str_type
+                        # TODO: how do we know it should not be large_string?
+                        self._dtypes_override[valid_name] = pa.string()
                     if len(types) == 0:  # can only be if all nan right?
                         ar = ar.astype(np.float64)
             self.columns[valid_name] = ar
@@ -3256,11 +3332,12 @@ class DataFrame(object):
                 expression = expression.copy(self)
         column_position = len(self.column_names)
         # if the current name is an existing column name....
+        real_name = self._column_aliases.get(name, name)
         if name in self.get_column_names(hidden=True):
-            column_position = self.column_names.index(name)
+            column_position = self.column_names.index(real_name)
             renamed = vaex.utils.find_valid_name('__' +name, used=self.get_column_names(hidden=True))
             # we rewrite all existing expressions (including the passed down expression argument)
-            self._rename(name, renamed)
+            self._rename(real_name, renamed)
         expression = _ensure_string_from_expression(expression)
 
         if vaex.utils.find_valid_name(name) != name:
@@ -3281,6 +3358,10 @@ class DataFrame(object):
     def rename(self, name, new_name, unique=False):
         """Renames a column or variable, and rewrite expressions such that they refer to the new name"""
         if name == new_name:
+            return
+        if name in self._column_aliases:
+            # nobody should refer to an alias, so we can just rename it
+            self._column_aliases[new_name] = self._column_aliases.pop(name)
             return
         new_name = vaex.utils.find_valid_name(new_name, used=[] if not unique else self.get_column_names(hidden=True))
         self._rename(name, new_name, rename_meta_data=True)
@@ -3380,10 +3461,11 @@ class DataFrame(object):
                 parts += ["<th>%s</th>" % header]
         parts += ["</tr></thead>"]
         for name in self.get_column_names():
+            column_name = self._column_aliases.get(name, name)
             parts += ["<tr>"]
             parts += ["<td>%s</td>" % name]
-            virtual = name not in self.column_names
-            if name in self.column_names:
+            virtual = column_name in self.virtual_columns
+            if not virtual:
                 dtype = str(self.data_type(name)) if self.data_type(name) != str else 'str'
             else:
                 dtype = "</i>virtual column</i>"
@@ -3394,7 +3476,7 @@ class DataFrame(object):
             if description:
                 parts += ["<td ><pre>%s</pre></td>" % self.descriptions.get(name, "")]
             if virtual:
-                parts += ["<td><code>%s</code></td>" % self.virtual_columns[name]]
+                parts += ["<td><code>%s</code></td>" % self.virtual_columns[column_name]]
             else:
                 parts += ["<td></td>"]
             parts += ["</tr>"]
@@ -3482,18 +3564,27 @@ class DataFrame(object):
         N = len(self)
         columns = {}
         for feature in self.get_column_names(strings=strings, virtual=virtual)[:]:
-            dtype = str(self.data_type(feature)) if self.data_type(feature) != str else 'str'
-            if self.data_type(feature) == str_type or self.data_type(feature).kind in ['S', 'U']:
+            data_type = self.data_type(feature)
+            if not isinstance(data_type, np.dtype):
+                if data_type in array_types.string_types:
+                    count = self.count(feature, selection=selection, delay=True)
+                    self.execute()
+                    count = count.get()
+                    columns[feature] = ((data_type, count, N-count, '--', '--', '--', '--'))
+                else:
+                    raise NotImplementedError(f'Did not implement describe for data type {data_type}')
+            elif data_type.kind in 'SU':
+                # TODO: this blocks is the same as the string block above, can we avoid SU types?
                 count = self.count(feature, selection=selection, delay=True)
                 self.execute()
                 count = count.get()
-                columns[feature] = ((dtype, count, N-count, '--', '--', '--', '--'))
-            elif self.data_type(feature).kind == 'O':
+                columns[feature] = ((data_type, count, N-count, '--', '--', '--', '--'))
+            elif data_type.kind in 'O':
                 # this will also properly count NaN-like objects like NaT
                 count_na = self[feature].isna().astype('int').sum(delay=True)
                 self.execute()
                 count_na = count_na.get()
-                columns[feature] = ((dtype, N-count_na, count_na, '--', '--', '--', '--'))
+                columns[feature] = ((data_type, N-count_na, count_na, '--', '--', '--', '--'))
             else:
                 is_datetime = self.is_datetime(feature)
                 mean = self.mean(feature, selection=selection, delay=True)
@@ -3510,8 +3601,8 @@ class DataFrame(object):
                 else:
                     count, mean, std, minmax = count.get(), mean.get(), std.get(), minmax.get()
                     count = int(count)
-                columns[feature] = ((dtype, count, N-count, mean, std, minmax[0], minmax[1]))
-        return pd.DataFrame(data=columns, index=['dtype', 'count', 'NA', 'mean', 'std', 'min', 'max'])
+                columns[feature] = ((data_type, count, N-count, mean, std, minmax[0], minmax[1]))
+        return pd.DataFrame(data=columns, index=['data_type', 'count', 'NA', 'mean', 'std', 'min', 'max'])
 
     def cat(self, i1, i2, format='html'):
         """Display the DataFrame from row i1 till i2
@@ -3713,9 +3804,9 @@ class DataFrame(object):
         """
         return len(self.get_column_names(hidden=hidden))
 
-    def get_names(self, hidden=False):
+    def get_names(self, hidden=False, alias=True):
         """Return a list of column names and variable names."""
-        names = self.get_column_names(hidden=hidden)
+        names = self.get_column_names(hidden=hidden, alias=alias)
         return names + [k for k in self.variables.keys() if not hidden or not k.startswith('__')]
 
     def get_column_names(self, virtual=True, strings=True, hidden=False, regex=None, alias=True):
@@ -3747,7 +3838,7 @@ class DataFrame(object):
                 return False
             if not virtual and name in self.virtual_columns:
                 return False
-            if not strings and (self.data_type(name) == str_type or self.data_type(name).type == np.string_):
+            if not strings and self.is_string(name):
                 return False
             if not hidden and name.startswith('__'):
                 return False
@@ -3839,13 +3930,13 @@ class DataFrame(object):
         df = self if inplace else self.copy()
         if self._index_start == 0 and self._index_end == self._length_original:
             return df
-        for name in df.get_column_names(hidden=True):
+        for name in df.columns.keys():
             column = df.columns.get(name)
             if column is not None:
                 if self._index_start == 0 and len(column) == self._index_end:
                     pass  # we already assigned it in .copy
                 else:
-                    if isinstance(column, np.ndarray):  # real array
+                    if isinstance(column, array_types.supported_array_types):  # real array
                         df.columns[name] = column[self._index_start:self._index_end]
                     else:
                         df.columns[name] = column.trim(self._index_start, self._index_end)
@@ -4283,12 +4374,19 @@ class DataFrame(object):
         """
         return self._filter_all(self.func.isna, column_names)
 
+    def dropinf(self, column_names=None):
+        """ Create a shallow copy of a DataFrame, with filtering set using isinf.
+        :param column_names: The columns to consider, default: all (real, non-virtual) columns
+        :rtype: DataFrame
+        """
+        return self._filter_all(self.func.isinf, column_names)
+
     def _filter_all(self, f, column_names=None):
         copy = self.copy()
         column_names = column_names or self.get_column_names(virtual=False)
-        expression = f(self._expr(column_names[0]))
+        expression = f(self[column_names[0]])
         for column in column_names[1:]:
-            expression = expression | f(self._expr(column))
+            expression = expression | f(self[column])
         copy.select(~expression, name=FILTER_SELECTION_NAME, mode='and')
         return copy
 
@@ -4474,7 +4572,7 @@ class DataFrame(object):
         '''
 
         if isinstance(name, six.string_types):
-            if isinstance(value, (np.ndarray, Column)):
+            if isinstance(value, supported_column_types):
                 self.add_column(name, value)
             else:
                 self.add_virtual_column(name, value)
@@ -4581,6 +4679,8 @@ class DataFrame(object):
                     names = self.get_column_names().__getitem__(item[1])
                     return df[names]
             for expression in item:
+                if expression in self._column_aliases:
+                    expression = self._column_aliases[expression]
                 self.validate_expression(expression)
             df = self.copy(column_names=item)
             return df
@@ -4964,12 +5064,15 @@ class DataFrameLocal(DataFrame):
         df._index_start = self._index_start
         df._active_fraction = self._active_fraction
         df._renamed_columns = list(self._renamed_columns)
-        df._column_aliases = dict(self._column_aliases)
         df.units.update(self.units)
         df.variables.update(self.variables)  # we add all, could maybe only copy used
         df._categories.update(self._categories)
         if column_names is None:
             column_names = self.get_column_names(hidden=True, alias=False)
+            df._column_aliases = dict(self._column_aliases)
+        else:
+            df._column_aliases = {alias: real_name for alias, real_name in self._column_aliases.items()}
+            column_names = [self._column_aliases.get(k, k) for k in column_names]
         all_column_names = self.get_column_names(hidden=True, alias=False)
 
         # put in the selections (thus filters) in place
@@ -5019,13 +5122,13 @@ class DataFrameLocal(DataFrame):
                         depending.update(deps)
                 else:
                     # this might be an expression, create a valid name
-                    self.validate_expression(name)
-                    expression = name
-                    name = vaex.utils.find_valid_name(name)
+                    real_column_name = df._column_aliases.get(name, name)
+                    valid_name = vaex.utils.find_valid_name(name)
+                    self.validate_expression(real_column_name)
                     # add the expression
-                    df[name] = df._expr(expression)
+                    df[valid_name] = df._expr(real_column_name)
                     # then get the dependencies
-                    deps = [key for key, value in df._virtual_expressions[name].ast_names.items()]
+                    deps = [key for key, value in df._virtual_expressions[valid_name].ast_names.items()]
                     depending.update(deps)
                 # print(depending, "after add")
             # depending |= column_names
@@ -5187,6 +5290,23 @@ class DataFrameLocal(DataFrame):
         else:
             return np.array(chunks, dtype=dtype).T
 
+    def as_arrow(self):
+        """Lazily cast all columns to arrow, except object types."""
+        df = self.copy()
+        for name in self.get_column_names():
+            df[name] = df[name].as_arrow()
+        return df
+
+    def as_numpy(self, strict=False):
+        """Lazily cast all numerical columns to numpy.
+
+        If strict is True, it will also cast non-numerical types.
+        """
+        df = self.copy()
+        for name in self.get_column_names():
+            df[name] = df[name].as_numpy(strict=strict)
+        return df
+
     @vaex.utils.deprecated('use DataFrame.join(other)')
     def _hstack(self, other, prefix=None):
         """Join the columns of the other DataFrame to this one, assuming the ordering is the same"""
@@ -5277,7 +5397,7 @@ class DataFrameLocal(DataFrame):
             for i1, i2 in vaex.utils.subdivide(logical_length, max_length=chunk_size):
                 yield i1, i2, i1, i2
 
-    def _evaluate_implementation(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, internal=False, parallel=True, chunk_size=None, raw=False):
+    def _evaluate_implementation(self, expression, i1=None, i2=None, out=None, selection=None, filtered=True, array_type=None, parallel=True, chunk_size=None, raw=False):
         """The real implementation of :func:`DataFrame.evaluate` (not returning a generator).
 
         :param raw: Whether indices i1 and i2 refer to unfiltered (raw=True) or 'logical' offsets (raw=False)
@@ -5285,6 +5405,7 @@ class DataFrameLocal(DataFrame):
         # expression = _ensure_string_from_expression(expression)
         was_list, [expressions] = vaex.utils.listify(expression)
         expressions = vaex.utils._ensure_strings_from_expressions(expressions)
+        expressions = [self._column_aliases.get(k, k) for k in expressions]
 
         selection = _ensure_strings_from_expressions(selection)
         max_stop = (len(self) if (self.filtered and filtered) else self.length_unfiltered())
@@ -5306,6 +5427,9 @@ class DataFrameLocal(DataFrame):
                 df = df.trim()
                 df.set_active_range(i1, i2)
                 df = df.trim()
+        else:
+            df = self
+        # print(df.columns['x'], i1, i2)
         expression = expressions[0]
         # here things are simpler or we don't go parallel
         mask = None
@@ -5322,57 +5446,72 @@ class DataFrameLocal(DataFrame):
             virtual = set()
             # TODO: For NEP branch: dtype -> dtype_evaluate
 
+            expression_to_evaluate = list(set(expressions))  # lets assume we have to do them all
+
             for expression in set(expressions):
-                dtypes[expression] = df.data_type(expression, internal=False)
+                dtypes[expression] = dtype = df.data_type(expression)
                 if expression not in df.columns:
                     virtual.add(expression)
                 # since we will use pre_filter=True, we'll get chunks of the data at unknown offset
                 # so we'll also have to stitch those back together
-                if dtypes[expression] == str_type or use_filter or selection:
+                if use_filter or selection:# or not isinstance(dtype, np.dtype):
                     chunks_map[expression] = {}
                 else:
                     # we know exactly where to place the chunks, so we pre allocate the arrays
-                    shape = (length, ) + df._shape_of(expression, filtered=False)[1:]
-                    shapes[expression] = shape
-                    if df.is_masked(expression):
-                        arrays[expression] = np.ma.empty(shapes.get(expression, length), dtype=dtypes[expression])
+                    if expression in virtual:
+                        if isinstance(dtype, np.dtype):
+                            shape = (length, ) + df._shape_of(expression, filtered=False)[1:]
+                            shapes[expression] = shape
+                            # numpy arrays are fixed length, so we can pre allocate them
+                            if df.is_masked(expression):
+                                arrays[expression] = np.ma.empty(shapes.get(expression, length), dtype=dtypes[expression])
+                            else:
+                                arrays[expression] = np.zeros(shapes.get(expression, length), dtype=dtypes[expression])
+                        else:
+                            # TODO: find a way to modify an arrow array inplace, e.g. float64 array
+                            # probably by making an ndarray, and have an Arrow array view that
+                            # fixed_width = False
+                            # try:
+                            #     ts.bit_width
+                            #     fixed_width = True
+                            # except ValueError:
+                            #     pass
+                            # if fixed_width:
+                            chunks_map[expression] = {}
                     else:
-                        arrays[expression] = np.zeros(shapes.get(expression, length), dtype=dtypes[expression])
-
+                        # quick path, we can just copy the column
+                        arrays[expression] = df.columns[expression]
+                        start, end = df._index_start, df._index_end
+                        if start != 0 or end != len(arrays[expression]):
+                            arrays[expression] = arrays[expression][start:end]
+                        if isinstance(arrays[expression], vaex.column.Column):
+                            arrays[expression] = arrays[expression][0:end-start]  # materialize fancy columns (lazy, indexed)
+                        expression_to_evaluate.remove(expression)
             def assign(thread_index, i1, i2, *blocks):
-                for i, expr in enumerate(expressions):
+                for i, expr in enumerate(expression_to_evaluate):
                     if expr in chunks_map:
                         # for non-primitive arrays we simply keep a reference to the chunk
                         chunks_map[expr][i1] = blocks[i]
                     else:
                         # for primitive arrays (and no filter/selection) we directly add it to the right place in contiguous numpy array
                         arrays[expr][i1:i2] = blocks[i]
-
-            df.map_reduce(assign, lambda *_: None, expressions, ignore_filter=False, selection=selection, pre_filter=use_filter, info=True, to_numpy=False)
+            if expression_to_evaluate:
+                df.map_reduce(assign, lambda *_: None, expression_to_evaluate, ignore_filter=False, selection=selection, pre_filter=use_filter, info=True, to_numpy=False)
             def finalize_result(expression):
                 if expression in chunks_map:
                     # put all chunks in order
                     chunks = [chunk for (i1, chunk) in sorted(chunks_map[expression].items(), key=lambda i1_and_chunk: i1_and_chunk[0])]
                     assert len(chunks) > 0
                     if len(chunks) == 1:
-                        # TODO: For NEP Branch
-                        # return pa.array(chunks[0])
-                        if internal:
-                            return chunks[0]
-                        else:
-                            values = to_numpy(chunks[0])
-                            return values
+                        values = array_types.convert(chunks[0], array_type)
                     else:
-                        # TODO: For NEP Branch
-                        # return pa.chunked_array(chunks)
-                        if internal:
-                            return chunks  # Returns a list of StringArrays
-                        else:
-                            # if isinstance(value, ColumnString) and not internal:
-                            return np.concatenate([to_numpy(k) for k in chunks])
+                        values = array_types.convert(chunks, array_type)
+                    return values
                 else:
-                    return arrays[expression]
+                    return array_types.convert(arrays[expression], array_type)
+            # print("dsadsa", chunks_map, arrays)
             result = [finalize_result(k) for k in expressions]
+            # print("Result", result)
             if not was_list:
                 result = result[0]
             return result
@@ -5399,8 +5538,11 @@ class DataFrameLocal(DataFrame):
                 if out is not None:
                     scope.buffers[expression] = out
                 value = scope.evaluate(expression)
-                if isinstance(value, ColumnString) and not internal:
-                    value = value.to_numpy()
+                # if isinstance(value, ColumnString) and not internal:
+                #     value = value.to_numpy()
+                # print("before", value)
+                value = array_types.convert(value, array_type)
+                # print("after", value)
                 values.append(value)
             if not was_list:
                 return values[0]
@@ -5446,13 +5588,9 @@ class DataFrameLocal(DataFrame):
                     print("unit mismatch : %r vs %r for %s" % (unit1, unit2, column_name))
                     meta_mismatch.append(column_name)
                 type1 = self.data_type(column_name)
-                if type1 != str_type:
-                    type1 = type1.type
                 type2 = other.data_type(column_name)
-                if type2 != str_type:
-                    type2 = type2.type
-                if type1 != type2:
-                    print("different dtypes: %s vs %s for %s" % (self.data_type(column_name), other.data_type(column_name), column_name))
+                if not vaex.array_types.same_type(type1, type2):
+                    print("different data types: %s vs %s for %s" % (self.data_type(column_name), other.data_type(column_name), column_name))
                     type_mismatch.append(column_name)
                 else:
                     # a = self.columns[column_name]
@@ -5461,15 +5599,17 @@ class DataFrameLocal(DataFrame):
                     #   a = a[self.evaluate_selection_mask(None)]
                     # if other.filtered:
                     #   b = b[other.evaluate_selection_mask(None)]
-                    a = self.evaluate(column_name)
-                    b = other.evaluate(column_name)
+                    a = self.evaluate(column_name, array_type="numpy")
+                    b = other.evaluate(column_name,  array_type="numpy")
                     if orderby:
                         a = a[index1]
                         b = b[index2]
 
                     def normalize(ar):
-                        if ar.dtype == str_type:
-                            return ar
+                        if isinstance(ar, pa.Array):
+                            ar = ar.to_pandas().values
+                        # if ar.dtype == str_type:
+                        #     return ar
                         if ar.dtype.kind == "f" and hasattr(ar, "mask"):
                             mask = ar.mask
                             ar = ar.copy()
@@ -5490,7 +5630,7 @@ class DataFrameLocal(DataFrame):
                         a = normalize(a)
                         b = normalize(b)
                         boolean_mask = (a == b)
-                        if self.data_type(column_name) != str_type and self.data_type(column_name).kind == 'f':  # floats with nan won't equal itself, i.e. NaN != NaN
+                        if not self.is_string(column_name) and self.data_type(column_name).kind == 'f':  # floats with nan won't equal itself, i.e. NaN != NaN
                             boolean_mask |= (np.isnan(a) & np.isnan(b))
                         return boolean_mask
                     boolean_mask = equal_mask(a, b)
@@ -5568,6 +5708,8 @@ class DataFrameLocal(DataFrame):
         right_on = _ensure_string_from_expression(right_on)
         left_on = left_on or on
         right_on = right_on or on
+        left_on = self._column_aliases.get(left_on, left_on)
+        right_on = self._column_aliases.get(right_on, right_on)
         for name in right:
             if left_on and (rprefix + name + rsuffix == lprefix + left_on + lsuffix):
                 continue  # it's ok when we join on the same column name
@@ -5603,7 +5745,7 @@ class DataFrameLocal(DataFrame):
 
             from vaex.column import _to_string_sequence
             def map(thread_index, i1, i2, ar):
-                if dtype == str_type:
+                if vaex.array_types.is_string_type(dtype):
                     previous_ar = ar
                     ar = _to_string_sequence(ar)
                 if np.ma.isMaskedArray(ar):
@@ -5673,16 +5815,17 @@ class DataFrameLocal(DataFrame):
         right_names = right.get_names(hidden=True)
         left_names = left.get_names(hidden=True)
         for name in right_names:
+            column_name = right._column_aliases.get(name, name)
             if name == left_on and name in left_names:
                 continue  # skip when it's the join column
             assert name not in left_names
             if name in right.variables:
                 left.set_variable(name, right.variables[name])
-            elif name in right.virtual_columns:
-                left.add_virtual_column(name, right.virtual_columns[name])
+            elif column_name in right.virtual_columns:
+                left.add_virtual_column(name, right.virtual_columns[column_name])
             else:
                 if lookup is not None:
-                    column = ColumnIndexed.index(right, right.columns[name], name, lookup, direct_indices_map, any(lookup_masked))
+                    column = ColumnIndexed.index(right, right.columns[column_name], name, lookup, direct_indices_map, any(lookup_masked))
                 else:
                     column = right.columns[name]
                 left.add_column(name, column)
@@ -5705,7 +5848,7 @@ class DataFrameLocal(DataFrame):
         :return:
         """
         if path.endswith('.arrow'):
-            self.export_arrow(path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+            self.export_arrow(path)
         elif path.endswith('.hdf5'):
             self.export_hdf5(path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
         elif path.endswith('.fits'):
@@ -5719,7 +5862,6 @@ class DataFrameLocal(DataFrame):
 
     def export_arrow(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True):
         """Exports the DataFrame to a file written with arrow
-
         :param DataFrameLocal df: DataFrame to export
         :param str path: path for file
         :param lis[str] column_names: list of column names to export or None for all columns
@@ -5733,8 +5875,32 @@ class DataFrameLocal(DataFrame):
         :param bool ascending: sort ascending (True) or descending
         :return:
         """
-        import vaex_arrow.export
-        vaex_arrow.export.export(self, path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+        import vaex.arrow.export
+        vaex.arrow.export.export(self, path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+
+    def export_arrow_stream(self, path_or_writer, progress=None, chunk_size=default_chunk_size):
+        """Exports the DataFrame as Arrow stream
+
+        :param path_or_writer path: path for file or :py:data:`pyarrow.RecordBatchStreamWriter`
+        :param progress: progress callback that gets a progress fraction as argument and should return True to continue,
+                or a default progress bar when progress=True
+        :return:
+        """
+        schema = self[0:1].to_arrow_table().schema
+        progressbar = vaex.utils.progressbars(progress)
+        def write(writer):
+            progressbar(0)
+            N = len(self)
+            for i1, i2, table in self.to_arrow_table(chunk_size=chunk_size):
+                writer.write_table(table)
+                progressbar(i2/N)
+            progressbar(1.)
+        if isinstance(path_or_writer, str):
+            with pa.OSFile(path_or_writer, 'wb') as sink:
+                writer = pa.RecordBatchStreamWriter(sink, schema)
+                write(writer)
+        else:
+            write(path_or_writer)
 
     def export_parquet(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True):
         """Exports the DataFrame to a parquet file
@@ -5752,8 +5918,8 @@ class DataFrameLocal(DataFrame):
         :param bool ascending: sort ascending (True) or descending
         :return:
         """
-        import vaex_arrow.export
-        vaex_arrow.export.export_parquet(self, path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
+        import vaex.arrow.export
+        vaex.arrow.export.export_parquet(self, path, column_names, byteorder, shuffle, selection, progress=progress, virtual=virtual, sort=sort, ascending=ascending)
 
     def export_hdf5(self, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True):
         """Exports the DataFrame to a vaex hdf5 file
@@ -5946,11 +6112,11 @@ class DataFrameConcatenated(DataFrameLocal):
         self.name = name or "-".join(df.name for df in self.dfs)
         self.path = "-".join(df.path for df in self.dfs)
         first, tail = dfs[0], dfs[1:]
-        for column_name in first.get_column_names(virtual=False, hidden=True):
-            if all([column_name in df.get_column_names(virtual=False, hidden=True) for df in tail]):
+        for column_name in first.get_column_names(virtual=False, hidden=True, alias=False):
+            if all([column_name in df.get_column_names(virtual=False, hidden=True, alias=False) for df in tail]):
                 self.column_names.append(column_name)
         self.columns = {}
-        for column_name in self.get_column_names(virtual=False, hidden=True):
+        for column_name in self.get_column_names(virtual=False, hidden=True, alias=False):
             self.columns[column_name] = ColumnConcatenatedLazy([df[column_name] for df in dfs])
             self._save_assign_expression(column_name)
 
@@ -5961,6 +6127,11 @@ class DataFrameConcatenated(DataFrameLocal):
                 self.columns[name] = ColumnConcatenatedLazy([df[name] for df in dfs])
                 self.column_names.append(name)
             self._save_assign_expression(name)
+
+        for df in tail:
+            if first._column_aliases != df._column_aliases:
+                raise ValueError(f'Concatenating dataframes where different column aliases not supported: {first._column_aliases} != {df._column_aliases}')
+        self._column_aliases = first._column_aliases.copy()
 
         for df in dfs[:1]:
             for name, value in list(df.variables.items()):

@@ -20,7 +20,7 @@ except:
     if not on_rtd:
         raise
 
-logger = logging.getLogger("vaex_arrow.export")
+logger = logging.getLogger("vaex.arrow.export")
 
 def export(dataset, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True):
     table = _export_table(dataset, column_names, byteorder, shuffle, selection, progress, virtual, sort, ascending)
@@ -86,11 +86,12 @@ def _export_table(dataset, column_names=None, byteorder="=", shuffle=False, sele
 
     arrow_arrays = []
     for column_name in column_names:
-        values = dataset.evaluate(column_name, selection=selection)
+        values = dataset[column_name].evaluate(selection=selection)
         if shuffle or sort:
             indices = order_array
             values = values[indices]
-        arrow_arrays.append(arrow_array_from_numpy_array(values))
+        values = arrow_array_from_numpy_array(values)
+        arrow_arrays.append(values)
     if shuffle:
         arrow_arrays.append(arrow_array_from_numpy_array(order_array))
         column_names = column_names + [random_index_column]

@@ -5,13 +5,12 @@ import h5py
 x = np.arange(10)
 
 
-def test_column_names(ds_local):
-    ds = ds_local
+def test_column_names(df_arrow):
+    ds = df_arrow
     columns_names = ds.get_column_names(virtual=True)
-    ds['__x'] = ds.x
+    ds['__x2'] = ds.x
     assert columns_names == ds.get_column_names(virtual=True)
-    assert '__x' in ds.get_column_names(virtual=True, hidden=True)
-    assert len(columns_names) == len(ds.get_column_names(virtual=True, hidden=True))-1
+    assert '__x2' in ds.get_column_names(virtual=True, hidden=True)
 
     ds = vaex.example()
     ds['__x'] = ds['x'] + 1
@@ -37,6 +36,11 @@ def test_add_invalid_name(tmpdir):
     df = vaex.open(path)
     assert df['X!1'].tolist() == x.tolist()
     assert (df.copy()['X!1']*2).tolist() == (x*2).tolist()
+    assert (df[['X!1']]['X!1']*2).tolist() == (x*2).tolist()
+
+    df_concat = vaex.concat([df, df])
+    assert (df_concat[['X!1']]['X!1']*2).tolist() == ((x*2).tolist() + (x*2).tolist())
+
 
 
 def test_add_invalid_virtual_columns(df_local):

@@ -353,6 +353,36 @@ class Selection(v.VuetifyTemplate):
         return vaex_components
 
 
+class SelectionToggleList(v.VuetifyTemplate):
+    df = traitlets.Any().tag(sync_ref=True)
+    title = traitlets.Unicode('Choose selections').tag(sync=True)
+    selection_names = traitlets.List(traitlets.Unicode()).tag(sync=True)
+    value = traitlets.List(traitlets.Unicode()).tag(sync=True)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.df.signal_selection_changed.connect(self._on_change_selection)
+
+    def _on_change_selection(self, df, name):
+        new_names = [name for name in self.df.selection_histories.keys() if not name.startswith('__') and df.has_selection(name)]
+        self.selection_names = new_names
+        self.value = [v for v in self.value if v in self.selection_names]
+
+    @traitlets.default('selection_names')
+    def _selection_names(self):
+        return [name for name in self.df.selection_histories.keys() if not name.startswith('__')]
+
+    @traitlets.default('template')
+    def _template(self):
+        return load_template('vue/selection_toggle_list.vue')
+
+    @traitlets.default('components')
+    def _components(self):
+        return vaex_components
+
+
+
+
 class VirtualColumnEditor(v.VuetifyTemplate):
     df = traitlets.Any()
     editor = traitlets.Any()
@@ -390,6 +420,7 @@ class VirtualColumnEditor(v.VuetifyTemplate):
 
 
 class ColumnList(v.VuetifyTemplate, vt.ColumnsMixin):
+    _metadata = traitlets.Dict(default_value=None, allow_none=True).tag(sync=True)
     column_filter = traitlets.Unicode('').tag(sync=True)
     valid_expression = traitlets.Bool(False).tag(sync=True)
     dialog_open = traitlets.Bool(False).tag(sync=True)
@@ -435,13 +466,20 @@ class ColumnList(v.VuetifyTemplate, vt.ColumnsMixin):
 class ColumnPicker(v.VuetifyTemplate, vt.ColumnsMixin):
     template = traitlets.Unicode(load_template('vue/column-select.vue')).tag(sync=True)
     label = traitlets.Unicode('Column').tag(sync=True)
-    value = traitlets.Unicode(None, allow_none=True).tag(sync=True)
+    value = vt.Expression(None, allow_none=True).tag(sync=True)
 
 
 tools_items_default = [
     {'value': 'pan-zoom', 'icon': 'pan_tool', 'tooltip': "Pan & zoom"},
     {'value': 'select-rect', 'icon': 'mdi-selection-drag', 'tooltip': "Rectangle selection"},
     {'value': 'select-x', 'icon': 'mdi-drag-vertical', 'tooltip': "X-Range selection"},
+]
+
+selection_items_default = [
+    {'value': 'replace', 'icon': 'mdi-circle-medium', 'tooltip': "Replace mode"},
+    {'value': 'and', 'icon': 'mdi-set-center', 'tooltip': "And mode"},
+    {'value': 'or', 'icon': 'mdi-set-all', 'tooltip': "Or mode"},
+    {'value': 'subtract', 'icon': 'mdi-set-left', 'tooltip': "Subtract mode"},
 ]
 
 transform_items_default = ['identity', 'log', 'log10', 'log1p', 'log1p']
@@ -464,11 +502,21 @@ class ToolsToolbar(v.VuetifyTemplate):
     transform_value = traitlets.Unicode(transform_items_default[0]).tag(sync=True)
     transform_items = traitlets.List(traitlets.Unicode(), default_value=transform_items_default).tag(sync=True)
     supports_transforms = traitlets.Bool(True).tag(sync=True)
+
     supports_normalize = traitlets.Bool(True).tag(sync=True)
+    z_normalize = traitlets.Bool(False, allow_none=True).tag(sync=True)
+    normalize = traitlets.Bool(False).tag(sync=True)
+
+    selection_mode_items = traitlets.Any(selection_items_default).tag(sync=True)
+    selection_mode = traitlets.Unicode('replace').tag(sync=True)
 
     @traitlets.default('template')
     def _template(self):
         return load_template('vue/tools-toolbar.vue')
+
+    @observe('z_normalize')
+    def _observe_normalize(self, change):
+        self.normalize = bool(self.z_normalize)
 
 class VuetifyTemplate(v.VuetifyTemplate):
     _metadata = traitlets.Dict(default_value=None, allow_none=True).tag(sync=True)
