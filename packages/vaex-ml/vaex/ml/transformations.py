@@ -5,6 +5,8 @@ from . import generate
 from .state import HasState
 import traitlets
 from vaex.utils import _ensure_strings_from_expressions
+import numpy as np
+import warnings
 
 help_features = 'List of features to transform.'
 help_prefix = 'Prefix for the names of the transformed features.'
@@ -415,10 +417,17 @@ class MinMaxScaler(Transformer):
         :param df: A vaex DataFrame.
         '''
 
-        assert len(self.feature_range) == 2, 'feature_range must have 2 elements only'
-        minmax = df.minmax(self.features)
-        self.fmin_ = minmax[:, 0].tolist()
-        self.fmax_ = minmax[:, 1].tolist()
+        minmax = []
+        for feat in self.features:
+            minmax.append(df.minmax(feat, delay=True))
+
+        @vaex.delayed
+        def assign(minmax):
+            self.fmin_ = [elem[0] for elem in minmax]
+            self.fmax_ = [elem[1] for elem in minmax]
+
+        assign(minmax)
+        df.execute()
 
     def transform(self, df):
         '''
@@ -631,6 +640,8 @@ class CycleTransformer(Transformer):
         return copy
 
 
+@register
+@generate.register
 class BayesianTargetEncoder(Transformer):
     '''Encode categorical variables with a Bayesian Target Encoder.
 
@@ -700,6 +711,9 @@ class BayesianTargetEncoder(Transformer):
                                            allow_missing=True)
         return copy
 
+
+@register
+@generate.register
 class WeightOfEvidenceEncoder(Transformer):
     '''Encode categorical variables with a Weight of Evidence Encoder.
 
@@ -776,6 +790,134 @@ class WeightOfEvidenceEncoder(Transformer):
 
         return copy
 
+
+@register
+@generate.register
+class KBinsDiscretizer(Transformer):
+    '''Bin continous features into discrete bins.
+
+    A stretegy to encode continuous features into discrete bins. The transformed
+    columns contain the bin label each sample falls into. In a way this
+    transformer Label/Ordinal encodes continous features.
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(x=[0, 2.5, 5, 7.5, 10, 12.5, 15])
+    >>> bin_trans = vaex.ml.KBinsDiscretizer(features=['x'], n_bins=3, strategy='uniform')
+    >>> bin_trans.fit_transform(df)
+      #     x    binned_x
+      0   0             0
+      1   2.5           0
+      2   5             1
+      3   7.5           1
+      4  10             2
+      5  12.5           2
+      6  15             2
+    '''
+    n_bins = traitlets.Int(allow_none=False, default_value=5, help='Number of bins. Must be greater than 1.')
+    strategy = traitlets.Enum(values=['uniform', 'quantile', 'kmeans'], default_value='uniform', help='Strategy used to define the widths of the bins.')
+    prefix = traitlets.Unicode(default_value='binned_', help=help_prefix)
+    epsilon = traitlets.Float(default_value=1e-8, allow_none=False, help='Tiny value added to the bin edges ensuring samples close to the bin edges are binned correcly.')
+    n_bins_ = traitlets.Dict(help='Number of bins per feature.').tag(output=True)
+    bin_edges_ = traitlets.Dict(help='The bin edges for each binned feature').tag(output=True)
+
+    def fit(self, df):
+        '''
+        Fit KBinsDiscretizer to the DataFrame.
+
+        :param df: A vaex DataFrame.
+        '''
+
+        # We need at least two bins to do the transformations
+        assert self.n_bins > 1, ' Kwarg `n_bins` must be greated than 1.'
+
+        # Find the extent of the features
+        minmax = []
+        minmax_promise = []
+        for feat in self.features:
+            minmax_promise.append(df.minmax(feat, delay=True))
+
+        @vaex.delayed
+        def assign(minmax_promise):
+            for elem in minmax_promise:
+                minmax.append(elem)
+
+        assign(minmax_promise)
+        df.execute()
+
+        # warning: everyting is cast to float, which is unavoidable due to the addition of self.epsilon
+        minmax = np.array(minmax)
+        minmax[:, 1] = minmax[:, 1] + self.epsilon
+
+        # # Determine the bin edges and number of bins depending on the strategy per feature
+        if self.strategy == 'uniform':
+            bin_edges = {feat: np.linspace(minmax[i, 0], minmax[i, 1], self.n_bins+1) for i, feat in enumerate(self.features)}
+
+        elif self.strategy == 'quantile':
+            percentiles = np.linspace(0, 100, self.n_bins + 1)
+            bin_edges = df.percentile_approx(self.features, percentage=percentiles)
+            bin_edges = {feat: edges for feat, edges in zip(self.features, bin_edges)}
+
+        else:
+            from .cluster import KMeans
+
+            bin_edges = {}
+            for i, feat in enumerate(self.features):
+
+                # Deterministic initialization with uniform spacing
+                uniform_edges = np.linspace(minmax[i, 0], minmax[i, 1], self.n_bins+1)
+                centers_init = ((uniform_edges[1:] + uniform_edges[:-1]) * 0.5).tolist()
+                centers_init = [[elem] for elem in centers_init]
+
+                # KMeans strategy
+                km = KMeans(n_clusters=self.n_bins, init=centers_init, n_init=1, features=[feat])
+                km.fit(df)
+                # Get and sort the centres of the kmeans clusters
+                centers = np.sort(np.array(km.cluster_centers).flatten())
+                # Put the bin edges half way between each center (ignoring the outermost edges)
+                be = (centers[1:] + centers[:-1]) * 0.5
+                # The outermost edges are defined by the min/max of each feature
+                # Quickly build a numpy array by concat individual values (min/max) and arrays (be)
+                bin_edges[feat] = np.r_[minmax[i, 0], be, minmax[i, 1]]
+
+        # Remove bins whose width are too small (i.e., <= 1e-8)
+        n_bins = {}  # number of bins per features that are actually used
+        for feat in self.features:
+            mask = np.diff(bin_edges[feat], append=np.inf) > 1e-8
+            be = bin_edges[feat][mask]
+            if len(be) - 1 != self.n_bins:
+                warnings.warn(f'Bins whose width are too small (i.e., <= 1e-8) in   {feat} are removed.'
+                              f'Consider decreasing the number of bins.')
+                bin_edges[feat] = be
+            n_bins[feat] = len(be) - 1
+
+        self.bin_edges_ = bin_edges
+        self.n_bins_ = n_bins
+
+    def transform(self, df):
+        '''
+        Transform a DataFrame with a fitted KBinsDiscretizer.
+
+        :param df: A vaex DataFrame.
+
+        :returns copy: a shallow copy of the DataFrame that includes the binned features.
+        :rtype: DataFrame
+        '''
+
+        df = df.copy()
+
+        for feat in self.features:
+            name = self.prefix + feat
+            # Samples outside the bin range are added to the closest bin
+            df[name] = (df[feat].digitize(self.bin_edges_[feat]) - 1).clip(0, self.n_bins_[feat] - 1)
+
+        return df
+
+
+@register
+@generate.register
 class GroupByTransformer(Transformer):
     '''The GroupByTransformer creates aggregations via the groupby operation, which are
     joined to a DataFrame. This is useful for creating aggregate features.
