@@ -7,7 +7,7 @@ def test_dtype_basics(df):
         if df.is_string(name):
             assert df[name].to_numpy().dtype.kind in 'OSU'
         else:
-            assert df[name].values.dtype == df.data_type(df[name])
+            assert vaex.array_types.same_type(vaex.array_types.data_type(df[name].values), df.data_type(df[name]))
 
 
 def test_dtypes(df_local):
@@ -42,10 +42,8 @@ def test_dtype_str():
     df = vaex.from_arrays(n=n)
     assert df.n.dtype == pa.string()
     assert df.copy().n.dtype == pa.string()
-    assert 'n' in df._dtypes_override
 
     n = np.array([None, 'aap', 'noot'])
     df = vaex.from_arrays(n=n)
     assert df.n.dtype == pa.string()
     assert df.copy().n.dtype == pa.string()
-    assert 'n' in df._dtypes_override

@@ -10,9 +10,26 @@ supported_array_types = (np.ndarray, ) + supported_arrow_array_types
 string_types = [pa.string(), pa.large_string()]
 
 
+def filter(ar, boolean_mask):
+    if isinstance(ar, supported_arrow_array_types):
+        return ar.filter(pa.array(boolean_mask))
+    else:
+        return ar[boolean_mask]
+
 
 def is_string_type(data_type):
     return not isinstance(data_type, np.dtype) and data_type in string_types
+
+
+def is_string(ar):
+    return isinstance(ar, supported_arrow_array_types) and is_string_type(ar.type)
+
+
+def filter(ar, boolean_mask):
+    if isinstance(ar, supported_arrow_array_types):
+        return ar.filter(pa.array(boolean_mask))
+    else:
+        return ar[boolean_mask]
 
 
 def same_type(type1, type2):
@@ -21,6 +38,20 @@ def same_type(type1, type2):
     except TypeError:
         # numpy dtypes don't like to be compared
         return False
+
+
+def tolist(ar):
+    if isinstance(ar, supported_arrow_array_types):
+        return ar.to_pylist()
+    else:
+        return ar.tolist()
+
+
+def data_type(ar):
+    if isinstance(ar, supported_arrow_array_types):
+        return ar.type
+    else:
+        return ar.dtype
 
 
 def to_numpy(x, strict=False):

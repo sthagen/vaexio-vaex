@@ -160,7 +160,7 @@ class LabelEncoder(Transformer):
         '''
 
         for feature in self.features:
-            labels = df[feature].unique().tolist()
+            labels = vaex.array_types.tolist(df[feature].unique())
             self.labels_[feature] = dict(zip(labels, np.arange(len(labels))))
 
     def transform(self, df):
@@ -227,9 +227,15 @@ class OneHotEncoder(Transformer):
         uniques = []
         for i in self.features:
             expression = _ensure_strings_from_expressions(i)
-            unique = df.unique(expression)
-            unique = np.sort(unique)  # this can/should be optimized with @delay
-            uniques.append(unique.tolist())
+            unique_values = vaex.array_types.tolist(df.unique(expression))
+
+            if None in unique_values:
+                unique_values.remove(None)
+                unique_values.sort()
+                unique_values.insert(0, None)  # This is done in place
+            else:
+                unique_values.sort()
+            uniques.append(unique_values)
         self.uniques_ = uniques
 
     def transform(self, df):
@@ -243,9 +249,14 @@ class OneHotEncoder(Transformer):
         # for each feature, add a virtual column for each unique entry
         for i, feature in enumerate(self.features):
             for j, value in enumerate(self.uniques_[i]):
-                column_name = self.prefix + feature + '_' + str(value)
-                copy.add_virtual_column(column_name, 'where({feature} == {value}, {one}, {zero})'.format(
-                                        feature=feature, value=repr(value), one=self.one, zero=self.zero))
+                str_value = str(value) if value is not None else 'missing'
+                column_name = self.prefix + feature + '_' + str_value
+                if value is None:
+                    copy[column_name] = copy.func.where(copy[feature].ismissing(), self.one, self.zero)
+                elif isinstance(value, np.float) and np.isnan(value):
+                    copy[column_name] = copy.func.where(copy[feature].isnan(), self.one, self.zero)
+                else:
+                    copy[column_name] = copy.func.where(copy[feature] == value, self.one, self.zero)
         return copy
 
 
@@ -404,6 +415,7 @@ class MinMaxScaler(Transformer):
      3    2    0           0                  0.166667
      4   15   10           1                  1
     '''
+    snake_name = 'minmax_scaler'
     # title = Unicode(default_value='MinMax Scaler', read_only=True).tag(ui='HTML')
     feature_range = traitlets.Tuple(default_value=(0, 1), help='The range the features are scaled to.').tag().tag(ui='FloatRangeSlider')
     prefix = traitlets.Unicode(default_value="minmax_scaled_", help=help_prefix).tag(ui='Text')
@@ -816,6 +828,7 @@ class KBinsDiscretizer(Transformer):
       5  12.5           2
       6  15             2
     '''
+    snake_name = 'kbins_discretizer'
     n_bins = traitlets.Int(allow_none=False, default_value=5, help='Number of bins. Must be greater than 1.')
     strategy = traitlets.Enum(values=['uniform', 'quantile', 'kmeans'], default_value='uniform', help='Strategy used to define the widths of the bins.')
     prefix = traitlets.Unicode(default_value='binned_', help=help_prefix)
@@ -944,6 +957,7 @@ class GroupByTransformer(Transformer):
       3  mouse    5  --       --
     '''
 
+    snake_name = 'groupby_transformer'
     by = traitlets.Unicode(allow_none=False, help='The feature on which to do the grouping.')
     agg = traitlets.Dict(help='Dict where the keys are feature names and the values are vaex.agg objects.')
     rprefix = traitlets.Unicode(default_value='', help='Prefix for the names of the aggregate features in case of a collision.')

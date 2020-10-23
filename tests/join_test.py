@@ -41,14 +41,14 @@ df_e = vaex.from_arrays(a=np.array(['X', 'Y', 'Z']),
 def test_no_on():
     # just adds the columns
     df = df_a.join(df_b, rsuffix='_r')
-    assert df.columns['b'] is df_b.columns['b']
+    assert df.dataset.right._columns['b'] is df_b.dataset._columns['b']
 
 
 def test_join_masked():
     df = df_a.join(other=df_b, left_on='m', right_on='m', rsuffix='_r')
     assert df.evaluate('m').tolist() == [1, None, 3]
     assert df.evaluate('m_r').tolist() == [1, None, None]
-    assert df.columns['m_r'].indices.dtype == np.int8
+    assert df.dataset.right._columns['m_r'].indices.dtype == np.int8
 
 
 def test_join_nomatch():
@@ -97,7 +97,7 @@ def test_left_a_b_filtered():
 
     # actually, even though the filter is applied, all rows will be matched
     # since the filter can change
-    df.set_selection(None, vaex.dataset.FILTER_SELECTION_NAME)
+    df.set_selection(None, vaex.dataframe.FILTER_SELECTION_NAME)
     assert df['a'].tolist() == ['A', 'B', 'C']
     assert df['b'].tolist() == ['A', 'B', None]
     assert df['x'].tolist() == [0, 1, 2]
@@ -108,7 +108,7 @@ def test_left_a_b_filtered():
     # if we extract, that shouldn't be the case
     df_af = df_a[df_a.x > 0].extract()
     df = df_af.join(other=df_b, left_on='a', right_on='b', rsuffix='_r')
-    df.set_selection(None, vaex.dataset.FILTER_SELECTION_NAME)
+    df.set_selection(None, vaex.dataframe.FILTER_SELECTION_NAME)
     assert df['a'].tolist() == ['B', 'C']
     assert df['b'].tolist() == ['B', None]
     assert df['x'].tolist() == [1, 2]
@@ -301,7 +301,7 @@ def test_with_masked_no_short_circuit():
     df_right = vaex.from_arrays(i=np.arange(9), j=np.arange(9))
     with small_buffer(df, size=1):
         dfj = df.join(other=df_right, on='i')
-    assert dfj.columns['j'].masked
-    assert dfj[:10].columns['j'].masked
+    assert dfj.dataset.right._columns['j'].masked
+    assert dfj[:10].dataset.right._columns['j'].masked
     assert dfj['j'][:10].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, None]
     dfj['j'].tolist()  # make sure we can evaluate the whole column

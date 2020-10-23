@@ -1,19 +1,68 @@
-# vaex 3.1.0 (unreleased)
-
-## vaex-core 2.1.0-dev (unreleased)
-   * Fixes
-      * Repeated dropna/dropnan/dropmissing could report cached length [#874](https://github.com/vaexio/vaex/pull/874)
-   * Features
-      * Arrow is now a core dependency, vaex-arrow is deprecated. Much better chunked array support, numpy conversion is done lazily. [#517](https://github.com/vaexio/vaex/pull/517)
+# vaex 4.0.0 (unreleased)
+   * Breaking changes:
+      * Arrow is now a core dependency, vaex-arrow is deprecated. All methods that return string, will return Arrow arrays [#517](https://github.com/vaexio/vaex/pull/517)
+      * Opening an .arrow file will expose the arrays as Apache Arrow arrays, not numpy arrays. [#984](https://github.com/vaexio/vaex/pull/984)
+      * Columns (e.g. df.column['x']) may now return a ColumnProxy, instead of the original data, slice it [:] to get the underlying data (or call .to_numpy()/to_arrow() or try converting it with np.array(..) or pa.array(..)). [#993](https://github.com/vaexio/vaex/pull/993)
 
 ## vaex-arrow (DEPRECATED)
    This is now part of vaex-core.
+
+## vaex-astro 0.8.0 (unreleased)
+  * Requirement changed to vaex-core >=4,<5
+
+## vaex-core 4.0.0 (unreleased)
+   * Fixes
+      * Repeated dropna/dropnan/dropmissing could report cached length. [#874](https://github.com/vaexio/vaex/pull/874)
+      * Trimming concatenated columns. [#860](https://github.com/vaexio/vaex/pull/860)
+      * percentile_approx works for 0 and 100 percentile. [#818](https://github.com/vaexio/vaex/pull/818)
+      * Expression containing kwarg=True were treated as invalid. [#861](hhttps://github.com/vaexio/vaex/pull/861)
+      * Unicode column names fully supported [#974](https://github.com/vaexio/vaex/issues/974)
+   * Features
+      * Datetime floor method [#843](https://github.com/vaexio/vaex/pull/843)
+      * dropinf (similar to dropna) [#821](https://github.com/vaexio/vaex/pull/821)
+      * Support for streaming from Google Cloud Storage. [#898](https://github.com/vaexio/vaex/pull/898)
+      * IPython autocomplete support (e.g. `df['hom' (tab)`) [#961](https://github.com/vaexio/vaex/pull/961)
+      * Out of core Parquet support using Arrow Dataset scanning [#993](https://github.com/vaexio/vaex/pull/993)
+   * Refactor
+      * Use `arrow.compute` for several string functions/kernels. [#885](https://github.com/vaexio/vaex/pull/885)
+      * Separate DataFrame and Dataset. [#865](https://github.com/vaexio/vaex/pull/865)
+   * Performance
+      * concat (vaex.concat or df.concat) is about 100x faster. [#994](https://github.com/vaexio/vaex/pull/994)
+
+## vaex-distributed (DEPRECATED)
+   This is now part of vaex-enterprise (was a proof of content, never functional).
+
+## vaex-graphql 0.2.0 (unreleased)
+  * Requirement changed to vaex-core >=4,<5
+
+## vaex-hdf5 0.7.0 (unreleased)
+   * Requirement changed vaex-core >=4,<5
+
+## vaex-jupyter 0.6.0 (unreleased)
+  * Requirement changed to vaex-core >=4,<5
+
+## vaex-ml 0.11.0 (unreleased)
+   * Features
+      * Batch training for CatBoost. [#819](https://github.com/vaexio/vaex/pull/819)
+      * Support for `predict_proba` and `predict_log_proba` for sklearn classifiers. [#927](https://github.com/vaexio/vaex/pull/927)
+
+## vaex-server 0.4.0 (unreleased)
+  * Requirement changed to vaex-core >=4,<5
+
+## vaex-viz 0.5.0 (unreleased)
+  * Requirement changed to vaex-core >=4,<5
+
+# vaex 3.1.0 (unreleased)
 
 ## vaex-jupyter 0.5.2 (2020-6-12)
    * Features
       * Normalize histogram and change selection mode. [#826](https://github.com/vaexio/vaex/pull/826)
 
-## vaex-core 2.0.3 (unreleased)
+## vaex-ml 0.11.0-dev0 (unreleased)
+    * Features
+      * Autogenerate the fast (or functional) API [#512](https://github.com/vaexio/vaex/pull/512)
+
+## vaex-core 2.0.3 (2020-6-10)
    * Performance
       * isin uses hashmaps, leading to a 2x-4x performance increase for primitives, 200x for strings in some cases [#822](https://github.com/vaexio/vaex/pull/822)
 

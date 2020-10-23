@@ -233,6 +233,10 @@ class Expression(with_metaclass(Meta)):
         return self._ast_names
 
     @property
+    def _ast_slices(self):
+        return expresso.slices(self.ast)
+
+    @property
     def expression(self):
         if self._expression is None:
             self._expression = expresso.node_to_string(self.ast)
@@ -391,12 +395,25 @@ class Expression(with_metaclass(Meta)):
                 if (include_virtual and (varname != self.expression)) or (varname == self.expression and ourself):
                     variables.add(varname)
                 if expand_virtual:
-                    expresso.translate(self.ds.virtual_columns[varname], record)
+                    variables.update(self.df[self.df.virtual_columns[varname]].variables(ourself=include_virtual, include_virtual=include_virtual))
             # we usually don't want to record ourself
             elif varname != self.expression or ourself:
                 variables.add(varname)
 
         expresso.translate(self.ast, record)
+        # df is a buildin, don't record it, if df is a column name, it will be collected as
+        # df['df']
+        variables -= {'df'}
+        for varname in self._ast_slices:
+            if varname in self.df.virtual_columns and varname not in variables:
+                if (include_virtual and (f"df['{varname}']" != self.expression)) or (f"df['{varname}']" == self.expression and ourself):
+                    variables.add(varname)
+                if expand_virtual:
+                    if varname in self.df.virtual_columns:
+                        variables |= self.df[self.df.virtual_columns[varname]].variables(ourself=include_virtual, include_virtual=include_virtual)
+            elif f"df['{varname}']" != self.expression or ourself:
+                variables.add(varname)
+
         return variables
 
     def _graph(self):
@@ -595,7 +612,7 @@ class Expression(with_metaclass(Meta)):
         :returns: Pandas series containing the counts
         """
         from pandas import Series
-        dtype = self.dtype
+        data_type = self.data_type()
 
         transient = self.transient or self.ds.filtered or self.ds.is_masked(self.expression)
         if self.is_string() and not transient:
@@ -604,12 +621,12 @@ class Expression(with_metaclass(Meta)):
             if not isinstance(ar, ColumnString):
                 transient = True
 
-        counter_type = counter_type_from_dtype(self.dtype, transient)
+        counter_type = counter_type_from_dtype(data_type, transient)
         counters = [None] * self.ds.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
             if counters[thread_index] is None:
                 counters[thread_index] = counter_type()
-            if vaex.array_types.is_string_type(dtype):
+            if vaex.array_types.is_string_type(data_type):
                 previous_ar = ar
                 ar = _to_string_sequence(ar)
                 if not transient:
@@ -699,8 +716,8 @@ class Expression(with_metaclass(Meta)):
         """Returns the number of missing values in the expression."""
         return self.ismissing().astype('int').sum().item()  # so the output is int, not array
 
-    def evaluate(self, i1=None, i2=None, out=None, selection=None, parallel=True):
-        return self.ds.evaluate(self, i1, i2, out=out, selection=selection, parallel=parallel)
+    def evaluate(self, i1=None, i2=None, out=None, selection=None, parallel=True, array_type=None):
+        return self.ds.evaluate(self, i1, i2, out=out, selection=selection, array_type=array_type, parallel=parallel)
 
     # TODO: it is not so elegant we need to have a custom version of this
     # it now also misses the docstring, reconsider how the the meta class auto
@@ -770,7 +787,11 @@ def f({0}):
             for node in expression.ast_names[old]:
                 node.id = new
             expression._ast_names[new] = expression._ast_names.pop(old)
-            expression._expression = None  # resets the cached string representation
+        slices = expression._ast_slices
+        if old in slices:
+            for node in slices[old]:
+                node.slice.value.s = new
+        expression._expression = None  # resets the cached string representation
         return expression
 
     def astype(self, data_type):
@@ -1074,7 +1095,7 @@ class FunctionSerializableJit(FunctionSerializable):
         # TODO: can we do the above using the Expressio API?s
 
         arguments = list(set(names))
-        argument_dtypes = [df.data_type(argument) for argument in arguments]
+        argument_dtypes = [df.data_type(argument, array_type='numpy') for argument in arguments]
         return_dtype = df[expression].dtype
         return cls(str(expression), arguments, argument_dtypes, return_dtype, verbose, compile=compile)
 
@@ -1125,6 +1146,7 @@ def f({0}):
         exec(code, scope)
         func = scope['f']
         def wrapper(*args):
+            args = [vaex.array_types.to_numpy(k) for k in args]
             args = [vaex.utils.to_native_array(arg) if isinstance(arg, np.ndarray) else arg for arg in args]
             args = [cupy.asarray(arg) if isinstance(arg, np.ndarray) else arg for arg in args]
             return cupy.asnumpy(func(*args))

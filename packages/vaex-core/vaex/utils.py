@@ -16,6 +16,7 @@ import numbers
 import keyword
 
 import numpy as np
+import pyarrow as pa
 import progressbar
 import psutil
 import six
@@ -202,8 +203,7 @@ def get_private_dir(subdir=None, *extra):
     path = os.path.expanduser('~/.vaex')
     if subdir:
         path = os.path.join(path, subdir, *extra)
-    if not os.path.exists(path):
-        os.makedirs(path)
+    os.makedirs(path,exist_ok=True)
     return path
 
 
@@ -535,24 +535,21 @@ def unlistify(waslist, *args):
             return values[0]
 
 
+def valid_expression(names, name):
+    if name in names and not valid_identifier(name):
+        return f'df[%r]' % name
+    else:
+        return name
+
+
+def valid_identifier(name):
+    return name.isidentifier() and not keyword.iskeyword(name)
+
+
 def find_valid_name(name, used=[]):
+    if isinstance(name, int):
+        name = str(name)
     first, rest = name[0], name[1:]
-    if not first.isidentifier():
-        if ('col_' + first).isidentifier():
-            first = 'col_' + first
-        else:
-            first = 'col_'
-    name = first
-    for char in rest:
-        # we test if it is an identifier with _ prefixed, since not every first character
-        # and following character are treated the same
-        # https://docs.python.org/3/reference/lexical_analysis.html#identifiers
-        if not ('_' + char).isidentifier():
-            name += '_'
-        else:
-            name += char
-    if keyword.iskeyword(name):
-        name += '_'
     if name in used:
         nr = 1
         while name + ("_%d" % nr) in used:
@@ -731,7 +728,7 @@ def _issequence(x):
 
 
 def _isnumber(x):
-    return isinstance(x, numbers.Number)
+    return isinstance(x, (numbers.Number, pa.Scalar))
 
 
 def _is_limit(x):
@@ -865,6 +862,8 @@ def find_type_from_dtype(namespace, prefix, dtype, transient=True):
         else:
             postfix = 'string' # view not support atm
     else:
+        import vaex
+        dtype = vaex.array_types.to_numpy_type(dtype)
         postfix = str(dtype)
         if postfix == '>f8':
             postfix = 'float64'
@@ -883,7 +882,7 @@ def find_type_from_dtype(namespace, prefix, dtype, transient=True):
 
 
 def to_native_dtype(dtype):
-    if dtype.byteorder not in "<=|":
+    if isinstance(dtype, np.dtype) and dtype.byteorder not in "<=|":
         return dtype.newbyteorder()
     else:
         return dtype
@@ -909,14 +908,18 @@ def unmask_selection_mask(selection_mask):
 
 
 def upcast(dtype):
-    if dtype.kind == "b":
-        return np.dtype('int64')
-    if dtype.kind == "i":
-        return np.dtype('int64')
-    if dtype.kind == "u":
-        return np.dtype('uint64')
-    if dtype.kind == "f":
-        return np.dtype('float64')
+    if isinstance(dtype, np.dtype):
+        if dtype.kind == "b":
+            return np.dtype('int64')
+        if dtype.kind == "i":
+            return np.dtype('int64')
+        if dtype.kind == "u":
+            return np.dtype('uint64')
+        if dtype.kind == "f":
+            return np.dtype('float64')
+    else:
+        # TODO: arrow
+        pass
     return dtype
 
 

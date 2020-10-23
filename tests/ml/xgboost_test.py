@@ -61,7 +61,7 @@ def test_xgboost_numerical_validation():
     features = ['sepal_width', 'petal_length', 'sepal_length', 'petal_width']
 
     # Vanilla xgboost
-    dtrain = xgb.DMatrix(ds[features], label=ds.data.class_)
+    dtrain = xgb.DMatrix(ds[features].values, label=ds.class_.values)
     xgb_bst = xgb.train(params=params_multiclass, dtrain=dtrain, num_boost_round=3)
     xgb_pred = xgb_bst.predict(dtrain)
 
@@ -80,12 +80,12 @@ def test_xgboost_serialize(tmpdir):
     features = ['sepal_length', 'sepal_width', 'petal_length', 'petal_width']
     target = 'class_'
 
-    gbm = ds.ml.xgboost_model(target=target, features=features, num_boost_round=20, params=params_multiclass)
+    gbm = ds.ml.xgboost_model(target=target, features=features, num_boost_round=20, params=params_multiclass, transform=False)
     pl = vaex.ml.Pipeline([gbm])
     pl.save(str(tmpdir.join('test.json')))
     pl.load(str(tmpdir.join('test.json')))
 
-    gbm = ds.ml.xgboost_model(target=target, features=features, num_boost_round=20, params=params_multiclass)
+    gbm = ds.ml.xgboost_model(target=target, features=features, num_boost_round=20, params=params_multiclass, transform=False)
     gbm.state_set(gbm.state_get())
     pl = vaex.ml.Pipeline([gbm])
     pl.save(str(tmpdir.join('test.json')))
@@ -121,14 +121,14 @@ def test_xgboost_pipeline():
     train['r'] = np.sqrt(train.x**2 + train.y**2 + train.z**2)
     # Do a pca
     features = ['vx', 'vy', 'vz', 'Lz', 'L']
-    pca = train.ml.pca(n_components=3, features=features)
+    pca = train.ml.pca(n_components=3, features=features, transform=False)
     train = pca.transform(train)
     # Do state transfer
     st = train.ml.state_transfer()
     # now the xgboost model thingy
     features = ['r', 'PCA_0', 'PCA_1', 'PCA_2']
     # define the boosting model
-    booster = train.ml.xgboost_model(target='E', num_boost_round=10, features=features, params=params_reg)
+    booster = train.ml.xgboost_model(target='E', num_boost_round=10, features=features, params=params_reg, transform=False)
     # Create a pipeline
     pp = vaex.ml.Pipeline([st, booster])
     # Use the pipeline

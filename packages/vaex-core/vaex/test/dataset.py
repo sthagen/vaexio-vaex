@@ -69,15 +69,15 @@ class CallbackCounter(object):
 
 class TestDataset(unittest.TestCase):
 	def setUp(self):
-		self.dataset = dataset.DatasetArrays("dataset")
-
+		
+		columns = {}
 
 		# x is non-c
 		# same as np.arange(10, dtype=">f8")., but with strides == 16, instead of 8
 		use_filtering = True
 		if use_filtering:
 			self.zero_index = 2
-			self.x = x = np.arange(-2, 40, dtype=">f8").reshape((-1,21)).T.copy()[:,0]
+			self.x = self.x_all = x = np.arange(-2, 40, dtype=">f8").reshape((-1,21)).T.copy()[:,0]
 			self.y = y = x ** 2
 			self.ints = np.arange(-2,19, dtype="i8")
 			self.ints[1] = 2**62+1
@@ -86,8 +86,8 @@ class TestDataset(unittest.TestCase):
 			self.ints[1+10] = 2**62+1
 			self.ints[2+10] = -2**62+1
 			self.ints[3+10] = -2**62-1
-			self.dataset.add_column("x", x)
-			self.dataset.add_column("y", y)
+			columns["x"] = x
+			columns["y"] = y
 			mo = m = np.arange(-2, 40, dtype=">f8").reshape((-1,21)).T.copy()[:,0]
 			ma_value = 77777
 			m[-1+10+2] = ma_value
@@ -99,31 +99,33 @@ class TestDataset(unittest.TestCase):
 			self.ints[0] = 2**62+1
 			self.ints[1] = -2**62+1
 			self.ints[2] = -2**62-1
-			self.dataset.add_column("x", x)
-			self.dataset.add_column("y", y)
+			columns["x"] = x
+			columns["y"] = y
 			m = x.copy()
 			ma_value = 77777
 			m[-1] = ma_value
 		self.m = m = np.ma.array(m, mask=m==ma_value)
 		self.mi = mi = np.ma.array(m.data.astype(np.int64), mask=m.data==ma_value, fill_value=88888)
-		self.dataset.add_column("m", m)
-		self.dataset.add_column("mi", mi)
-		self.dataset.add_column("ints", self.ints)
+		columns["m"] = m
+		columns["mi"] = mi
+		columns["ints"] = self.ints
+
+		columns["f"] = np.arange(len(self.x), dtype=np.float64)
+
+		name = np.array(list(map(lambda x: str(x) + "bla" + ('_' * int(x)), self.x)), dtype='U') #, dtype=np.string_)
+		columns["name"] = np.array(name)
+		columns["name_arrow"] = vaex.string_column(name)
+
+		self.dataset = vaex.from_dict(columns)
 		self.dataset.set_variable("t", 1.)
 		self.dataset.add_virtual_column("z", "x+t*y")
 		self.dataset.units["x"] = astropy.units.Unit("km")
 		self.dataset.units["y"] = astropy.units.Unit("km/s")
 		self.dataset.units["t"] = astropy.units.Unit("s")
-		self.dataset.add_column("f", np.arange(len(self.dataset), dtype=np.float64))
 		self.dataset.ucds["x"] = "some;ucd"
-
-
-		name = np.array(list(map(lambda x: str(x) + "bla" + ('_' * int(x)), self.x)), dtype='U') #, dtype=np.string_)
 		self.names = self.dataset.get_column_names()
-		self.dataset.add_column("name", np.array(name))
-		self.dataset.add_column("name_arrow", vaex.string_column(name))
 		if use_filtering:
-			self.dataset.select('(x >= 0) & (x < 10)', name=vaex.dataset.FILTER_SELECTION_NAME)
+			self.dataset.select('(x >= 0) & (x < 10)', name=vaex.dataframe.FILTER_SELECTION_NAME)
 			self.x = x = self.x[2:12]
 			self.y = y = self.y[2:12]
 			self.m = m = self.m[2:12]
@@ -143,7 +145,7 @@ class TestDataset(unittest.TestCase):
 
 		x = np.array([0., 1])
 		y = np.array([-1., 1])
-		self.datasetxy = vx.dataset.DatasetArrays("datasetxy")
+		self.datasetxy = vx.dataframe.DataFrameLocal()
 		self.datasetxy.add_column("x", x)
 		self.datasetxy.add_column("y", y)
 
@@ -152,16 +154,16 @@ class TestDataset(unittest.TestCase):
 		x3 = np.array([5.])
 		self.x_concat = np.concatenate((x1, x2, x3))
 
-		dataset1 = vx.dataset.DatasetArrays("dataset1")
-		dataset2 = vx.dataset.DatasetArrays("dataset2")
-		dataset3 = vx.dataset.DatasetArrays("dataset3")
+		dataset1 = vx.dataframe.DataFrameLocal()
+		dataset2 = vx.dataframe.DataFrameLocal()
+		dataset3 = vx.dataframe.DataFrameLocal()
 		dataset1.add_column("x", x1)
 		dataset2.add_column("x", x2)
 		dataset3.add_column("x", x3)
-		dataset3.add_column("y", x3**2)
-		self.dataset_concat = vx.dataset.DatasetConcatenated([dataset1, dataset2, dataset3], name="dataset_concat")
+		# dataset3.add_column("y", x3**2)
+		self.dataset_concat = vaex.concat([dataset1, dataset2, dataset3])
 
-		self.dataset_concat_dup = vx.dataset.DatasetConcatenated([self.dataset_no_filter, self.dataset_no_filter, self.dataset_no_filter], name="dataset_concat_dup")
+		self.dataset_concat_dup = vaex.concat([self.dataset_no_filter, self.dataset_no_filter, self.dataset_no_filter])
 		self.dataset_local = self.dataset
 		self.datasetxy_local = self.datasetxy
 		self.dataset_concat_local = self.dataset_concat
@@ -207,7 +209,7 @@ class TestDataset(unittest.TestCase):
 			ds._invalidate_selection_cache()
 		with small_buffer(ds):
 			ds1 = ds.copy()
-			ds1.select(ds1.x > 4, name=vaex.dataset.FILTER_SELECTION_NAME, mode='and')
+			ds1.select(ds1.x > 4, name=vaex.dataframe.FILTER_SELECTION_NAME, mode='and')
 			ds1._invalidate_caches()
 
 			ds2 = ds[ds.x > 4]
@@ -253,7 +255,7 @@ class TestDataset(unittest.TestCase):
 		self.assertIsNotNone(ds.unit("x"))
 		self.assertIsNotNone(ds.unit("vx"))
 		self.assertIsNotNone(ds.unit("mass"))
-		ds.close_files()
+		ds.close()
 
 	def test_masked_array_output(self):
 		fn = tempfile.mktemp(".hdf5")
@@ -425,9 +427,7 @@ class TestDataset(unittest.TestCase):
 					#np.testing.assert_array_equal(ds.data.names, self.dataset.data.name)
 
 	def tearDown(self):
-		self.dataset.remove_virtual_meta()
-		self.dataset_concat.remove_virtual_meta()
-		self.dataset_concat_dup.remove_virtual_meta()
+		pass
 
 	def test_mixed_endian(self):
 
@@ -502,10 +502,11 @@ class TestDataset(unittest.TestCase):
 		distance_std = ds_1.evaluate("distance_uncertainty")[0]
 		self.assertAlmostEqual(distance_std, distance_std_est,2)
 
-	def test_virtual_column_storage(self):
-		self.dataset.write_meta()
-		ds = vaex.zeldovich()
-		ds.write_meta()
+	# deprecated
+	# def test_virtual_column_storage(self):
+	# 	self.dataset.write_meta()
+	# 	ds = vaex.zeldovich()
+	# 	ds.write_meta()
 
 	def test_add_virtual_columns_cartesian_velocities_to_polar(self):
 		if 1:
@@ -694,7 +695,7 @@ class TestDataset(unittest.TestCase):
 	def test_state(self):
 		mul = Multiply(3)
 		ds = self.dataset
-		copy = ds.copy(virtual=False)
+		copy = ds.copy(ds.get_column_names(virtual=False))
 		statefile = tempfile.mktemp('.json')
 		ds.select('x > 5', name='test')
 		ds.add_virtual_column('xx', 'x**2')
@@ -767,10 +768,11 @@ class TestDataset(unittest.TestCase):
 		self.assertEqual(self.dataset.data_type("x*f"), np.float64)
 
 	def test_byte_size(self):
-		arrow_size = self.dataset.columns['name_arrow'].nbytes
-		self.assertEqual(self.dataset.byte_size(), (8*6 + 2 + self.dataset.columns['name'].dtype.itemsize)*len(self.dataset) + arrow_size)
+		arrow_size = self.dataset.columns['name_arrow'].nbytes +\
+		             self.dataset.columns['name'].nbytes
+		self.assertEqual(self.dataset.byte_size(), (8*6 + 2)*len(self.dataset) + arrow_size)
 		self.dataset.select("x < 1")
-		self.assertEqual(self.dataset.byte_size(selection=True), 8*6 + 2 + self.dataset.columns['name'].dtype.itemsize + arrow_size)
+		self.assertEqual(self.dataset.byte_size(selection=True), 8*6 + 2 + arrow_size)
 
 	def test_ucd_find(self):
 		self.dataset.ucds["x"] = "a;b;c"
@@ -872,8 +874,10 @@ class TestDataset(unittest.TestCase):
 		np.testing.assert_array_almost_equal(df['m'].count(), 4)
 
 		# convert to float
-		self.dataset_local.columns["x"] = self.dataset_local.columns["x"] * 1.
-		self.dataset_local.columns["x"][self.zero_index] = np.nan
+		x = self.x_all * 1. # keep a local version, this is actually using mutation of that
+		# which is not really supported (caching and hashing will get confused)
+		self.dataset_local.columns["x"] = x #x[self.zero_index:self.zero_index + 10]
+		x[self.zero_index] = np.nan
 		if self.dataset.is_local():
 			self.dataset._invalidate_caches()
 		else:
@@ -1155,10 +1159,10 @@ class TestDataset(unittest.TestCase):
 		def concat(*types):
 			arrays = [np.arange(3, dtype=dtype) for dtype in types]
 			N = len(arrays)
-			dfs = [vx.dataset.DatasetArrays("dataset-%i" % i)  for i in range(N)]
+			dfs = [vx.dataframe.DataFrameLocal()  for i in range(N)]
 			for dataset, array in zip(dfs, arrays):
 				dataset.add_column("x", array)
-			dataset_concat = vx.dataset.DatasetConcatenated(dfs, name="dataset_concat")
+			dataset_concat = vaex.concat(dfs)
 			return dataset_concat
 
 		self.assertEqual(concat(np.float32, np.float64).columns["x"].dtype, np.float64)
@@ -1170,41 +1174,42 @@ class TestDataset(unittest.TestCase):
 		ar2 = np.zeros((20))
 		arrays = [ar1, ar2]
 		N = len(arrays)
-		dfs = [vx.dataset.DatasetArrays("dataset1") for i in range(N)]
+		dfs = [vx.dataframe.DataFrameLocal() for i in range(N)]
 		for dataset, array in zip(dfs, arrays):
 			dataset.add_column("x", array)
 		with self.assertRaises(ValueError):
-			dataset_concat = vx.dataset.DatasetConcatenated(dfs, name="dataset_concat")
+			dataset_concat = vaex.concat(dfs)
 
 
 		ar1 = np.zeros((10))
 		ar2 = np.zeros((20))
 		arrays = [ar1, ar2]
 		N = len(arrays)
-		dfs = [vx.dataset.DatasetArrays("dataset1") for i in range(N)]
+		dfs = [vx.dataframe.DataFrameLocal() for i in range(N)]
 		for dataset, array in zip(dfs, arrays):
 			dataset.add_column("x", array)
-		dataset_concat = vx.dataset.DatasetConcatenated(dfs, name="dataset_concat")
+		dataset_concat = vaex.concat(dfs)
 
 
-		dataset_concat1 = vx.dataset.DatasetConcatenated(dfs, name="dataset_concat")
-		dataset_concat2 = vx.dataset.DatasetConcatenated(dfs, name="dataset_concat")
-		self.assertEqual(len(dataset_concat1.concat(dataset_concat2).dfs), 4)
-		self.assertEqual(len(dataset_concat1.concat(dfs[0]).dfs), 3)
-		self.assertEqual(len(dfs[0].concat(dataset_concat1).dfs), 3)
-		self.assertEqual(len(dfs[0].concat(dfs[0]).dfs), 2)
+		dataset_concat1 = vaex.concat(dfs)
+		dataset_concat2 = vaex.concat(dfs)
+		# TODO: is it really a performance penalty if we don't 'collapse' multiple concats
+		# self.assertEqual(len(dataset_concat1.concat(dataset_concat2).dataset.datasets), 4)
+		# self.assertEqual(len(dataset_concat1.concat(dfs[0]).dataset.datasets), 3)
+		# self.assertEqual(len(dfs[0].concat(dataset_concat1).dataset.datasets), 3)
+		# self.assertEqual(len(dfs[0].concat(dfs[0]).dataset.datasets), 2)
 
 	def test_export_concat(self):
 		x1 = np.arange(1000, dtype=np.float32)
 		x2 = np.arange(100, dtype=np.float32)
 		self.x_concat = np.concatenate((x1, x2))
 
-		dataset1 = vx.dataset.DatasetArrays("dataset1")
-		dataset2 = vx.dataset.DatasetArrays("dataset2")
+		dataset1 = vx.dataframe.DataFrameLocal()
+		dataset2 = vx.dataframe.DataFrameLocal()
 		dataset1.add_column("x", x1)
 		dataset2.add_column("x", x2)
 
-		self.dataset_concat = vx.dataset.DatasetConcatenated([dataset1, dataset2], name="dataset_concat")
+		self.dataset_concat = vaex.concat([dataset1, dataset2])
 
 		path_hdf5 = tempfile.mktemp(".hdf5")
 		self.dataset_concat.export_hdf5(path_hdf5)
@@ -1318,21 +1323,24 @@ class TestDataset(unittest.TestCase):
 											else:
 												values = dataset.evaluate(column_name, array_type="numpy")
 												if shuffle:
-													indices = compare.columns["random_index"]
+													indices = compare.columns["random_index"][:]
 													a = np.ma.compressed(make_masked(compare.evaluate(column_name, array_type="numpy")))
 													b = np.ma.compressed(make_masked(values[::][indices]))
 													self.assertEqual(sorted(a), sorted(b))
 												else:
-													dtype = np.array(compare.columns[column_name]).dtype # we don't want any casting
-													compare_values = compare.columns[column_name]
+													dtype = np.array(compare.columns[column_name][:]).dtype # we don't want any casting
+													compare_values = compare.columns[column_name][:]
 													if isinstance(compare_values, vaex.column.Column):
 														compare_values = compare_values.to_numpy()
 													np.testing.assert_array_equal(compare_values, values[:length].astype(dtype))
-										compare.close_files()
+										compare.close()
 										#os.remove(path)
 
 				# self.dataset_concat_dup references self.dataset, so set it's active_fraction to 1 again
 				dataset.set_active_fraction(1)
+
+	def test_export_cmdline(self):
+		import vaex.export
 		path_arrow = tempfile.mktemp(".arrow")
 		path_hdf5 = tempfile.mktemp(".hdf5")
 		dataset = self.dataset
@@ -1632,7 +1640,7 @@ class TestDatasetDistributed(TestDatasetRemote):
 	def setUp(self):
 		TestDataset.setUp(self)
 		global test_port
-		# self.dataset_local = self.dataset = dataset.DatasetArrays("dataset")
+		# self.dataset_local = self.dataset = dataframe.DataFrameLocal("dataset")
 		self.dataset_local = self.dataset
 
 		dfs = [self.dataset]
@@ -1721,7 +1729,7 @@ class TestDatasetDistributed(TestDatasetRemote):
 
 class T_stWebServer(unittest.TestCase):
 	def setUp(self):
-		self.dataset = dataset.DatasetArrays()
+		self.dataset = dataframe.DataFrameLocal()
 
 		self.x = x = np.arange(10)
 		self.y = y = x ** 2

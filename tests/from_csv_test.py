@@ -21,6 +21,11 @@ def test_from_csv():
     df = vaex.from_csv(os.path.join(path, 'data', 'empty.csv'))
     assert len(df) == 0
 
+    # can read csv with no header
+    df = vaex.from_csv(os.path.join(path, 'data', 'noheader.csv'), header=None)
+    assert len(df) == 5
+    assert df.get_column_names() == ['0', '1', '2']
+
     # can read as chunks iterator
     df_iterator = vaex.from_csv(csv_path, chunk_size=1)
     df1 = next(df_iterator)
@@ -28,7 +33,7 @@ def test_from_csv():
     df2, df3 = next(df_iterator), next(df_iterator)
     with pytest.raises(StopIteration):
         next(df_iterator)
-    _assert_csv_content(vaex.dataframe.DataFrameConcatenated([df1, df2, df3]))
+    _assert_csv_content(vaex.concat([df1, df2, df3]))
 
 
 def test_from_csv_converting_in_chunks():
@@ -78,6 +83,6 @@ def _assert_csv_content(csv_df, with_index=False):
 
 def _cleanup_generated_files(*dfs):
     for df in dfs:
-        df.close_files()
+        df.close()
     for hdf5_file in glob.glob(os.path.join(path, 'data', '*.hdf5')):
         os.remove(hdf5_file)

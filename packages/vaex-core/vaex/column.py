@@ -16,6 +16,7 @@ if not on_rtd:
 logger = logging.getLogger("vaex.column")
 
 
+
 class Column(object):
     def tolist(self):
         return self.to_numpy().tolist()
@@ -74,6 +75,9 @@ class ColumnSparse(Column):
     def __len__(self):
         return self.shape[0]
 
+    def trim(self, i1, i2):
+        return ColumnSparse(self.matrix[i1:i2], column_index=self.column_index)
+
     def __getitem__(self, slice):
         # not sure if this is the fastest
         return self.matrix[slice, self.column_index].A[:,0]
@@ -96,12 +100,36 @@ class ColumnNumpyLike(Column):
     def __setitem__(self, slice, value):
         self.ar[slice] = value
 
+
+
+class ColumnArrowLazyCast(Column):
+    """Wraps an array like object and cast it lazily"""
+    def __init__(self, ar, type):
+        self.ar = ar  # this should behave like a numpy array
+        self.type = type
+
+    @property
+    def dtype(self):
+        return vaex.array_types.to_numpy_type(self.type)
+
+    def __len__(self):
+        return len(self.ar)
+
+    def trim(self, i1, i2):
+        return type(self)(self.ar[i1:i2], self.type)
+
+    def __getitem__(self, slice):
+        if self.ar.dtype == object and vaex.array_types.is_string_type(self.type):
+            # this seem to be the only way to convert mixed str and nan to include nulls
+            return pa.Array.from_pandas(self.ar[slice], type=self.type)
+        return pa.array(self.ar[slice], type=self.type)
+
+
 class ColumnIndexed(Column):
-    def __init__(self, df, indices, name, masked=False):
-        self.df = df
+    def __init__(self, column, indices, masked=False):
+        self.column = column
         self.indices = indices
-        self.name = name
-        self.dtype = self.df.data_type(name)
+        self.dtype = vaex.array_types.data_type(column)
         self.shape = (len(indices),)
         self.masked = masked
         # this check is too expensive
@@ -110,7 +138,7 @@ class ColumnIndexed(Column):
         #     assert max_index < self.df._length_original
 
     @staticmethod
-    def index(df, column, name, indices, direct_indices_map=None, masked=False):
+    def index(column, indices, direct_indices_map=None, masked=False):
         """Creates a new column indexed by indices which avoids nested indices
 
         :param df: Dataframe where column comes from
@@ -131,15 +159,15 @@ class ColumnIndexed(Column):
                 direct_indices_map[id(column.indices)] = direct_indices
             else:
                 direct_indices = direct_indices_map[id(column.indices)]
-            return ColumnIndexed(column.df, direct_indices, column.name, masked=masked or column.masked)
+            return ColumnIndexed(column.column, direct_indices, masked=masked or column.masked)
         else:
-            return ColumnIndexed(df, indices, name, masked=masked)
+            return ColumnIndexed(column, indices, masked=masked)
 
     def __len__(self):
         return len(self.indices)
 
     def trim(self, i1, i2):
-        return ColumnIndexed(self.df, self.indices[i1:i2], self.name, masked=self.masked)
+        return ColumnIndexed(self.column, self.indices[i1:i2], masked=self.masked)
 
     def __arrow_array__(self, type=None):
         # TODO: without a copy we get a buserror
@@ -150,13 +178,16 @@ class ColumnIndexed(Column):
         # else:
         return pa.array(self)
 
+    def to_numpy(self):
+        return np.array(self[:])
+
     def __getitem__(self, slice):
         start, stop, step = slice.start, slice.stop, slice.step
         start = start or 0
         stop = stop or len(self)
         assert step in [None, 1]
         indices = self.indices[start:stop]
-        ar_unfiltered = self.df.columns[self.name]
+        ar_unfiltered = self.column
         if self.masked:
             mask = indices == -1
         if isinstance(ar_unfiltered, Column):
@@ -191,9 +222,10 @@ class ColumnIndexed(Column):
 
 
 class ColumnConcatenatedLazy(Column):
-    def __init__(self, expressions, dtype=None):
+    def __init__(self, expressions, dtype=None, shape=None, fill_value=None):
         self.is_masked = any([e.is_masked for e in expressions])
-        if self.is_masked:
+        self.fill_value = fill_value
+        if self.is_masked and fill_value is None:
             for expression in expressions:
                 if expression.is_masked:
                     try:
@@ -237,13 +269,15 @@ class ColumnConcatenatedLazy(Column):
             # if dtype is given, we assume every expression/column is the same dtype
             self.dtype = dtype
             self.expressions = expressions[:]
-        self.shape = (len(self), ) + self.expressions[0][0:1].to_numpy().shape[1:]
-
-        for i in range(1, len(self.expressions)):
-            expression = self.expressions[i]
-            shape_i = (len(self), ) + expressions[i][0:1].to_numpy().shape[1:]
-            if self.shape != shape_i:
-                raise ValueError("shape of of expression %s, array index 0, is %r and is incompatible with the shape of the same column of array index %d, %r" % (self.expressions[0], self.shape, i, shape_i))
+        if shape is not None:
+            self.shape = (len(self),) + shape
+        else:
+            self.shape = (len(self), ) + self.expressions[0].evaluate(0, 1, array_type='numpy', parallel=False).shape[1:]
+            for i in range(1, len(self.expressions)):
+                expression = self.expressions[i]
+                shape_i = (len(self), ) + expressions[i].evaluate(0, 1, array_type='numpy', parallel=False).shape[1:]
+                if self.shape != shape_i:
+                    raise ValueError("shape of of expression %s, array index 0, is %r and is incompatible with the shape of the same column of array index %d, %r" % (self.expressions[0], self.shape, i, shape_i))
 
     def to_arrow(self, type=None):
         values = [e.values for e in self.expressions]
@@ -295,7 +329,10 @@ class ColumnConcatenatedLazy(Column):
             # otherwise we only need a slice of the first
             expressions = [self.expressions[i][start-offset:stop-offset]]
 
-        return ColumnConcatenatedLazy(expressions, self.dtype)
+        return ColumnConcatenatedLazy(expressions, self.dtype, self.shape[1:], fill_value=self.fill_value)
+
+    def __arrow_array__(self, type=None):
+        return pa.array(self[:], type=type)
 
     def __getitem__(self, slice):
         start, stop, step = slice.start, slice.stop, slice.step
@@ -368,7 +405,9 @@ def _to_string(string_bytes):
 
 
 def _is_stringy(x):
-    if isinstance(x, ColumnString):
+    if vaex.array_types.is_string(x):
+        return True
+    elif isinstance(x, ColumnString):
         return True
     elif isinstance(x, np.ndarray):
         if x.dtype.kind in 'US':
@@ -562,6 +601,10 @@ class ColumnStringArrow(ColumnString):
     def from_string_sequence(cls, string_sequence):
         s = string_sequence
         return cls(s.indices, s.bytes, s.length, s.offset, string_sequence=s, null_bitmap=s.null_bitmap)
+
+    @classmethod
+    def from_arrow(cls, ar):
+        return cls.from_string_sequence(_to_string_sequence(ar))
 
     def _zeros_like(self):
         return ColumnStringArrow(np.zeros_like(self.indices), np.zeros_like(self.bytes), self.length, null_bitmap=self.null_bitmap)

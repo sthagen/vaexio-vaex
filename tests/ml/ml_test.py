@@ -10,8 +10,8 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler, MaxAbsScaler, Ro
 
 def test_pca():
     ds = vaex.ml.datasets.load_iris()
-    pca1 = ds.ml.pca(features=[ds.petal_width, ds.petal_length], n_components=2)
-    pca2 = ds.ml.pca(features=[ds.sepal_width, ds.sepal_length, ds.petal_length], n_components=3)
+    pca1 = ds.ml.pca(features=[ds.petal_width, ds.petal_length], n_components=2, transform=False)
+    pca2 = ds.ml.pca(features=[ds.sepal_width, ds.sepal_length, ds.petal_length], n_components=3, transform=False)
     ds = pca1.transform(ds)
     print(ds.virtual_columns.keys())
     virtual_column_count1 = len(ds.virtual_columns.keys())
@@ -32,18 +32,17 @@ def test_valid_sklearn_pca():
     pca.fit(ds[features])
     sklearn_trans = pca.transform(ds[features])
     # vaex-ml approach
-    vaexpca = ds.ml.pca(n_components=3, features=features)
-    vpca = vaexpca.transform(ds[features])
+    ds_pca = ds.ml.pca(n_components=3, features=features)
     # Compare the two approaches
-    np.testing.assert_almost_equal(vpca.evaluate('PCA_0'), sklearn_trans[:, 0])
+    np.testing.assert_almost_equal(ds_pca.evaluate('PCA_0'), sklearn_trans[:, 0])
 
 
 def test_standard_scaler():
     ds = vaex.ml.datasets.load_iris()
-    ss1 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=True, with_std=True)
-    ss2 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=True, with_std=False)
-    ss3 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=False, with_std=True)
-    ss4 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=False, with_std=False)
+    ss1 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=True, with_std=True, transform=False)
+    ss2 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=True, with_std=False, transform=False)
+    ss3 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=False, with_std=True, transform=False)
+    ss4 = ds.ml.standard_scaler(features=[ds.petal_width, ds.petal_length], with_mean=False, with_std=False, transform=False)
     ds1 = ss1.transform(ds)
     print(ds.virtual_columns.keys())
     ds2 = ss2.transform(ds)
@@ -71,8 +70,8 @@ def test_standard_scaler():
 
 def test_minmax_scaler():
     ds = vaex.ml.datasets.load_iris()
-    mms1 = ds.ml.minmax_scaler(features=[ds.petal_width, ds.petal_length])
-    mms2 = ds.ml.minmax_scaler(features=[ds.petal_width, ds.petal_length], feature_range=(-5, 2))
+    mms1 = ds.ml.minmax_scaler(features=[ds.petal_width, ds.petal_length], transform=False)
+    mms2 = ds.ml.minmax_scaler(features=[ds.petal_width, ds.petal_length], feature_range=(-5, 2), transform=False)
     ds1 = mms1.transform(ds)
     print(ds.virtual_columns.keys())
     ds2 = mms2.transform(ds)
@@ -123,7 +122,7 @@ def test_frequency_encoder():
     test = vaex.from_arrays(animals=animals, numbers=numbers)
     features = ['animals', 'numbers']
 
-    fe = train.ml.frequency_encoder(features=features, unseen='nan')
+    fe = train.ml.frequency_encoder(features=features, unseen='nan', transform=False)
     fe.fit(train)
     test_a = fe.transform(test)
     np.testing.assert_almost_equal(test_a.frequency_encoded_animals.values,
@@ -159,7 +158,7 @@ def test_label_encoder():
     df_unseen = vaex.from_arrays(x=x3, y=y3)
 
     # # Label Encode with vaex.ml
-    label_encoder = df_train.ml.label_encoder(features=['x', 'y'], prefix='mypref_')
+    label_encoder = df_train.ml.label_encoder(features=['x', 'y'], prefix='mypref_', transform=False)
 
     # Assertions: makes sure that the categories are correctly identified:
     assert set(list(label_encoder.labels_['x'].keys())) == set(np.unique(x1))
@@ -178,7 +177,7 @@ def test_label_encoder():
         label_encoder.transform(df_unseen)
 
     # Now try again, but allow for unseen categories
-    label_encoder = df_train.ml.label_encoder(features=['x', 'y'], prefix='mypref_', allow_unseen=True)
+    label_encoder = df_train.ml.label_encoder(features=['x', 'y'], prefix='mypref_', allow_unseen=True, transform=False)
     df_unseen = label_encoder.transform(df_unseen)
     assert set(df_unseen[df_unseen.x == 'dragon'].mypref_x.tolist()) == {-1}
     assert set(df_unseen[df_unseen.y == 4].mypref_x.tolist()) == {-1}
@@ -196,12 +195,13 @@ def test_one_hot_encoding():
     # Create dataset
     ds = vaex.from_arrays(animals=x, kids=y, numbers=z)
     # First try to one-hot encode without specifying features: this should raise an exception
-    with pytest.raises(ValueError):
-        onehot = ds.ml.one_hot_encoder(features=None)
+    # TODO: should we do this?
+    # with pytest.raises(ValueError):
+    #     onehot = ds.ml.one_hot_encoder(features=None)
     # split in train and test
     train, test = ds.ml.train_test_split(test_size=.25, verbose=False)
     # fit onehot encoder on the train set
-    onehot = train.ml.one_hot_encoder(features=['kids', 'animals', 'numbers'], prefix='')
+    onehot = train.ml.one_hot_encoder(features=['kids', 'animals', 'numbers'], prefix='', transform=False)
     # transform the test set
     test = onehot.transform(test)
     # asses the success of the test
@@ -215,6 +215,38 @@ def test_one_hot_encoding():
     # Fit-transform
     ohe = vaex.ml.OneHotEncoder(features=['kids', 'animals', 'numbers'])
     ohe.fit_transform(ds)
+
+def test_one_hot_encoding_with_na():
+    x = ['Reggie', 'Michael', None, 'Reggie']
+    y = [31, 23, np.nan, 31]
+    df_train = vaex.from_arrays(x=x, y=y)
+
+    x = ['Michael', 'Reggie', None, None]
+    y = [23, 31, np.nan, np.nan]
+    df_test = vaex.from_arrays(x=x, y=y)
+
+
+    enc = vaex.ml.OneHotEncoder(features=['x', 'y'])
+    enc.fit(df_train)
+
+    assert enc.uniques_[0] == [None, 'Michael', 'Reggie']
+    np.testing.assert_array_equal(enc.uniques_[1], [np.nan, 23.0, 31.0])
+
+    df_train = enc.transform(df_train)
+    assert df_train.x_missing.tolist() == [0, 0, 1, 0]
+    assert df_train.x_Michael.tolist() == [0, 1, 0, 0]
+    assert df_train.x_Reggie.tolist() == [1, 0, 0, 1]
+    assert df_train['y_23.0'].tolist() == [0, 1, 0, 0]
+    assert df_train['y_31.0'].tolist() == [1, 0, 0, 1]
+    assert df_train['y_nan'].tolist() == [0, 0, 1, 0]
+
+    df_test = enc.transform(df_test)
+    assert df_test.x_missing.tolist() == [0, 0, 1, 1]
+    assert df_test.x_Michael.tolist() == [1, 0, 0, 0]
+    assert df_test.x_Reggie.tolist() == [0, 1, 0, 0]
+    assert df_test['y_23.0'].tolist() == [1, 0, 0, 0]
+    assert df_test['y_31.0'].tolist() == [0, 1, 0, 0]
+    assert df_test['y_nan'].tolist() == [0, 0, 1, 1]
 
 
 def test_maxabs_scaler():
@@ -390,7 +422,7 @@ def test_groupby_transformer_basics():
     assert df_test_trans.y.tolist() == [5, 5, 5, 5]
 
     # Alternative API
-    trans = df_train.ml.groupby_transformer(by='x', agg={'mean_y': vaex.agg.mean('y')}, rsuffix='_agg')
+    trans = df_train.ml.groupby_transformer(by='x', agg={'mean_y': vaex.agg.mean('y')}, rsuffix='_agg', transform=False)
     df_test_trans_2 = trans.transform(df_test)
     assert df_test_trans.mean_y.tolist() == df_test_trans_2.mean_y.tolist()
     assert df_test_trans.x.tolist() == df_test_trans_2.x.tolist()

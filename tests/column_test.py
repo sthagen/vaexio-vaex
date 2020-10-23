@@ -28,19 +28,19 @@ def test_arrow_strings():
     assert df[1:3].x.tolist() == x[1:3]
 
     indices = np.array([0, 2, 1, 3])
-    assert xc[indices].tolist() == ['a', 'ccc', 'bb', 'dddd']
+    assert xc.take(indices).tolist() == ['a', 'ccc', 'bb', 'dddd']
 
     indices_masked = np.ma.array(indices, mask=[False, True, False, False])
-    assert xc[indices_masked].tolist() == ['a', None, 'bb', 'dddd']
+    assert xc.take(indices_masked).tolist() == ['a', None, 'bb', 'dddd']
 
     indices = np.array([0, 2, 1, 3])
-    assert xc[indices].tolist() == ['a', 'ccc', 'bb', 'dddd']
+    assert xc.take(indices).tolist() == ['a', 'ccc', 'bb', 'dddd']
 
     mask = np.array([True, True, False, True])
-    assert xc[mask].tolist() == ['a', 'bb', 'dddd']
+    assert vaex.array_types.filter(xc, mask).tolist() == ['a', 'bb', 'dddd']
 
     mask_masked = np.ma.array(np.array([True, True, False, True]), mask=[False, True, True, False])
-    assert xc[mask_masked].tolist() == ['a', 'dddd']
+    assert vaex.array_types.filter(xc, mask_masked).tolist() == ['a', 'dddd']
 
 
 def test_arrow_strings_null():
@@ -100,7 +100,7 @@ def test_column_indexed(df_local):
     assert isinstance(dff.columns[x_name], vaex.column.ColumnIndexed)
     assert dff.x.tolist() == [1, 3, 5, 7, 9]
 
-    column_masked = vaex.column.ColumnIndexed.index(dff, dff.columns[x_name], 'x', np.array([0, -1, 2, 3, 4]), {}, True)
+    column_masked = vaex.column.ColumnIndexed.index(dff.columns[x_name], np.array([0, -1, 2, 3, 4]), {}, True)
     assert column_masked[:].tolist() == [1, None, 5, 7, 9]
     assert column_masked.masked
     assert column_masked.trim(0, 1).masked

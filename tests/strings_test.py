@@ -24,12 +24,12 @@ def test_format():
     assert df.text.format('pre-%s-post').tolist() == ['pre-%s-post' % k for k in text]
 
 
-@pytest.mark.skipif(sys.version_info < (3, 3), reason="requires python3.4 or higher")
 def test_dtype_object_string(tmpdir):
+    # CHANGE: before vaex v4 we worked with dtype object, now we lazily cast to arrow
     x = np.arange(8, 12)
     s = np.array(list(map(str, x)), dtype='O')
     df = vaex.from_arrays(x=x, s=s)
-    assert df.columns['s'].dtype.kind == 'O'
+    assert df.columns['s'].type == pa.string()
     path = str(tmpdir.join('test.arrow'))
     df.export(path)
     df_read = vaex.open(path, as_numpy=False)
@@ -149,6 +149,7 @@ def dfs_arrow(tmp_path_factory):
     df = vaex.from_arrays(s=vaex.string_column(string_list), sr=vaex.string_column(string_list_reverse))
     df.export(path)  # we write it out so that the memory is read only
     return vaex.open(path)
+    return df
 
 
 def test_null_values():
@@ -174,6 +175,10 @@ def test_string_capitalize(dfs):
 def test_string_cat(dfs):
     c = [s1+s2 for s1, s2 in zip(string_list, string_list_reverse)]
     assert dfs.s.str.cat(dfs.sr).tolist() == c
+
+@pytest.mark.xfail(reason='pandas does not like getting an arrow array as argument')
+def test_string_cat(dfs):
+    c = [s1+s2 for s1, s2 in zip(string_list, string_list_reverse)]
     assert dfs.s.str_pandas.cat(dfs.sr).tolist() == c
 
 
@@ -359,14 +364,15 @@ def test_string_islower(dfs):
     assert dfs.s.str.lower().str.islower().tolist() == dfs.s.str_pandas.lower().str_pandas.islower().tolist()
 
 
+@pytest.mark.parametrize("ascii", [True, False])
+def test_string_istitle(ascii):
+    df = vaex.from_arrays(s=['Title Case', 'no title'])
+    assert df.s.str.istitle(ascii=ascii).tolist() == [True, False]
+
+
 def test_string_isupper(dfs):
     assert dfs.s.str.isupper().tolist() == dfs.s.str_pandas.isupper().tolist()
     assert dfs.s.str.upper().str.isupper().tolist() == dfs.s.str_pandas.upper().str_pandas.isupper().tolist()
-
-
-# def test_string_istitle(dfs):
-#   assert dfs.s.str.istitle().tolist() == dfs.s.str_pandas.istitle().tolist()
-#   assert dfs.s.str.title.istitle().tolist() == dfs.s.str_pandas.title().str_pandas.istitle().tolist()
 
 
 def test_string_isspace(dfs):

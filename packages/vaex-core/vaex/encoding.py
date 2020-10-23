@@ -64,8 +64,8 @@ class vaex_evaluate_results_encoding:
         else:
             if isinstance(result, np.ndarray):
                 return {'type': 'ndarray', 'data': encoding.encode('ndarray', result)}
-            elif isinstance(result, vaex.column.ColumnStringArrow):
-                return {'type': 'arrow-array', 'data': encoding.encode('arrow-array', result.to_arrow())}
+            elif isinstance(result, vaex.array_types.supported_arrow_array_types):
+                return {'type': 'arrow-array', 'data': encoding.encode('arrow-array', result)}
             elif isinstance(result, numbers.Number):
                 try:
                     result = result.item()  # for numpy scalars
@@ -162,6 +162,9 @@ class dtype_encoding:
             return pa.string()
         if type_spec == 'large_string':
             return pa.large_string()
+        # TODO: find a proper way to support all arrow types
+        if type_spec == 'timestamp[ms]':
+            return pa.timestamp('ms')
         else:
             return np.dtype(type_spec)
 
@@ -224,6 +227,10 @@ class Encoding:
         encoded = [self.registry[typename].encode(self, k) for k in values]
         return encoded
 
+    def encode_list2(self, typename, values):
+        encoded = [self.encode_list(typename, k) for k in values]
+        return encoded
+
     def encode_dict(self, typename, values):
         encoded = {key: self.registry[typename].encode(self, value) for key, value in values.items()}
         return encoded
@@ -234,6 +241,10 @@ class Encoding:
 
     def decode_list(self, typename, values, **kwargs):
         decoded = [self.registry[typename].decode(self, k, **kwargs) for k in values]
+        return decoded
+
+    def decode_list2(self, typename, values, **kwargs):
+        decoded = [self.decode_list(typename, k, **kwargs) for k in values]
         return decoded
 
     def decode_dict(self, typename, values, **kwargs):

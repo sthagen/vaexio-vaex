@@ -53,6 +53,25 @@ def arrow_array_from_numpy_array(array):  # TODO: -=> rename with ensure
 from vaex.dataframe import Column
 
 
+def arrow_string_array_from_buffers(bytes, offsets, null_bitmap):
+    if offsets.dtype == np.int32:
+        type = pa.string()
+    elif offsets.dtype == np.int64:
+        type = pa.large_string()
+    else:
+        raise ValueError(f'Unsupported dtype {offsets.dtype} for string offsets')
+    return _arrow_binary_array_from_buffers(bytes, offsets, null_bitmap, type)
+
+
+def _arrow_binary_array_from_buffers(bytes, offsets, null_bitmap, type):
+    length = len(offsets)-1
+    offsets = pa.py_buffer(offsets)
+    bytes = pa.py_buffer(bytes)
+    if null_bitmap is not None:
+        null_bitmap = pa.py_buffer(null_bitmap)
+    return pa.Array.from_buffers(type, length, [null_bitmap, offsets, bytes])
+
+
 def column_from_arrow_array(arrow_array):
     # TODO: we may be able to pass chunked arrays
     arrow_array = ensure_not_chunked(arrow_array)
@@ -74,7 +93,8 @@ def column_from_arrow_array(arrow_array):
             string_bytes = np.array([], dtype='S1')
         else:
             string_bytes = np.frombuffer(string_bytes, 'S1', len(string_bytes))
-        column = vaex.column.ColumnStringArrow(offsets, string_bytes, len(arrow_array), null_bitmap=null_bitmap)
+        offset = arrow_array.offset
+        column = vaex.column.ColumnStringArrow(offsets[offset:], string_bytes, len(arrow_array), null_bitmap=null_bitmap)
         return column
     else:
         raise TypeError('type unsupported: %r' % arrow_type)

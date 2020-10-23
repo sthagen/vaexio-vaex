@@ -26,8 +26,14 @@ jobs:
     - uses: actions/checkout@v1
       with:
         submodules: true
+    - uses: actions/checkout@v2
+      if: ${{ (github.event.pull_request.head.repo.full_name == 'vaexio/vaex') && (matrix.os == 'linux-latest') }}
+      with:
+        repository: vaexio/vaex-enterprise
+        token: ${{ secrets.PAT_PULL_ENTERPRISE }}
+        path: vaex-enterprise
     - name: Install conda with Python ${{ matrix.python-version }}
-      uses: s-weigand/setup-conda@master
+      uses: s-weigand/setup-conda@v1
       with:
         python-version: ${{ matrix.python-version }}
         conda-channels: anaconda, conda-forge
@@ -43,6 +49,9 @@ jobs:
       shell: bash
       run: |
         ./ci/02-create-vaex-dev-env.sh ${{ matrix.python-version }}
+        source activate vaex-dev
+        pip install "ipython>=7" "dask>=1"
+        # not sure why, but the conda env is strange (old dask) if we put this constraint in the conda solver
     - name: free disk space
       if: matrix.os == 'ubuntu-latest'
       run: |
@@ -57,10 +66,10 @@ jobs:
         brew install libomp
     - name: Cache compiled binaries
       id: cache-compiled-binaries
-      uses: actions/cache@v1
+      uses: actions/cache@v2
       with:
         path: packages/vaex-core/build
-        key: ${{ runner.OS }}-${{ matrix.python-version }}-${{ hashFiles('packages/vaex-core/src/*') }}-v4
+        key: ${{ runner.OS }}-${{ matrix.python-version }}-${{ hashFiles('packages/vaex-core/src/*') }}-v2
     - name: Fix cache timestamp
       if: steps.cache-compiled-binaries.outputs.cache-hit == 'true' && matrix.os != 'windows-latest'
       shell: bash
@@ -70,6 +79,16 @@ jobs:
       shell: bash
       run: |
         ./ci/03-install-vaex.sh
+    - name: Install vaex-enterprise
+      if: ${{ (github.event.pull_request.head.repo.full_name == 'vaexio/vaex') && (matrix.os == 'linux-latest') }}
+      shell: bash
+      run: |
+        conda config --set always_yes yes --set changeps1 no
+        source activate vaex-dev
+        cd vaex-enterprise
+        mamba install -c conda-forge distributed
+        pip install ray
+        pip install -e .
     - name: Lint with flake8
       run: |
         echo "soon"
@@ -82,6 +101,15 @@ jobs:
       shell: bash
       run: |
         ./ci/04-run-test-suite.sh
+        source activate vaex-dev
+        python -m vaex.ml.spec packages/vaex-ml/vaex/ml/spec_new.json
+        diff packages/vaex-ml/vaex/ml/spec_new.json packages/vaex-ml/vaex/ml/spec.json
+    - name: Test with pytest (vaex-enterprise)
+      if: ${{ (github.event.pull_request.head.repo.full_name == 'vaexio/vaex') && (matrix.os == 'linux-latest') }}
+      shell: bash
+      run: |
+        source activate vaex-dev
+        py.test vaex-enterprise/tests --timeout=1000
     - name: Test notebooks
       if: matrix.os != 'windows-latest'
       shell: bash

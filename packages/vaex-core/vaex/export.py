@@ -2,10 +2,12 @@ __author__ = 'maartenbreddels'
 import os
 import sys
 import collections
-import numpy as np
 import logging
 import concurrent.futures
 import threading
+
+import numpy as np
+import pyarrow as pa
 
 import vaex
 import vaex.utils
@@ -163,7 +165,12 @@ def _export_column(dataset_input, dataset_output, column_name, shuffle, sort, se
         if 1:
             block_scope = dataset_input._block_scope(0, vaex.execution.buffer_size_default)
             to_array = dataset_output.columns[column_name]
-            dtype = dataset_input.data_type(column_name)
+            dtype = dataset_input.data_type(column_name, array_type='numpy')
+            is_string = vaex.array_types.is_string_type(dtype)
+            if is_string:
+                assert isinstance(to_array, pa.Array)  # we don't support chunked arrays here
+                # TODO legacy: we still use ColumnStringArrow to write, find a way to do this with arrow
+                to_array = ColumnStringArrow.from_arrow(to_array)
             if shuffle or sort:  # we need to create a in memory copy, otherwise we will do random writes which is VERY inefficient
                 to_array_disk = to_array
                 if np.ma.isMaskedArray(to_array):
@@ -177,19 +184,17 @@ def _export_column(dataset_input, dataset_output, column_name, shuffle, sort, se
             to_offset = 0  # we need this for selections
             to_offset_unselected = 0 # we need this for filtering
             count = len(dataset_input)# if not selection else dataset_input.length_unfiltered()
-            is_string = vaex.array_types.is_string_type(dtype)
             # TODO: if no filter, selection or mask, we can choose the quick path for str
             string_byte_offset = 0
 
             for i1, i2 in vaex.utils.subdivide(count, max_length=max_length):
                 logger.debug("from %d to %d (total length: %d, output length: %d)", i1, i2, len(dataset_input), N)
-                values = dataset_input.evaluate(column_name, i1=i1, i2=i2, filtered=True, parallel=False, selection=selection)
+                values = dataset_input.evaluate(column_name, i1=i1, i2=i2, filtered=True, parallel=False, selection=selection, array_type='numpy')
                 no_values = len(values)
                 if no_values:
                     if is_string:
                         # for strings, we don't take sorting/shuffling into account when building the structure
                         to_column = to_array
-                        assert isinstance(to_column, ColumnStringArrow)
                         from_sequence = _to_string_sequence(values)
                         to_sequence = to_column.string_sequence.slice(to_offset, to_offset+no_values, string_byte_offset)
                         string_byte_offset += to_sequence.fill_from(from_sequence)
@@ -294,10 +299,11 @@ def export_fits(dataset, path, column_names=None, shuffle=False, selection=False
         del data_types[-1]
         del data_shapes[-1]
     dataset_output = vaex.file.other.FitsBinTable(path, write=True)
-    _export(dataset_input=dataset, dataset_output=dataset_output, path=path, random_index_column=random_index_name,
+    df_output = vaex.dataframe.DataFrameLocal(dataset_output)
+    _export(dataset_input=dataset, dataset_output=df_output, path=path, random_index_column=random_index_name,
             column_names=column_names, selection=selection, shuffle=shuffle,
             progress=progress, sort=sort, ascending=ascending)
-    dataset_output.close_files()
+    dataset_output.close()
 
 
 def export_hdf5_v1(dataset, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True):
@@ -366,6 +372,7 @@ def main(argv):
             if not args.quiet:
                 print("generating soneira peebles dataset...")
             dataset = vaex.file.other.SoneiraPeebles(args.dimension, 2, args.max_level, args.lambdas)
+            dataset = vaex.dataframe.DataFrameLocal(dataset)
         else:
             return 1
     if args.task == "tap":
@@ -483,5 +490,5 @@ def main(argv):
                 progressbar.finish()
             if not args.quiet:
                 print("\noutput to %s" % os.path.abspath(args.output))
-            dataset.close_files()
+            dataset.close()
     return 0
