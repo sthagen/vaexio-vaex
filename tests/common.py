@@ -45,13 +45,13 @@ class CallbackCounter(object):
 @contextlib.contextmanager
 def small_buffer(ds, size=3):
     if ds.is_local():
-        previous = ds.executor.buffer_size
-        ds.executor.buffer_size = size
+        previous = ds.executor.chunk_size
+        ds.executor.chunk_size = size
         ds._invalidate_selection_cache()
         try:
             yield
         finally:
-            ds.executor.buffer_size = previous
+            ds.executor.chunk_size = previous
     else:
         yield # for remote datasets we don't support this ... or should we?
 
@@ -348,3 +348,77 @@ def create_base_ds():
     df.add_virtual_column("z", "x+t*y")
     df.set_variable("t", 1.)
     return df._readonly()
+
+
+@pytest.fixture(scope='session')
+def array_factory_numpy():
+    def create(x):
+        mask = [k is None for k in x]
+        if any(mask):
+            x = [x[0] if k is None else k for k in x]
+            return np.ma.array(x, mask=mask)
+        else:
+            return np.array(x)
+    return create
+
+
+@pytest.fixture(scope='session')
+def array_factory_arrow_normal():
+    return pa.array
+
+
+@pytest.fixture(scope='session')
+def array_factory_arrow_chunked():
+    def create(x):
+        x = pa.array(x)
+        mid = len(x) // 3
+        c1 = x.slice(0, mid)
+        c2 = x.slice(mid)
+        return pa.chunked_array([c1, c2])
+    return create
+
+
+@pytest.fixture(scope='session', params=['array_factory_numpy', 'array_factory_arrow_normal', 'array_factory_arrow_chunked'])
+def array_factory(request, array_factory_numpy, array_factory_arrow_normal, array_factory_arrow_chunked):
+    named = dict(array_factory_numpy=array_factory_numpy, array_factory_arrow_normal=array_factory_arrow_normal, array_factory_arrow_chunked=array_factory_arrow_chunked)
+    return named[request.param]
+
+@pytest.fixture(scope='session', params=['array_factory_arrow_normal', 'array_factory_arrow_chunked'])
+def array_factory_arrow(request, array_factory_arrow_normal, array_factory_arrow_chunked):
+    named = dict(array_factory_arrow_normal=array_factory_arrow_normal, array_factory_arrow_chunked=array_factory_arrow_chunked)
+    return named[request.param]
+
+array_factory1 = array_factory
+array_factory2 = array_factory
+
+@pytest.fixture(params=['df_factory_numpy', 'df_factory_arrow'])#, 'df_factory_parquet'])
+def df_factory(request, df_factory_numpy, df_factory_arrow):#, df_factory_parquet):
+    named = dict(df_factory_numpy=df_factory_numpy, df_factory_arrow=df_factory_arrow)#, df_factory_parquet=df_factory_parquet)
+    return named[request.param]
+
+
+@pytest.fixture
+def df_factory_numpy():
+    return vaex.from_arrays
+
+
+@pytest.fixture
+def df_factory_arrow():
+    def create(**arrays):
+        def try_convert(ar):
+            try:
+                return pa.array(ar)
+            except:
+                return ar
+        return vaex.from_dict({k: try_convert(v) for k, v in arrays.items()})
+    return create
+
+
+@pytest.fixture
+def df_factory_parquet(tmpdir):
+    def create(**arrays):
+        df = vaex.from_dict({k: pa.array(v) for k, v in arrays.items()})
+        path = str(tmpdir / 'test.parquet')
+        df.export(path)
+        return vaex.open(path)
+    return create

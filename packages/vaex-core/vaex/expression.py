@@ -12,6 +12,7 @@ from future.utils import with_metaclass
 import numpy as np
 import tabulate
 import pyarrow as pa
+from vaex.datatype import DataType
 
 from vaex.utils import _ensure_strings_from_expressions, _ensure_string_from_expression
 from vaex.column import ColumnString, _to_string_sequence
@@ -278,10 +279,11 @@ class Expression(with_metaclass(Meta)):
 
     @property
     def dtype(self):
-        return self.df.data_type(self.expression, array_type='numpy')
+        return self.df.data_type(self.expression)
 
+    # TODO: remove this method?
     def data_type(self, array_type=None):
-        return self.df.data_type(self.expression, array_type=array_type)
+        return self.df.data_type(self.expression)
 
     @property
     def shape(self):
@@ -305,7 +307,7 @@ class Expression(with_metaclass(Meta)):
         import dask.array as da
         import uuid
         dtype = self.dtype
-        chunks = da.core.normalize_chunks(chunks, shape=self.shape, dtype=dtype)
+        chunks = da.core.normalize_chunks(chunks, shape=self.shape, dtype=dtype.numpy)
         name = 'vaex-expression-%s' % str(uuid.uuid1())
         def getitem(df, item):
             assert len(item) == 1
@@ -313,9 +315,9 @@ class Expression(with_metaclass(Meta)):
             start, stop, step = item.start, item.stop, item.step
             assert step in [None, 1]
             return self.evaluate(start, stop, parallel=False)
-        dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype)
+        dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype.numpy)
         dsk[name] = self
-        return da.Array(dsk, name, chunks, dtype=dtype)
+        return da.Array(dsk, name, chunks, dtype=dtype.numpy)
 
     def to_pandas_series(self):
         """Return a pandas.Series representation of the expression.
@@ -476,11 +478,11 @@ class Expression(with_metaclass(Meta)):
     #     '''
     #     return self.ds.evaluate(self)
 
-    def tolist(self):
+    def tolist(self, i1=None, i2=None):
         '''Short for expr.evaluate().tolist()'''
-        values = self.evaluate()
+        values = self.evaluate(i1=i1, i2=i2)
         if isinstance(values, (pa.Array, pa.ChunkedArray)):
-            return values.to_pandas().values.tolist()
+            return values.to_pylist()
         return values.tolist()
 
     if not os.environ.get('VAEX_DEBUG', ''):
@@ -821,8 +823,10 @@ def f({0}):
             var = self.df.add_variable('isin_values', values, unique=True)
             return self.df['isin(%s, %s)' % (self, var)]
 
-    def apply(self, f):
+    def apply(self, f, vectorize=False, multiprocessing=True):
         """Apply a function along all values of an Expression.
+
+        Shorthand for ``df.apply(f, arguments=[expression])``, see :meth:`DataFrame.apply`
 
         Example:
 
@@ -852,9 +856,11 @@ def f({0}):
 
 
         :param f: A function to be applied on the Expression values
+        :param vectorize: Call f with arrays instead of a scalars (for better performance).
+        :param bool multiprocessing: Use multiple processes to avoid the GIL (Global interpreter lock).
         :returns: A function that is lazily evaluated when called.
         """
-        return self.ds.apply(f, [self.expression])
+        return self.ds.apply(f, [self.expression], vectorize=vectorize, multiprocessing=multiprocessing)
 
     def dropmissing(self):
         # TODO: df.dropna does not support inplace
@@ -1004,20 +1010,28 @@ def f({0}):
     def is_string(self):
         return self.df.is_string(self.expression)
 
+
 class FunctionSerializable(object):
     pass
 
 
 @vaex.serialize.register
 class FunctionSerializablePickle(FunctionSerializable):
-    def __init__(self, f=None):
+    def __init__(self, f=None, multiprocessing=False):
         self.f = f
+        self.multiprocessing = multiprocessing
 
     def pickle(self, function):
         return pickle.dumps(function)
 
     def unpickle(self, data):
         return pickle.loads(data)
+
+    def __getstate__(self):
+        return self.state_get()
+
+    def __setstate__(self, state):
+        self.state_set(state)
 
     def state_get(self):
         data = self.pickle(self.f)
@@ -1045,6 +1059,10 @@ class FunctionSerializablePickle(FunctionSerializable):
 
     def __call__(self, *args, **kwargs):
         '''Forward the call to the real function'''
+        import vaex.multiprocessing
+        return vaex.multiprocessing.apply(self._apply, args, kwargs, self.multiprocessing)
+
+    def _apply(self, *args, **kwargs):
         return self.f(*args, **kwargs)
 
 
@@ -1065,7 +1083,7 @@ class FunctionSerializableJit(FunctionSerializable):
     def state_get(self):
         return dict(expression=self.expression,
                     arguments=self.arguments,
-                    argument_dtypes=list(map(str, self.argument_dtypes)),
+                    argument_dtypes=list(map(lambda dtype: str(dtype.numpy), self.argument_dtypes)),
                     return_dtype=str(self.return_dtype),
                     verbose=self.verbose)
 
@@ -1073,8 +1091,8 @@ class FunctionSerializableJit(FunctionSerializable):
     def state_from(cls, state, trusted=True):
         return cls(expression=state['expression'],
                    arguments=state['arguments'],
-                   argument_dtypes=list(map(np.dtype, state['argument_dtypes'])),
-                   return_dtype=np.dtype(state['return_dtype']),
+                   argument_dtypes=list(map(lambda s: DataType(np.dtype(s)), state['argument_dtypes'])),
+                   return_dtype=DataType(np.dtype(state['return_dtype'])),
                    verbose=state['verbose'])
 
     @classmethod
@@ -1120,8 +1138,8 @@ def f({0}):
         f = scope['f']
 
         # numba part
-        argument_dtypes_numba = [getattr(numba, argument_dtype.name) for argument_dtype in self.argument_dtypes]
-        return_dtype_numba = getattr(numba, self.return_dtype.name)
+        argument_dtypes_numba = [getattr(numba, argument_dtype.numpy.name) for argument_dtype in self.argument_dtypes]
+        return_dtype_numba = getattr(numba, self.return_dtype.numpy.name)
         vectorizer = numba.vectorize([return_dtype_numba(*argument_dtypes_numba)])
         return vectorizer(f)
 
@@ -1158,6 +1176,10 @@ def f({0}):
 @vaex.serialize.register
 class FunctionToScalar(FunctionSerializablePickle):
     def __call__(self, *args, **kwargs):
+        import vaex.multiprocessing
+        return vaex.multiprocessing.apply(self._apply, args, kwargs, self.multiprocessing)
+
+    def _apply(self, *args, **kwargs):
         length = len(args[0])
         result = []
         def fix_type(v):
@@ -1168,6 +1190,7 @@ class FunctionToScalar(FunctionSerializablePickle):
                 return v.decode('utf8')
             else:
                 return v
+        args = [vaex.array_types.tolist(k) for k in args]
         for i in range(length):
             scalar_result = self.f(*[fix_type(k[i]) for k in args], **{key: value[i] for key, value in kwargs.items()})
             result.append(scalar_result)

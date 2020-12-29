@@ -1,8 +1,12 @@
 from common import *
 import os
+from pathlib import Path
 import tempfile
 import pandas as pd
 import platform
+
+
+DATA_PATH = Path(__file__).parent
 
 
 @pytest.mark.skipif(platform.system().lower() == 'windows', reason="access violation?")
@@ -15,7 +19,42 @@ def test_export_empty_string(tmpdir, filename):
     df = vaex.open(path)
     repr(df)
 
-def test_export(ds_local, tmpdir):
+
+def test_export_non_identifier(tmpdir):
+    df = vaex.from_dict({'#': ['foo']})
+    df.export_hdf5(tmpdir / 'test.hdf5')
+    df2 = vaex.open(tmpdir / 'test.hdf5')
+    assert df2['#'].tolist() == ['foo']
+
+
+def test_export_many_name(df_local, tmpdir):
+    df = df_local[['x']]
+    df.export_many(tmpdir / 'chunk.parquet', chunk_size=3)
+    assert (tmpdir / 'chunk-00001.parquet').exists()
+    assert (tmpdir / 'chunk-00002.parquet').exists()
+    assert (tmpdir / 'chunk-00003.parquet').exists()
+    assert not (tmpdir / 'chunk-00004.parquet').exists()
+
+
+def test_export_large_string_parquet(tmpdir):
+    s = pa.array(['aap', 'noot', 'mies'], type=pa.large_string())
+    df = vaex.from_arrays(s=s)
+    df.export_parquet(tmpdir / 'chunk.parquet')
+
+
+def test_export_many(df_local, tmpdir):
+    df = df_local
+    df = df.drop('datetime')
+    if 'timedelta' in df:
+        df = df.drop('timedelta')
+    if 'obj' in df:
+        df = df.drop(['obj'])
+    df.export_many(tmpdir / 'chunk_{i:05}.parquet', chunk_size=3)
+    df_copy = vaex.open(str(tmpdir / 'chunk_*.parquet'))
+    assert df_copy.x.tolist() == df.x.tolist()
+
+
+def test_export_basic(ds_local, tmpdir):
     ds = ds_local
     # TODO: we eventually want to support dtype=object, but not for hdf5
     if 'obj' in ds:  # df_arrow does not have it
@@ -46,7 +85,7 @@ def test_export_open_hdf5(ds_local):
 def test_export_open_csv(ds_local, tmpdir):
     df = ds_local
     path = str(tmpdir.join('test.csv'))
-    df.export_csv(path, chunk_size=3, virtual=True)
+    df.export_csv(path, chunk_size=3)
     df_opened = vaex.from_csv(path)
     assert list(df) == list(df_opened)
     assert df.shape == df_opened.shape
@@ -124,7 +163,7 @@ def test_multi_file_naive_read_convert_export(tmpdir, dtypes):
     df_verify = vaex.open(output_path_final)
     assert len(df) == len(df_verify)
     assert df['name'].tolist() == df_verify['name'].tolist()
-    assert df['age'].fillnan(magic_value).tolist() == df_verify['age'].fillnan(magic_value).tolist()
+    assert df['age'].fillna(magic_value).tolist() == df_verify['age'].fillna(magic_value).tolist()
 
 def test_export_csv(df_local, tmpdir):
     df = df_local

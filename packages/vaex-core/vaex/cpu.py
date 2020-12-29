@@ -161,7 +161,7 @@ class TaskPartStatistic:
         self.selections = selections
         self.fields = op.fields(weights)
         self.shape_total = (len(self.selections), ) + self.shape + (self.fields,)
-        self.grid = np.zeros(self.shape_total, dtype=self.dtype)
+        self.grid = np.zeros(self.shape_total, dtype=self.dtype.numpy)
         self.op.init(self.grid)
         self.minima = minima
         self.maxima = maxima
@@ -353,6 +353,7 @@ class TaskPartAggregations:
                 references.extend([block, mask])
             else:
                 binner.set_data(block)
+                binner.clear_data_mask()
                 references.extend([block])
         all_aggregators = []
         for agg_desc, selections, aggregation2d, selection_waslist in self.aggregations:
@@ -393,6 +394,8 @@ class TaskPartAggregations:
                 if selection_mask is not None:
                     agg.set_data_mask(selection_mask)
                     references.extend([selection_mask])
+                else:
+                    agg.clear_data_mask()
         grid.bin(all_aggregators, N)
         self.has_values = True
 
@@ -412,9 +415,8 @@ class TaskPartAggregations:
                 grids.append(grid)
             result = np.asarray(grids) if selection_waslist else grids[0]
             if agg_desc.dtype_out != str:
-                dtype_out = vaex.utils.to_native_dtype(agg_desc.dtype_out)
-                dtype_out = vaex.array_types.to_numpy_type(dtype_out)
-                result = result.view(dtype_out)
+                dtype_out = agg_desc.dtype_out.to_native()
+                result = result.view(dtype_out.numpy)
             result = result.copy()
             results.append(result)
         return results

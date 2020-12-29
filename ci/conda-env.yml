@@ -13,15 +13,19 @@ numpy
 pandas
 pcre
 pip
+psutil
 python-annoy
-py-xgboost
+# py-xgboost
 # pyarrow
 pyqt
 pytest
 pytest-asyncio <0.14
+pytest-mpl
 pytest-timeout
 python-graphviz
 scikit-learn
 scipy
+s3fs
+gcsfs
 tornado
 xarray

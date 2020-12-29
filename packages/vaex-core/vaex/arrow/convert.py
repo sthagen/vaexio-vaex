@@ -10,7 +10,7 @@ import vaex.column
 
 def ensure_not_chunked(arrow_array):
     if isinstance(arrow_array, pa.ChunkedArray):
-        if len(arrow_array.chunks) == 0:
+        if len(arrow_array.chunks) == 1:
             return arrow_array.chunks[0]
         table = pa.Table.from_arrays([arrow_array], ["single"])
         table_concat = table.combine_chunks()
@@ -94,7 +94,7 @@ def column_from_arrow_array(arrow_array):
         else:
             string_bytes = np.frombuffer(string_bytes, 'S1', len(string_bytes))
         offset = arrow_array.offset
-        column = vaex.column.ColumnStringArrow(offsets[offset:], string_bytes, len(arrow_array), null_bitmap=null_bitmap)
+        column = vaex.column.ColumnStringArrow(offsets, string_bytes, len(arrow_array), offset, null_bitmap=null_bitmap)
         return column
     else:
         raise TypeError('type unsupported: %r' % arrow_type)
@@ -130,6 +130,7 @@ def numpy_array_from_arrow_array(arrow_array):
         bitmap = np.frombuffer(bitmap_buffer, np.uint8, len(bitmap_buffer))
         mask = numpy_mask_from_arrow_mask(bitmap, len(arrow_array) + offset)[offset:]
         array = np.ma.MaskedArray(array, mask=mask)
+    assert len(array) == len(arrow_array)
     return array
 
 
@@ -158,3 +159,116 @@ def arrow_table_from_vaex_df(ds, column_names=None, selection=None, strings=True
 def vaex_df_from_arrow_table(table):
     from .dataset import DatasetArrow
     return DatasetArrow(table=table)
+
+
+def trim_buffers(ar):
+    # there are cases where memcopy are made, of modifications are mode (large_string_to_string)
+    # in those cases, we don't want to work on the full array, and get rid of the offset if possible
+    if ar.type == pa.string() or ar.type == pa.large_string():
+        if isinstance(ar, pa.ChunkedArray):
+            return ar  # lets assume chunked arrays are fine
+        null_bitmap, offsets_buffer, bytes = ar.buffers()
+        if ar.type == pa.string():
+            offsets = np.frombuffer(offsets_buffer, np.int32, len(ar) + 1 + ar.offset)
+        else:
+            offsets = np.frombuffer(offsets_buffer, np.int64, len(ar) + 1 + ar.offset)
+        # because it is difficult to slice bits
+        new_offset = ar.offset % 8
+        remove_offset = (ar.offset // 8) * 8
+        first_offset = offsets[remove_offset]
+        new_offsets = offsets[remove_offset:] - first_offset
+        if null_bitmap:
+            null_bitmap = null_bitmap.slice(ar.offset // 8)
+        new_offsets_buffer = pa.py_buffer(new_offsets)
+        bytes = bytes.slice(first_offset)
+        ar = pa.Array.from_buffers(ar.type, len(ar), [null_bitmap, new_offsets_buffer, bytes], offset=new_offset)
+    return ar
+
+
+def large_string_to_string(ar):
+    if isinstance(ar, pa.ChunkedArray):
+        return pa.chunked_array([large_string_to_string(k) for k in ar.chunks], type=pa.string())
+    ar = trim_buffers(ar)
+    offset = ar.offset
+    null_bitmap, offsets_buffer, bytes = ar.buffers()
+    offsets = np.frombuffer(offsets_buffer, np.int64, len(ar)+1 + ar.offset)
+    if offsets[-1] > (2**31-1):
+        raise ValueError('pa.large_string cannot be converted to pa.string')
+    offsets = offsets.astype(np.int32)
+    offsets_buffer = pa.py_buffer(offsets)
+    return pa.Array.from_buffers(pa.string(), len(ar), [null_bitmap, offsets_buffer, bytes], offset=ar.offset)
+
+
+def trim_buffers_ipc(ar):
+    '''
+    >>> ar = pa.array([1, 2, 3, 4], pa.int8())
+    >>> ar.nbytes
+    4
+    >>> ar.slice(2, 2) #doctest: +ELLIPSIS
+    <pyarrow.lib.Int8Array object at 0x...>
+    [
+      3,
+      4
+    ]
+    >>> ar.slice(2, 2).nbytes
+    4
+    >>> trim_buffers_ipc(ar.slice(2, 2)).nbytes  # expected 1
+    2
+    >>> trim_buffers_ipc(ar.slice(2, 2))#doctest: +ELLIPSIS
+    <pyarrow.lib.Int8Array object at 0x...>
+    [
+      3,
+      4
+    ]
+    '''
+    if len(ar) == 0:
+        return ar
+    schema = pa.schema({'x': ar.type})
+    with pa.BufferOutputStream() as sink:
+        with pa.ipc.new_stream(sink, schema) as writer:
+            writer.write_table(pa.table({'x': ar}))
+    with pa.BufferReader(sink.getvalue()) as source:
+        with pa.ipc.open_stream(source) as reader:
+            table = reader.read_all()
+            assert table.num_columns == 1
+            assert table.num_rows == len(ar)
+            trimmed_ar = table.column(0)
+    if isinstance(trimmed_ar, pa.ChunkedArray):
+        assert len(trimmed_ar.chunks) == 1
+        trimmed_ar = trimmed_ar.chunks[0]
+
+    return trimmed_ar
+
+
+def trim_buffers_for_pickle(ar):
+    # future version of pyarrow might fix this, so we have a single entry point for this
+    return trim_buffers_ipc(ar)
+
+
+def align(a, b):
+    '''Align two arrays/chunked arrays such that they have the same chunk lengths'''
+    if len(a) != len(b):
+        raise ValueError(f'Length of arrays should be equals ({len(a)} != {len(b)})')
+    if isinstance(a, pa.ChunkedArray) and len(a.chunks) == 1:
+        a = a.chunks[0]
+    if isinstance(b, pa.ChunkedArray) and len(b.chunks) == 1:
+        b = b.chunks[0]
+    if isinstance(a, pa.ChunkedArray) and isinstance(b, pa.ChunkedArray):
+        lengths_a = [len(c) for c in a.chunks]
+        lengths_b = [len(c) for c in b.chunks]
+        if lengths_a == lengths_b:
+            return a, b
+        else:
+            return ensure_not_chunked(a), ensure_not_chunked(b)
+    elif isinstance(a, pa.ChunkedArray) and not isinstance(b, pa.ChunkedArray):
+        lengths = [len(c) for c in a.chunks]
+        # numpy cannot do an exclusive cumsum
+        offsets = np.cumsum([0] + lengths)
+        offsets = offsets[:-1]
+        return a, pa.chunked_array([b.slice(offset, length) for offset, length in zip(offsets, lengths)])
+    elif not isinstance(a, pa.ChunkedArray) and isinstance(b, pa.ChunkedArray):
+        b, a = align(b, a)
+        return a, b
+    else:
+        return a, b
+    return

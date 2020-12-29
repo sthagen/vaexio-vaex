@@ -1,48 +1,35 @@
-try:
-    from urllib.parse import urlparse, parse_qs
-except ImportError:
-    from urlparse import urlparse, parse_qs
+import pyarrow.fs
 
-try:
-    import gcsfs
-except Exception as e:
-    import_exception = e
-    gcsfs = None
 
+import vaex.utils
+gcsfs = vaex.utils.optional_import('gcsfs', '>=0.6.2')
 import vaex.file.cache
-
+from . import split_options, split_scheme
+from .cache import FileSystemHandlerCached
 
 normal_open = open
 
 
-def is_gs_path(path):
-    return path.startswith('gs://')
-
-
-def dup(f):
-    return f.gcsfs.open(f.path, f.mode)
-
-
-def open(path, mode='rb', **kwargs):
-    if not is_gs_path(path):
-        return normal_open(path, mode)
-    if gcsfs is None:
-        raise import_exception
-    o = urlparse(path)
-    assert o.scheme == 'gs'
-    naked_path = path
-    if '?' in naked_path:
-        naked_path = naked_path[:naked_path.index('?')]
-    # only use the first item
-    options = {key: values[0] for key, values in parse_qs(o.query).items()}
-    options.update(kwargs)
-    use_cache = options.get('cache', 'true') in ['true', 'True', '1']
-    if 'cache' in options:
-        del options['cache']
-    fs = gcsfs.GCSFileSystem(**options)
-    if use_cache:
-        fp = lambda: fs.open(naked_path, mode)
-        fp = vaex.file.cache.CachedFile(fp, naked_path)
+def glob(path, fs_options={}):
+    if '?' in path:
+        __, query = path[:path.index('?')], path[path.index('?'):]
     else:
-        fp = fs.open(naked_path, mode)
-    return fp
+        query = ''
+    path, options = split_options(path, fs_options)
+    fs = gcsfs.GCSFileSystem(**options)
+    return ['gs://' + k + query for k in fs.glob(path)]
+
+
+def parse(path, fs_options={}, for_arrow=False):
+    path = path.replace('fsspec+gs://', 'gs://')
+    path, fs_options = split_options(path, fs_options)
+    scheme, path = split_scheme(path)
+    assert scheme == 'gs'
+    use_cache = fs_options.pop('cache', 'true') in [True, 'true', 'True', '1']
+    fs = gcsfs.GCSFileSystem(**fs_options)
+    fs = pyarrow.fs.FSSpecHandler(fs)
+    if use_cache:
+        fs = FileSystemHandlerCached(fs, scheme='gs', for_arrow=for_arrow)
+    if for_arrow:
+        fs = pyarrow.fs.PyFileSystem(fs)
+    return fs, path

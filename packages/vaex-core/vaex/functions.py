@@ -38,7 +38,7 @@ scopes = {
     'td': vaex.expression.TimeDelta
 }
 
-def register_function(scope=None, as_property=False, name=None, on_expression=True, df_accessor=None):
+def register_function(scope=None, as_property=False, name=None, on_expression=True, df_accessor=None, multiprocessing=False):
     """Decorator to register a new function with vaex.
 
     If on_expression is True, the function will be available as a method on an
@@ -63,6 +63,7 @@ def register_function(scope=None, as_property=False, name=None, on_expression=Tr
     >>>     return vaex.functions.dt_dayofyear(x)/365.
     >>> df.departure.dt.relative_day
     """
+    import vaex.multiprocessing
     prefix = ''
     if scope:
         prefix = scope + "_"
@@ -79,7 +80,7 @@ def register_function(scope=None, as_property=False, name=None, on_expression=Tr
                 def wrapper(self, *args, **kwargs):
                     lazy_func = getattr(self.df.func, full_name)
                     lazy_func = vaex.arrow.numpy_dispatch.autowrapper(lazy_func)
-                    return lazy_func(*args, **kwargs)
+                    return vaex.multiprocessing.apply(lazy_func, args, kwargs, multiprocessing)
                 return functools.wraps(function)(wrapper)
             if as_property:
                 setattr(df_accessor, name, property(closure()))
@@ -93,7 +94,7 @@ def register_function(scope=None, as_property=False, name=None, on_expression=Tr
                             lazy_func = getattr(self.expression.ds.func, full_name)
                             lazy_func = vaex.arrow.numpy_dispatch.autowrapper(lazy_func)
                             args = (self.expression, ) + args
-                            return lazy_func(*args, **kwargs)
+                            return vaex.multiprocessing.apply(lazy_func, args, kwargs, multiprocessing)
                         return functools.wraps(function)(wrapper)
                     if as_property:
                         setattr(scopes[scope], name, property(closure()))
@@ -104,8 +105,8 @@ def register_function(scope=None, as_property=False, name=None, on_expression=Tr
                         def wrapper(self, *args, **kwargs):
                             lazy_func = getattr(self.ds.func, full_name)
                             lazy_func = vaex.arrow.numpy_dispatch.autowrapper(lazy_func)
-                            args = (self, ) + args
-                            return lazy_func(*args, **kwargs)
+                            args = (self,) + args
+                            return vaex.multiprocessing.apply(lazy_func, args, kwargs, multiprocessing=multiprocessing)
                         return functools.wraps(function)(wrapper)
                     setattr(vaex.expression.Expression, name, closure())
         vaex.expression.expression_namespace[prefix + name] = vaex.arrow.numpy_dispatch.autowrapper(f)
@@ -155,7 +156,15 @@ for name, numpy_name in numpy_function_mapping:
         function = getattr(np, numpy_name)
         def f(function=function):
             def wrapper(*args, **kwargs):
-                return function(*args, **kwargs)
+                # convert to numpy
+                args = [vaex.arrow.numpy_dispatch.wrap(k) for k in args]
+                numpy_data = [k.numpy_array if isinstance(k, vaex.arrow.numpy_dispatch.NumpyDispatch) else k for k in args]
+                result = function(*numpy_data, **kwargs)
+                # and put back the masks
+                for arg in args:
+                    if isinstance(arg, vaex.arrow.numpy_dispatch.NumpyDispatch):
+                        result = arg.add_missing(result)
+                return vaex.arrow.numpy_dispatch.wrap(result)
             return wrapper
         function = f()
         function.__doc__ = "Lazy wrapper around :py:data:`numpy.%s`" % name
@@ -195,6 +204,7 @@ def fillnan(ar, value):
     # they will never contain nan
     if not _is_stringy(ar):
         ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
+        ar = vaex.array_types.to_numpy(ar, strict=True)
         if ar.dtype.kind in 'fO':
             mask = isnan(ar)
             if np.any(mask):
@@ -210,7 +220,7 @@ def fillna(ar, value):
 
     '''
     # TODO: should use arrow fill_null in the future
-    if vaex.array_types.is_string(ar):
+    if isinstance(ar, vaex.array_types.supported_arrow_array_types):
         ar = fillna(vaex.array_types.to_numpy(ar, strict=True), value)
         return vaex.array_types.to_arrow(ar)
     ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
@@ -235,7 +245,9 @@ def ismissing(x):
         else:
             return x.mask == 1
     else:
-        if not isinstance(x, np.ndarray) or x.dtype.kind in 'US':
+        if isinstance(x, vaex.array_types.supported_arrow_array_types):
+            return pa.compute.is_null(x)
+        elif not isinstance(x, np.ndarray) or x.dtype.kind in 'US':
             x = _to_string_sequence(x)
             mask = x.mask()
             if mask is None:
@@ -255,6 +267,8 @@ def notmissing(x):
 @register_function()
 def isnan(x):
     """Returns an array where there are NaN values"""
+    if isinstance(x, vaex.array_types.supported_arrow_array_types):
+        x = vaex.array_types.to_numpy(x)
     if isinstance(x, np.ndarray):
         if np.ma.isMaskedArray(x):
             # we don't want a masked arrays
@@ -1110,6 +1124,8 @@ def str_contains(x, pattern, regex=True):
     if regex:
         return _to_string_sequence(x).search(pattern, regex)
     else:
+        if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+            x = pa.array(x)
         return pc.match_substring(x, pattern)
 
 # TODO: default regex is False, which breaks with pandas
@@ -1444,6 +1460,8 @@ def str_lower(x):
     3          our
     4         way.
     """
+    if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+        x = pa.array(x)
     return pc.utf8_lower(x)
 
 
@@ -1957,6 +1975,8 @@ def str_upper(x, ascii=False):
     if ascii:
         return pc.ascii_upper(x)
     else:
+        if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+            x = pa.array(x)
         return pc.utf8_upper(_arrow_string_might_grow(x, 3/2))
 
 
@@ -2028,6 +2048,8 @@ def str_isalnum(x, ascii=False):
     4  False
     """
     kernel_function = pc.ascii_is_alnum if ascii else pc.utf8_is_alnum
+    if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+        x = pa.array(x)
     return kernel_function(x)
 
 
@@ -2253,8 +2275,7 @@ for name in dir(scopes['str']):
 def _ordinal_values(x, ordered_set):
     from vaex.column import _to_string_sequence
 
-    if not isinstance(x, np.ndarray) or x.dtype.kind in 'US' or\
-        isinstance(ordered_set, vaex.superutils.ordered_set_string):
+    if not isinstance(x, vaex.array_types.supported_array_types) or isinstance(ordered_set, vaex.superutils.ordered_set_string):
         # sometimes the dtype can be object, but seen as an string array
         x = _to_string_sequence(x)
     return ordered_set.map_ordinal(x)

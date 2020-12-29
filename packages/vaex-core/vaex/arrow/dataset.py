@@ -1,66 +1,32 @@
 __author__ = 'maartenbreddels'
-import collections
-import concurrent.futures
+from collections import defaultdict
 import logging
-import multiprocessing
-import os
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.dataset
+import pyarrow.parquet as pq
 
 import vaex.dataset
-import vaex.file.other
+import vaex.file
+from vaex.dataset import DatasetSlicedArrays
 from ..itertools import buffer
+from vaex.multithreading import get_main_io_pool
 
-
-logger = logging.getLogger("vaex.arrow.dataset")
-
-thread_count_default_io = os.environ.get('VAEX_NUM_THREADS_IO', multiprocessing.cpu_count() * 2 + 1)
-thread_count_default_io = int(thread_count_default_io)
-main_io_pool = None
 
 logger = logging.getLogger("vaex.multithreading")
 
 
-def get_main_io_pool():
-    global main_io_pool
-    if main_io_pool is None:
-        main_io_pool = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count_default_io)
-    return main_io_pool
-
-
-class DatasetSliced(vaex.dataset.Dataset):
-    def __init__(self, original, start, end):
+class DatasetArrowBase(vaex.dataset.Dataset):
+    def __init__(self, max_rows_read=1024**2*10):
         super().__init__()
-        self.original = original
-        self.start = start
-        self.end = end
-        self._row_count = end - start
-        self._columns = {name: vaex.dataset.ColumnProxy(self, col.name, col.dtype) for name, col in self.original._columns.items()}
+        self.max_rows_read = max_rows_read
+        self._create_columns()
         self._ids = {}
 
-    def chunk_iterator(self, columns, chunk_size=None, reverse=False):
-        yield from self.original.chunk_iterator(columns, chunk_size=chunk_size, reverse=reverse, start=self.start, end=self.end)
-
-    def hashed(self):
-        raise NotImplementedError
-
-    def close(self):
-        self.original.close()
-
-    def slice(self, start, end):
-        length = end - start
-        start += self.start
-        end = start + length
-        if end > self.original.row_count:
-            raise IndexError(f'Slice end ({end}) if larger than number of rows: {self.original.row_count}')
-        return type(self)(self.original, start, end)
-
-
-class DatasetArrow(vaex.dataset.Dataset):
-    def __init__(self, ds):
-        super().__init__()
-        self._arrow_ds = ds
+    def _create_columns(self):
+        self._create_dataset()
+        # we have to get the metadata again, this does not pickle
         row_count = 0
         for fragment in self._arrow_ds.get_fragments():
             if hasattr(fragment, "ensure_complete_metadata"):
@@ -70,7 +36,9 @@ class DatasetArrow(vaex.dataset.Dataset):
         self._row_count = row_count
         self._columns = {name: vaex.dataset.ColumnProxy(self, name, type) for name, type in
                           zip(self._arrow_ds.schema.names, self._arrow_ds.schema.types)}
-        self._ids = {}
+        for name, dictionary in self._partitions.items():
+            # TODO: make int32 dependant on the data?
+            self._columns[name] = vaex.dataset.ColumnProxy(self, name, pa.dictionary(pa.int32(), dictionary.type))
 
     def hashed(self):
         raise NotImplementedError
@@ -79,12 +47,18 @@ class DatasetArrow(vaex.dataset.Dataset):
         # TODO: we can be smarter here, and trim off some fragments
         if start == 0 and end == self.row_count:
             return self
-        return DatasetSliced(self, start=start, end=end)
+        return vaex.dataset.DatasetSliced(self, start=start, end=end)
+
+    def is_masked(self, column):
+        return False
+
+    def shape(self, column):
+        return tuple()
 
     def __getitem__(self, item):
         if isinstance(item, slice):
             assert item.step in [1, None]
-            return DatasetSliced(self, item.start or 0, item.stop or self.row_count)
+            return vaex.dataset.DatasetSliced(self, item.start or 0, item.stop or self.row_count)
         return self._columns[item]
 
     def close(self):
@@ -92,18 +66,26 @@ class DatasetArrow(vaex.dataset.Dataset):
         pass
 
     def _chunk_producer(self, columns, chunk_size=None, reverse=False, start=0, end=None):
+        import pyarrow.parquet
         pool = get_main_io_pool()
         offset = 0
+        columns = tuple(columns)
+        columns_physical = []
+        columns_partition = []
+        for column in columns:
+            if column in self._partitions:
+                columns_partition.append(column)
+            else:
+                columns_physical.append(column)
+        columns_physical = tuple(columns_physical)
+        columns_partition = tuple(columns_partition)
+
         for fragment_large in self._arrow_ds.get_fragments():
             fragment_large_rows = sum([rg.num_rows for rg in fragment_large.row_groups])
-            # when do we want to split up? File size? max chunk size?
-            # if fragment_large_rows > chunk_size:
-            #     fragments = fragment_large.split_by_row_group()
-            # else:
-            #     # or not
-            #     fragments = [fragment_large]
-            import pyarrow.parquet
             fragments = [fragment_large]
+            # when do we want to split up? File size? max chunk size?
+            if fragment_large_rows > self.max_rows_read:
+                fragments = fragment_large.split_by_row_group()
             for fragment in fragments:
                 rows = sum([rg.num_rows for rg in fragment.row_groups])
                 chunk_start = offset
@@ -114,20 +96,28 @@ class DatasetArrow(vaex.dataset.Dataset):
                 if start >= chunk_end:  # we didn't find the beginning yet
                     offset += length
                     continue
-                if end < chunk_start:  # we are past the end
+                if end <= chunk_start:  # we are past the end
                     # assert False
                     break
                 def reader(fragment=fragment):
-                    table = fragment.to_table(columns=columns, use_threads=False)
-                    chunks = dict(zip(table.column_names, table.columns))
+                    table = fragment.to_table(columns=list(columns_physical), use_threads=False)
+                    chunks_physical = dict(zip(table.column_names, table.columns))
+                    chunks_partition = {}
+                    partition_keys = self._partition_keys[fragment.path]
+                    for name in columns_partition:
+                        partition_index = partition_keys[name]
+                        partition_index_ar = pa.array(np.full(len(table), partition_index, dtype=np.int32))
+                        chunks_partition[name] = pa.DictionaryArray.from_arrays(partition_index_ar, self._partitions[name])
+                    chunks = {name: chunks_physical.get(name, chunks_partition.get(name)) for name in columns}
                     return chunks
-
+                assert length > 0
                 if start > chunk_start:
                     # this means we have to cut off a piece of the beginning
                     if end < chunk_end:
                         # AND the end
                         length = end - chunk_start  # without the start cut off
                         length -= start - chunk_start  # correcting for the start cut off
+                        assert length > 0
                         def slicer(chunk_start=chunk_start, reader=reader, length=length):
                             chunks = reader()
                             chunks = {name: ar.slice(start - chunk_start, length) for name, ar in chunks.items()}
@@ -137,6 +127,7 @@ class DatasetArrow(vaex.dataset.Dataset):
                         reader = slicer
                     else:
                         length -= start - chunk_start  # correcting for the start cut off
+                        assert length > 0
                         def slicer(chunk_start=chunk_start, reader=reader, length=length):
                             chunks = reader()
                             chunks = {name: ar.slice(start - chunk_start) for name, ar in chunks.items()}
@@ -148,6 +139,7 @@ class DatasetArrow(vaex.dataset.Dataset):
                     if end < chunk_end:
                         # we only need to cut off a piece of the end
                         length = end - chunk_start
+                        assert length > 0
                         def slicer(chunk_start=chunk_start, reader=reader, length=length):
                             chunks = reader()
                             chunks = {name: ar.slice(0, length) for name, ar in chunks.items()}
@@ -155,102 +147,142 @@ class DatasetArrow(vaex.dataset.Dataset):
                                 assert len(ar) == length, f'Oops, array was expected to be of length {length} but was {len(ar)}'
                             return chunks
                         reader = slicer
-                offset += length
+                offset += rows
                 yield pool.submit(reader)
 
     def chunk_iterator(self, columns, chunk_size=None, reverse=False, start=0, end=None):
         chunk_size = chunk_size or 1024*1024
         i1 = 0
-        lenghts = set()
-        cuts = 0
         chunks_ready_list = []
         i1 = i2 = 0
-        def get(chunks_ready_list):
-            nonlocal cuts
-            current_row_count = 0
-            chunks_current_list = []
-            while current_row_count < chunk_size and chunks_ready_list:
-                chunks_current = chunks_ready_list.pop(0)
-                chunk = list(chunks_current.values())[0]
-                # chunks too large, split, and put back a part
-                if current_row_count + len(chunk) > chunk_size:
-                    strict = True
-                    if strict:
-                        needed_length = chunk_size - current_row_count
-                        current_row_count += needed_length
-                        assert current_row_count == chunk_size
-                        if needed_length not in lenghts:
-                            lenghts.add(needed_length)
-                        cuts += 1
+        # TODO: merge this with DatsetConcatenated.chunk_iterator
+        if not columns:
+            end = self.row_count if end is None else end
+            length = end - start
+            i2 = min(length, i1 + chunk_size)
+            while i1 < length:
+                yield i1, i2, {}
+                i1 = i2
+                i2 = min(length, i1 + chunk_size)
+            return
 
-                        chunks_head = {name: chunk.slice(0, needed_length) for name, chunk in chunks_current.items()}
-                        chunks_current_list.append(chunks_head)
-                        chunks_extra = {name: chunk.slice(needed_length) for name, chunk in chunks_current.items()}
-                        chunks_ready_list.insert(0, chunks_extra)  # put back the extra in front
-                    else:
-                        current_row_count += len(chunk)
-                        chunks_current_list.append(chunks_current)
-                else:
-                    current_row_count += len(chunk)
-                    chunks_current_list.append(chunks_current)
-            return chunks_current_list, current_row_count
-
-        for chunks_future in buffer(self._chunk_producer(columns, chunk_size, start=start, end=end or self._row_count), thread_count_default_io+3):
+        workers = get_main_io_pool()._max_workers
+        for chunks_future in buffer(self._chunk_producer(columns, chunk_size, start=start, end=end or self._row_count), workers+3):
             chunks = chunks_future.result()
             chunks_ready_list.append(chunks)
             total_row_count = sum([len(list(k.values())[0]) for k in chunks_ready_list])
             if total_row_count > chunk_size:
-                chunks_current_list, current_row_count = get(chunks_ready_list)
+                chunks_current_list, current_row_count = vaex.dataset._slice_of_chunks(chunks_ready_list, chunk_size)
                 i2 += current_row_count
-                yield i1, i2, _concat(chunks_current_list)
+                yield i1, i2, vaex.dataset._concat_chunk_list(chunks_current_list)
                 i1 = i2
 
         while chunks_ready_list:
-            chunks_current_list, current_row_count = get(chunks_ready_list)
+            chunks_current_list, current_row_count = vaex.dataset._slice_of_chunks(chunks_ready_list, chunk_size)
             i2 += current_row_count
-            yield i1, i2, _concat(chunks_current_list)
+            yield i1, i2, vaex.dataset._concat_chunk_list(chunks_current_list)
             i1 = i2
 
 
-def _concat(list_of_chunks):
-    dict_of_list_of_arrays = collections.defaultdict(list)
-    for chunks in list_of_chunks:
-        for name, array in chunks.items():
-            dict_of_list_of_arrays[name].extend(array.chunks)
-    chunks = {name: pa.chunked_array(arrays) for name, arrays in dict_of_list_of_arrays.items()}
-    return chunks
+class DatasetParquet(DatasetArrowBase):
+    def __init__(self, path, fs_options, max_rows_read=1024**2*10, partitioning=None, kwargs=None):
+        self.path = path
+        self.fs_options = fs_options
+        self.partitioning = partitioning
+        self.kwargs = kwargs or {}
+        super().__init__(max_rows_read=max_rows_read)
+
+    def _create_dataset(self):
+        file_system, source = vaex.file.parse(self.path, self.fs_options, for_arrow=True)
+        self._arrow_ds = pyarrow.dataset.dataset(source, filesystem=file_system, partitioning=self.partitioning)
+
+        self._partitions = defaultdict(list) # path -> list (which will be an arrow array later on)
+        self._partition_keys = defaultdict(dict)  # path -> key -> int/index
+
+        for fragment in self._arrow_ds.get_fragments():
+            keys = pa.dataset._get_partition_keys(fragment.partition_expression)
+            for name, value in keys.items():
+                if value not in self._partitions[name]:
+                    self._partitions[name].append(value)
+                self._partition_keys[fragment.path][name] = self._partitions[name].index(value)
+        self._partitions = {name: pa.array(values) for name, values in self._partitions.items()}
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        del state['_arrow_ds']
+        del state['_partitions']
+        del state['_partition_keys']
+        return state
 
 
-def from_table(table, as_numpy=False):
-    columns = dict(zip(table.schema.names, table.columns))
-    # TODO: this should be an DatasetArrow and/or DatasetParquet
-    dataset = vaex.dataset.DatasetArrays(columns)
-    df = vaex.dataframe.DataFrameLocal(dataset)
-    return df.as_numpy() if as_numpy else df
+class DatasetArrowFileBase(vaex.dataset.Dataset):
+    def __init__(self, path, fs_options):
+        super().__init__()
+        self.fs_options = fs_options
+        self.path = path
+        self._create_columns()
+        self._set_row_count()
+        self._ids = {}
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state['_source']
+        del state['_columns']
+        return state
 
-def open(filename, as_numpy=False):
-    source = pa.memory_map(filename)
-    try:
-        # first we try if it opens as stream
-        reader = pa.ipc.open_stream(source)
-    except pa.lib.ArrowInvalid:
-        # if not, we open as file
-        reader = pa.ipc.open_file(source)
-        # for some reason this reader is not iterable
+    def chunk_iterator(self, columns, chunk_size=None, reverse=False):
+        yield from self._default_chunk_iterator(self._columns, columns, chunk_size, reverse=reverse)
+
+    def close(self):
+        self._source.close()
+
+    def hashed(self):
+        raise NotImplementedError
+
+    def shape(self, column):
+        return tuple()
+
+    def is_masked(self, column):
+        return False
+
+    def slice(self, start, end):
+        if start == 0 and end == self.row_count:
+            return self
+        return DatasetSlicedArrays(self, start=start, end=end)
+
+class DatasetArrowIPCFile(DatasetArrowFileBase):
+    def _create_columns(self):
+        self._source = vaex.file.open(path=self.path, mode='rb', fs_options=self.fs_options, mmap=True, for_arrow=True)
+        reader = pa.ipc.open_file(self._source)
         batches = [reader.get_batch(i) for i in range(reader.num_record_batches)]
+        table = pa.Table.from_batches(batches)
+        self._columns = dict(zip(table.schema.names, table.columns))
+
+
+class DatasetArrowIPCStream(DatasetArrowFileBase):
+    def _create_columns(self):
+        self._source = vaex.file.open(path=self.path, mode='rb', fs_options=self.fs_options, mmap=True, for_arrow=True)
+        reader = pa.ipc.open_stream(self._source)
+        table = pa.Table.from_batches(reader)
+        self._columns = dict(zip(table.schema.names, table.columns))
+
+
+def from_table(table):
+    columns = dict(zip(table.schema.names, table.columns))
+    dataset = vaex.dataset.DatasetArrays(columns)
+    return dataset
+
+
+def open(path, fs_options):
+    with vaex.file.open(path=path, mode='rb', fs_options=fs_options, mmap=True, for_arrow=True) as f:
+        file_signature = bytes(f.read(6))
+        is_arrow_file = file_signature == b'ARROW1'
+    if is_arrow_file:
+        return DatasetArrowIPCFile(path, fs_options=fs_options)
     else:
-        # if a stream, we're good
-        batches = reader  # this reader is iterable
-    table = pa.Table.from_batches(batches)
-    return from_table(table, as_numpy=as_numpy)
+        return DatasetArrowIPCStream(path, fs_options=fs_options)
 
 
-def open_parquet(filename, as_numpy=False):
-    arrow_ds = pyarrow.dataset.dataset(filename)
-    ds = DatasetArrow(arrow_ds)
-    return vaex.from_dataset(ds)
-
-# vaex.file.other.dataset_type_map["arrow"] = DatasetArrow
-# vaex.file.other.dataset_type_map["parquet"] = DatasetParquet
+def open_parquet(path, fs_options={}, partitioning='hive', **kwargs):
+    return DatasetParquet(path, fs_options=fs_options, partitioning=partitioning, kwargs=kwargs)
 

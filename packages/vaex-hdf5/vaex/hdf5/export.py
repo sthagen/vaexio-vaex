@@ -105,7 +105,7 @@ def export_hdf5_v1(dataset, path, column_names=None, byteorder="=", shuffle=Fals
     return
 
 
-def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True):
+def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, selection=False, progress=None, virtual=True, sort=None, ascending=True, parallel=True):
     """
     :param DatasetLocal dataset: dataset to export
     :param str path: path for file
@@ -147,7 +147,7 @@ def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, 
                 sparse_groups[id(sparse_matrix)].append(column_name)
                 sparse_matrices[id(sparse_matrix)] = sparse_matrix
                 continue
-            dtype = dataset.data_type(column_name, array_type='numpy')
+            dtype = dataset.data_type(column_name)
             shape = (N, ) + dataset._shape_of(column_name)[1:]
             h5column_output = h5columns_output.require_group(column_name)
             if vaex.array_types.is_string_type(dtype):
@@ -173,7 +173,7 @@ def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, 
                 index_array = h5column_output.require_dataset('indices', shape=indices_shape, dtype=dtype_indices)
                 index_array[0] = index_array[0]  # make sure the array really exists
 
-                null_value_count = N - dataset.count(column_name, selection=selection)
+                null_value_count = N - dataset.count(dataset[column_name], selection=selection)
                 if null_value_count > 0:
                     null_shape = ((N + 7) // 8, )  # TODO: arrow requires padding right?
                     null_bitmap_array = h5column_output.require_dataset('null_bitmap', shape=null_shape, dtype='u1')
@@ -194,15 +194,16 @@ def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, 
                     array.attrs["dlength"] = char_length
                 else:
                     try:
-                        array = h5column_output.require_dataset('data', shape=shape, dtype=dtype.newbyteorder(byteorder))
+                        array = h5column_output.require_dataset('data', shape=shape, dtype=dtype.numpy.newbyteorder(byteorder))
                     except:
                         logging.exception("error creating dataset for %r, with type %r " % (column_name, dtype))
                         del h5columns_output[column_name]
                         column_names.remove(column_name)
+                        continue
                 array[0] = array[0]  # make sure the array really exists
 
                 data = dataset.evaluate(column_name, 0, 1, parallel=False)
-                if np.ma.isMaskedArray(data):
+                if dataset.is_masked(column_name):
                     mask = h5column_output.require_dataset('mask', shape=shape, dtype=np.bool)
                     mask[0] = mask[0]  # make sure the array really exists
         random_index_name = None
@@ -241,7 +242,7 @@ def export_hdf5(dataset, path, column_names=None, byteorder="=", shuffle=False, 
 
     column_names = vaex.export._export(dataset_input=dataset, dataset_output=df_output, path=path, random_index_column=random_index_name,
                                        column_names=column_names, selection=selection, shuffle=shuffle, byteorder=byteorder,
-                                       progress=progress, sort=sort, ascending=ascending)
+                                       progress=progress, sort=sort, ascending=ascending, parallel=parallel)
     dataset_output._freeze()
     # We aren't really making use of the metadata, we could put this back in some form in the future
     # import getpass

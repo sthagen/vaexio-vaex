@@ -10,6 +10,7 @@ Opening/reading in your data.
 .. autosummary::
 
     vaex.open
+    vaex.concat
     vaex.from_arrow_table
     vaex.from_arrays
     vaex.from_dict
@@ -23,11 +24,13 @@ Visualization.
 
 .. autosummary::
 
-    vaex.dataframe.DataFrame.plot
-    vaex.dataframe.DataFrame.plot1d
-    vaex.dataframe.DataFrame.scatter
-    vaex.dataframe.DataFrame.plot_widget
-    vaex.dataframe.DataFrame.healpix_plot
+    vaex.dataframe.DataFrame.viz.heatmap
+    vaex.dataframe.DataFrame.viz.histogram
+    vaex.dataframe.DataFrame.viz.scatter
+    vaex.dataframe.DataFrame.viz.healpix_heatmap
+    vaex.dataframe.Expression.viz.histogram
+    vaex.dataframe.DataFrame.widget.heatmap
+    vaex.dataframe.DataFrame.widget.histgram
 
 
 Statistics.
@@ -55,7 +58,7 @@ vaex-core
 ---------
 
 .. automodule:: vaex
-    :members: open, from_arrays, from_dict, from_items, from_arrow_table, from_csv, from_ascii, from_pandas, from_astropy_table, from_samp, open_many, register_function, server, example, app, delayed
+    :members: open, concat, from_arrays, from_dict, from_items, from_arrow_table, from_csv, from_ascii, from_pandas, from_astropy_table, from_samp, open_many, register_function, server, example, app, delayed
     :undoc-members:
     :show-inheritance:
 
@@ -147,6 +150,17 @@ Jupyter widgets accessor
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. autoclass:: vaex.jupyter.DataFrameAccessorWidget
+     :members:
+     :special-members:
+
+Viz accessors
+~~~~~~~~~~~~~
+
+.. autoclass:: vaex.viz.DataFrameAccessorViz
+     :members:
+     :special-members:
+
+.. autoclass:: vaex.viz.ExpressionAccessorViz
      :members:
      :special-members:
 
