@@ -396,6 +396,8 @@ class DataFrame(object):
                 ar = _to_string_sequence(ar)
                 if not transient:
                     assert ar is previous_ar.string_sequence
+            else:
+                ar = vaex.array_types.to_numpy(ar)
             if np.ma.isMaskedArray(ar):
                 mask = np.ma.getmaskarray(ar)
                 sets[thread_index].update(ar, mask)
@@ -2203,7 +2205,7 @@ class DataFrame(object):
                      active_range=[self._index_start, self._index_end])
         return state
 
-    def state_set(self, state, use_active_range=False, trusted=True):
+    def state_set(self, state, use_active_range=False, keep_columns=None, set_filter=True, trusted=True):
         """Sets the internal state of the df
 
         Example:
@@ -2235,11 +2237,18 @@ class DataFrame(object):
 
         :param state: dict as returned by :meth:`DataFrame.state_get`.
         :param bool use_active_range: Whether to use the active range or not.
+        :param list keep_columns: List of columns that should be kept if the state to be set contains less columns.
+        :param bool set_filter: Set the filter from the state (default), or leave the filter as it is it.
         """
         self.description = state['description']
         if use_active_range:
             self._index_start, self._index_end = state['active_range']
         self._length_unfiltered = self._index_end - self._index_start
+        if keep_columns:
+            all_columns = self.get_column_names()
+            for column_name in keep_columns:
+                if column_name not in all_columns:
+                    raise KeyError(f'Column name {column_name} does not exist')
         if 'renamed_columns' in state:
             for old, new in state['renamed_columns']:
                 self._rename(old, new)
@@ -2254,6 +2263,8 @@ class DataFrame(object):
                 self[name] = self._expr(value)
                 # self._save_assign_expression(name)
             self.column_names = list(state['column_names'])
+            if keep_columns:
+                self.column_names += list(keep_columns)
             for name in self.column_names:
                 self._save_assign_expression(name)
         else:
@@ -2266,6 +2277,8 @@ class DataFrame(object):
         units = {key: astropy.units.Unit(value) for key, value in state["units"].items()}
         self.units.update(units)
         for name, selection_dict in state['selections'].items():
+            if name == FILTER_SELECTION_NAME and not set_filter:
+                continue
             # TODO: make selection use the vaex.serialize framework
             if selection_dict is None:
                 selection = None
@@ -2273,7 +2286,7 @@ class DataFrame(object):
                 selection = selections.selection_from_dict(selection_dict)
             self.set_selection(selection, name=name)
 
-    def state_write(self, file, fs_options=None):
+    def state_write(self, file, fs_options=None, fs=None):
         """Write the internal state to a json or yaml file (see :meth:`DataFrame.state_get`)
 
         Example
@@ -2341,16 +2354,15 @@ class DataFrame(object):
         :param dict fs_options: arguments to pass the the file system handler (s3fs or gcsfs)
         """
         fs_options = fs_options or {}
-        vaex.utils.write_json_or_yaml(file, self.state_get(), fs_options=fs_options)
+        vaex.utils.write_json_or_yaml(file, self.state_get(), fs_options=fs_options, fs=fs)
 
-    def state_load(self, file, use_active_range=False, fs_options=None):
+    def state_load(self, file, use_active_range=False, fs_options=None, fs=None):
         """Load a state previously stored by :meth:`DataFrame.state_write`, see also :meth:`DataFrame.state_set`.
 
         :param str file: filename (ending in .json or .yaml)
         :param dict fs_options: arguments to pass the the file system handler (s3fs or gcsfs)
         """
-        fs_options = fs_options or {}
-        state = vaex.utils.read_json_or_yaml(file, fs_options=fs_options)
+        state = vaex.utils.read_json_or_yaml(file, fs_options=fs_options, fs=fs)
         self.state_set(state, use_active_range=use_active_range)
 
     def remove_virtual_meta(self):
@@ -5854,7 +5866,7 @@ class DataFrameLocal(DataFrame):
         return left
 
     @docsubst
-    def export(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, fs_options=None):
+    def export(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, fs_options=None, fs=None):
         """Exports the DataFrame to a file depending on the file extension.
 
         E.g if the filename ends on .hdf5, `df.export_hdf5` is called.
@@ -5869,20 +5881,22 @@ class DataFrameLocal(DataFrame):
         naked_path, options = vaex.file.split_options(path)
         fs_options = fs_options or {}
         if naked_path.endswith('.arrow'):
-            self.export_arrow(path, progress=progress, chunk_size=chunk_size, parallel=parallel, fs_options=fs_options)
+            self.export_arrow(path, progress=progress, chunk_size=chunk_size, parallel=parallel, fs_options=fs_options, fs=fs)
+        elif naked_path.endswith('.feather'):
+            self.export_feather(path, parallel=parallel, fs_options=fs_options)
         elif naked_path.endswith('.hdf5'):
             self.export_hdf5(path, progress=progress, parallel=parallel)
         elif naked_path.endswith('.fits'):
             self.export_fits(path, progress=progress)
         elif naked_path.endswith('.parquet'):
-            self.export_parquet(path, progress=progress, parallel=parallel, chunk_size=chunk_size, fs_options=fs_options)
+            self.export_parquet(path, progress=progress, parallel=parallel, chunk_size=chunk_size, fs_options=fs_options, fs=fs)
         elif naked_path.endswith('.csv'):
             self.export_csv(path, progress=progress, parallel=parallel, chunk_size=chunk_size)
         else:
             raise ValueError('''Unrecognized file extension. Please use .arrow, .hdf5, .parquet, .fits, or .csv to export to the particular file format.''')
 
     @docsubst
-    def export_arrow(self, to, progress=None, chunk_size=default_chunk_size, parallel=True, reduce_large=True, fs_options=None, as_stream=True):
+    def export_arrow(self, to, progress=None, chunk_size=default_chunk_size, parallel=True, reduce_large=True, fs_options=None, fs=None, as_stream=True):
         """Exports the DataFrame to a file of stream written with arrow
 
         :param to: filename, file object, or :py:data:`pyarrow.RecordBatchStreamWriter`, py:data:`pyarrow.RecordBatchFileWriter` or :py:data:`pyarrow.parquet.ParquetWriter`
@@ -5910,8 +5924,7 @@ class DataFrameLocal(DataFrame):
 
         if vaex.file.is_path_like(to):
             schema = self[0:1].to_arrow_table(parallel=False, reduce_large=reduce_large).schema
-            fs_options = fs_options or {}
-            with vaex.file.open(path=to, mode='wb', fs_options=fs_options) as sink:
+            with vaex.file.open(path=to, mode='wb', fs_options=fs_options, fs=fs) as sink:
                 if as_stream:
                     with pa.RecordBatchStreamWriter(sink, schema) as writer:
                         write(writer)
@@ -5922,7 +5935,28 @@ class DataFrameLocal(DataFrame):
             write(to)
 
     @docsubst
-    def export_parquet(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, fs_options=None, **kwargs):
+    def export_feather(self, to, parallel=True, reduce_large=True, compression='lz4', fs_options=None, fs=None):
+        """Exports the DataFrame to an arrow file using the feather file format version 2
+
+        Feather is exactly represented as the Arrow IPC file format on disk, but also support compression.
+            see also https://arrow.apache.org/docs/python/feather.html
+
+        :param to: filename or file object
+        :param bool parallel: {evaluate_parallel}
+        :param bool reduce_large: If True, convert arrow large_string type to string type
+        :param compression: Can be one of 'zstd', 'lz4' or 'uncompressed'
+        :param fs_options: {fs_options}
+        :param fs: {fs}
+        :return:
+        """
+        import pyarrow.feather as feather
+        table = self.to_arrow_table(parallel=False, reduce_large=reduce_large)
+        fs_options = fs_options or {}
+        with vaex.file.open(path=to, mode='wb', fs_options=fs_options, fs=fs) as sink:
+            feather.write_feather(table, sink, compression=compression)
+
+    @docsubst
+    def export_parquet(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, fs_options=None, fs=None, **kwargs):
         """Exports the DataFrame to a parquet file.
 
         Note: This may require that all of the data fits into memory (memory mapped data is an exception).
@@ -5933,17 +5967,18 @@ class DataFrameLocal(DataFrame):
         :param int chunk_size: {chunk_size_export}
         :param bool parallel: {evaluate_parallel}
         :param dict fs_options: {fs_options}
+        :param fs: {fs}
         :param **kwargs: Extra keyword arguments to be passed on to py:data:`pyarrow.parquet.ParquetWriter`.
         :return:
         """
         import pyarrow.parquet as pq
         schema = self[0:1].to_arrow_table(parallel=False, reduce_large=True).schema
-        with vaex.file.open(path=path, mode='wb', fs_options=fs_options) as sink:
+        with vaex.file.open(path=path, mode='wb', fs_options=fs_options, fs=fs) as sink:
             with pq.ParquetWriter(sink, schema, **kwargs) as writer:
                 self.export_arrow(writer, progress=progress, chunk_size=chunk_size, parallel=parallel, reduce_large=True)
 
     @docsubst
-    def export_partitioned(self, path, by, directory_format='{key}={value}', progress=None, chunk_size=default_chunk_size, parallel=True, fs_options=None):
+    def export_partitioned(self, path, by, directory_format='{key}={value}', progress=None, chunk_size=default_chunk_size, parallel=True, fs_options={}, fs=None):
         '''Expertimental: export files using hive partitioning.
 
         If no extension is found in the path, we assume parquet files. Otherwise you can specify the
@@ -5988,13 +6023,13 @@ class DataFrameLocal(DataFrame):
             uuid = uuid4()
             fullpath = path.format(uuid=uuid, subdir=subdir, i=i)
             dirpath = os.path.dirname(fullpath)
-            vaex.file.create_dir(dirpath, fs_options=fs_options)
+            vaex.file.create_dir(dirpath, fs_options=fs_options, fs=fs)
             progressbar((i)/len(groups))
-            df[columns].export(fullpath, chunk_size=chunk_size, parallel=parallel, fs_options=fs_options)
+            df[columns].export(fullpath, chunk_size=chunk_size, parallel=parallel, fs_options=fs_options, fs=fs)
         progressbar(1)
 
     @docsubst
-    def export_many(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, max_workers=None, fs_options=None):
+    def export_many(self, path, progress=None, chunk_size=default_chunk_size, parallel=True, max_workers=None, fs_options=None, fs=None):
         """Export the DataFrame to multiple files of the same type in parallel.
 
         The path will be formatted using the i parameter (which is the chunk index).
@@ -6033,7 +6068,7 @@ class DataFrameLocal(DataFrame):
             i1, i2, chunks = item
             p = str(path).format(i=i, i1=i2, i2=i2)
             df = vaex.from_dict(chunks)
-            df.export(p, chunk_size=None, parallel=False, fs_options=fs_options)
+            df.export(p, chunk_size=None, parallel=False, fs_options=fs_options, fs=fs)
             return i2
         progressbar = vaex.utils.progressbars(progress)
         progressbar(0)

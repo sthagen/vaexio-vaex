@@ -15,8 +15,11 @@ def ensure_not_chunked(arrow_array):
         table = pa.Table.from_arrays([arrow_array], ["single"])
         table_concat = table.combine_chunks()
         column = table_concat.columns[0]
-        assert column.num_chunks == 1
-        arrow_array = column.chunk(0)
+        if column.num_chunks == 1:
+            arrow_array = column.chunk(0)
+        else:
+            assert column.num_chunks == 0
+            arrow_array = pa.array([], type=arrow_array.type)
     return arrow_array
 
 
@@ -233,8 +236,7 @@ def trim_buffers_ipc(ar):
             assert table.num_columns == 1
             assert table.num_rows == len(ar)
             trimmed_ar = table.column(0)
-    if isinstance(trimmed_ar, pa.ChunkedArray):
-        assert len(trimmed_ar.chunks) == 1
+    if isinstance(trimmed_ar, pa.ChunkedArray) and len(trimmed_ar.chunks) == 1:
         trimmed_ar = trimmed_ar.chunks[0]
 
     return trimmed_ar
