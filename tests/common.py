@@ -350,16 +350,19 @@ def create_base_ds():
     return df._readonly()
 
 
+def create_numpy_array(x):
+    if isinstance(x, np.ndarray):
+        return x
+    mask = [k is None for k in x]
+    if any(mask):
+        x = [x[0] if k is None else k for k in x]
+        return np.ma.array(x, mask=mask)
+    else:
+        return np.array(x)
+
 @pytest.fixture(scope='session')
 def array_factory_numpy():
-    def create(x):
-        mask = [k is None for k in x]
-        if any(mask):
-            x = [x[0] if k is None else k for k in x]
-            return np.ma.array(x, mask=mask)
-        else:
-            return np.array(x)
-    return create
+    return create_numpy_array
 
 
 @pytest.fixture(scope='session')
@@ -399,7 +402,11 @@ def df_factory(request, df_factory_numpy, df_factory_arrow, df_factory_arrow_chu
 
 @pytest.fixture(scope='session')
 def df_factory_numpy():
-    return vaex.from_arrays
+    def create(**kwargs):
+        arrays = {key: create_numpy_array(value) for key, value in kwargs.items()}
+        print(kwargs, arrays)
+        return vaex.from_arrays(**arrays)
+    return create
 
 
 @pytest.fixture(scope='session')
@@ -444,3 +451,14 @@ def df_example_original():
 @pytest.fixture(scope='session')
 def df_example(df_example_original, df_factory):
    return df_factory(**df_example_original.to_dict())
+
+
+@pytest.fixture(scope='session')
+def df_types():
+    data = ['aap', 'noot', None], None, [], ['aap', 'noot', 'mies']
+    string_list = pa.array(data)
+
+    data = [1, 2, None], None, [], [1, 3, 4, 5]
+    int_list = pa.array(data)
+
+    return vaex.from_arrays(string_list=string_list, int_list=int_list)

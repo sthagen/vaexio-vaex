@@ -7,6 +7,7 @@ from vaex import column
 from vaex.column import _to_string_sequence, _to_string_column, _to_string_list_sequence, _is_stringy
 from vaex.dataframe import docsubst
 import vaex.arrow.numpy_dispatch
+import vaex.arrow.utils
 import re
 import vaex.expression
 import functools
@@ -113,6 +114,22 @@ def register_function(scope=None, as_property=False, name=None, on_expression=Tr
         return f  # we leave the original function as is
     return wrapper
 
+
+def auto_str_unwrap(f):
+    '''Will take the first argument, and if a list, will unwrap/unraval, and apply f, and wrap again'''
+    @functools.wraps(f)
+    def decorated(x, *args, **kwargs):
+        if not isinstance(x, vaex.column.supported_column_types):
+            return f(x, *args, **kwargs)
+        dtype = vaex.dtype_of(x)
+        if dtype.is_list:
+            x, wrapper = vaex.arrow.utils.list_unwrap(x)
+            x = f(x, *args, **kwargs)
+            return wrapper(x)
+        else:
+            return f(x, *args, **kwargs)
+    return decorated
+
 # name maps to numpy function
 # <vaex name>:<numpy name>
 numpy_function_mapping = [name.strip().split(":") if ":" in name else (name, name) for name in """
@@ -147,7 +164,6 @@ sinh
 sqrt
 tan
 tanh
-where
 """.strip().split()]
 for name, numpy_name in numpy_function_mapping:
     if not hasattr(np, numpy_name):
@@ -173,15 +189,45 @@ for name, numpy_name in numpy_function_mapping:
 
 
 @register_function()
+def list_sum(ar,  fill_empty=0):
+    fill_missing_item = 0  # a missing value gets replaced by 0, so it is effectively ignored
+    fill_empty = 0  # empty list [], would result in 0
+    # TODO: we might want to extract some of this to vaex.arrow.utils or even
+    # upstream (it Arrow)
+    dtype = vaex.dtype_of(ar)
+    assert dtype.is_list
+    offsets = vaex.array_types.to_numpy(ar.offsets)
+    values = pc.fill_null(ar.values.slice(offsets[0]), fill_missing_item)
+    values = vaex.array_types.to_numpy(values)
+
+    zero_length = (offsets[1:] - offsets[:-1]) == 0
+    if len(zero_length) == 1:  # special case, values is an empy array
+        return pa.array([fill_empty], type=dtype.value_type.arrow)
+
+    # we skip over empty lists and nulls, otherwise we'll have indices of -1
+    skips = (~zero_length).argmax(axis=0)
+    cumsum = values.cumsum()
+    list_end_offset = offsets[skips+1:] - offsets[0] - 1
+    sums = np.diff(cumsum[list_end_offset], prepend=0)
+    if skips:
+        sums = np.concatenate([np.zeros(skips, dtype=sums.dtype), sums])
+
+    if fill_empty != 0:  # by default this is already the case
+        sums[zero_length] = fill_empty
+    sums = vaex.array_types.to_arrow(sums)
+    from .arrow.utils import combine_missing
+    sums = combine_missing(sums, ar)
+    return sums
+
+
+@register_function()
 def fillmissing(ar, value):
     '''Returns an array where missing values are replaced by value.
     See :`ismissing` for the definition of missing values.
     '''
-    # TODO: optimize once https://github.com/apache/arrow/pull/7656 gets in
-    was_string = _is_stringy(ar)
-    if was_string:
-        ar = np.array(ar)
-
+    dtype = vaex.dtype_of(ar)
+    if dtype == str:
+        return pc.fill_null(ar, value)
     ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
     mask = ismissing(ar)
     if np.any(mask):
@@ -190,8 +236,6 @@ def fillmissing(ar, value):
         else:
             ar = ar.copy()
         ar[mask] = value
-    if was_string:
-        vaex.array_types.to_arrow(ar)
     return ar
 
 
@@ -219,6 +263,10 @@ def fillna(ar, value):
     See :`isna` for the definition of missing values.
 
     '''
+    dtype = vaex.dtype_of(ar)
+    if dtype == str:
+        # str cannot contain anything other than missing values
+        return fillmissing(ar, value)
     # TODO: should use arrow fill_null in the future
     if isinstance(ar, vaex.array_types.supported_arrow_array_types):
         ar = fillna(vaex.array_types.to_numpy(ar, strict=True), value)
@@ -939,6 +987,7 @@ def td_total_seconds(x):
 ########## string operations ##########
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_equals(x, y):
     """Tests if strings x and y are the same
 
@@ -988,6 +1037,7 @@ def str_equals(x, y):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_capitalize(x):
     """Capitalize the first letter of a string sample.
 
@@ -1020,6 +1070,7 @@ def str_capitalize(x):
     return column.ColumnStringArrow.from_string_sequence(sl)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_cat(x, other):
     """Concatenate two string columns on a row-by-row basis.
 
@@ -1060,6 +1111,7 @@ def str_cat(x, other):
     return column.ColumnStringArrow.from_string_sequence(sl)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_center(x, width, fillchar=' '):
     """ Fills the left and right side of the strings with additional characters, such that the sample has a total of `width`
     characters.
@@ -1096,6 +1148,7 @@ def str_center(x, width, fillchar=' '):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_contains(x, pattern, regex=True):
     """Check if a string pattern or regex is contained within a sample of a string column.
 
@@ -1135,6 +1188,7 @@ def str_contains(x, pattern, regex=True):
 
 # TODO: default regex is False, which breaks with pandas
 @register_function(scope='str')
+@auto_str_unwrap
 def str_count(x, pat, regex=False):
     """Count the occurences of a pattern in sample of a string column.
 
@@ -1170,6 +1224,7 @@ def str_count(x, pat, regex=False):
 # TODO: what to do with decode and encode
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_endswith(x, pat):
     """Check if the end of each string sample matches the specified pattern.
 
@@ -1220,6 +1275,7 @@ def str_endswith(x, pat):
 # TODO: extract/extractall
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_find(x, sub, start=0, end=None):
     """Returns the lowest indices in each string in a column, where the provided substring is fully contained between within a
     sample. If the substring is not found, -1 is returned.
@@ -1259,6 +1315,7 @@ def str_find(x, sub, start=0, end=None):
 # TODO get/index/join
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_get(x, i):
     """Extract a character from each sample at the specified position from a string column.
     Note that if the specified position is out of bound of the string sample, this method returns '', while pandas retunrs nan.
@@ -1298,6 +1355,7 @@ def str_get(x, i):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_index(x, sub, start=0, end=None):
     """Returns the lowest indices in each string in a column, where the provided substring is fully contained between within a
     sample. If the substring is not found, -1 is returned. It is the same as `str.find`.
@@ -1332,14 +1390,29 @@ def str_index(x, sub, start=0, end=None):
     """
     return str_find(x, sub, start, end)
 
+
 @register_function(scope='str')
 def str_join(x, sep):
     """Same as find (difference with pandas is that it does not raise a ValueError)"""
-    sl = _to_string_list_sequence(x).join(sep)
-    return column.ColumnStringArrow.from_string_sequence(sl)
+    dtype = vaex.dtype_of(x)
+    if not dtype.is_list:
+        raise TypeError(f'join expected a list, not {x}')
+
+    x, wrapper = vaex.arrow.utils.list_unwrap(x, level=-2)
+    values = x.values
+    offsets = vaex.array_types.to_numpy(x.offsets)
+    ss = _to_string_sequence(values)
+    x_joined_ss = vaex.strings.join(sep, offsets, ss, x.offset)
+    # TODO: we require a copy here, because the x_column and the string_seqence will be
+    # garbage collected, this is not idea, but once https://github.com/apache/arrow/pull/8990 is
+    # released, we can rely on that
+    x_column = column.ColumnStringArrow.from_string_sequence(x_joined_ss)
+    x_joined = pa.array(x_column)
+    return wrapper(x_joined)
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_len(x):
     """Returns the length of a string sample.
 
@@ -1371,6 +1444,7 @@ def str_len(x):
     return _to_string_sequence(x).len()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_byte_length(x):
     """Returns the number of bytes in a string sample.
 
@@ -1402,6 +1476,7 @@ def str_byte_length(x):
     return _to_string_sequence(x).byte_length()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_ljust(x, width, fillchar=' '):
     """Fills the right side of string samples with a specified character such that the strings are right-hand justified.
 
@@ -1437,6 +1512,7 @@ def str_ljust(x, width, fillchar=' '):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_lower(x):
     """Converts string samples to lower case.
 
@@ -1471,6 +1547,7 @@ def str_lower(x):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_lstrip(x, to_strip=None):
     """Remove leading characters from a string sample.
 
@@ -1506,6 +1583,7 @@ def str_lstrip(x, to_strip=None):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_match(x, pattern):
     """Check if a string sample matches a given regular expression.
 
@@ -1540,6 +1618,7 @@ def str_match(x, pattern):
 # TODO: normalize, partition
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_pad(x, width, side='left', fillchar=' '):
     """Pad strings in a given column.
 
@@ -1576,6 +1655,7 @@ def str_pad(x, width, side='left', fillchar=' '):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_repeat(x, repeats):
     """Duplicate each string in a column.
 
@@ -1610,6 +1690,7 @@ def str_repeat(x, repeats):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_replace(x, pat, repl, n=-1, flags=0, regex=False):
     """Replace occurences of a pattern/regex in a column with some other string.
 
@@ -1648,6 +1729,7 @@ def str_replace(x, pat, repl, n=-1, flags=0, regex=False):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_rfind(x, sub, start=0, end=None):
     """Returns the highest indices in each string in a column, where the provided substring is fully contained between within a
     sample. If the substring is not found, -1 is returned.
@@ -1683,6 +1765,7 @@ def str_rfind(x, sub, start=0, end=None):
     return _to_string_sequence(x).find(sub, start, 0 if end is None else end, end is None, False)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_rindex(x, sub, start=0, end=None):
     """Returns the highest indices in each string in a column, where the provided substring is fully contained between within a
     sample. If the substring is not found, -1 is returned. Same as `str.rfind`.
@@ -1718,6 +1801,7 @@ def str_rindex(x, sub, start=0, end=None):
     return str_rfind(x, sub, start, end)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_rjust(x, width, fillchar=' '):
     """Fills the left side of string samples with a specified character such that the strings are left-hand justified.
 
@@ -1755,6 +1839,7 @@ def str_rjust(x, width, fillchar=' '):
 # TODO: rpartition
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_rstrip(x, to_strip=None):
     """Remove trailing characters from a string sample.
 
@@ -1790,6 +1875,7 @@ def str_rstrip(x, to_strip=None):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_slice(x, start=0, stop=None):  # TODO: support n
     """Slice substrings from each string element in a column.
 
@@ -1827,18 +1913,32 @@ def str_slice(x, start=0, stop=None):  # TODO: support n
     return column.ColumnStringArrow.from_string_sequence(ss)
 
 # TODO: slice_replace (not sure it this makes sense)
-# TODO: n argument and rsplit
-@register_function(scope='str')
-def str_split(x, pattern=None):  # TODO: support n
-    x = _to_string_sequence(x)
-    if isinstance(x, vaex.strings.StringArray):
-        x = x.to_arrow()
-    if pattern == '':
-        raise ValueError('empty separator')
-    sll = x.split('' if pattern is None else pattern)
-    return sll
 
 @register_function(scope='str')
+@auto_str_unwrap
+def str_rsplit(x, pattern=None, max_splits=-1):
+    if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+        x = pa.array(x)
+    if pattern is None:
+        return pc.utf8_split_whitespace(x, reverse=True, max_splits=max_splits)
+    else:
+        return pc.split_pattern(x, reverse=True, max_splits=max_splits)
+
+
+@register_function(scope='str')
+@auto_str_unwrap
+def str_split(x, pattern=None, max_splits=-1):
+    if not isinstance(x, vaex.array_types.supported_arrow_array_types):
+        x = pa.array(x)
+    if pattern is None:
+        return pc.utf8_split_whitespace(x, max_splits=max_splits)
+    else:
+        return pc.split_pattern(x, pattern=pattern, max_splits=max_splits)
+
+
+
+@register_function(scope='str')
+@auto_str_unwrap
 def str_startswith(x, pat):
     """Check if a start of a string matches a pattern.
 
@@ -1871,6 +1971,7 @@ def str_startswith(x, pat):
     return _to_string_sequence(x).startswith(pat)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_strip(x, to_strip=None):
     """Removes leading and trailing characters.
 
@@ -1912,6 +2013,7 @@ def str_strip(x, to_strip=None):
 # TODO: swapcase, translate
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_title(x):
     """Converts all string samples to titlecase.
 
@@ -1946,6 +2048,7 @@ def str_title(x):
 
 @register_function(scope='str')
 @docsubst
+@auto_str_unwrap
 def str_upper(x, ascii=False):
     """Converts all strings in a column to uppercase.
 
@@ -1988,6 +2091,7 @@ def str_upper(x, ascii=False):
 # TODO: wrap, is*, get_dummies(maybe?)
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_zfill(x, width):
     """Pad strings in a column by prepanding "0" characters.
 
@@ -2023,6 +2127,7 @@ def str_zfill(x, width):
 
 @register_function(scope='str')
 @docsubst
+@auto_str_unwrap
 def str_isalnum(x, ascii=False):
     """Check if all characters in a string sample are alphanumeric.
 
@@ -2059,6 +2164,7 @@ def str_isalnum(x, ascii=False):
 
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_isalpha(x):
     """Check if all characters in a string sample are alphabetic.
 
@@ -2090,6 +2196,7 @@ def str_isalpha(x):
     return _to_string_sequence(x).isalpha()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_isdigit(x):
     """Check if all characters in a string sample are digits.
 
@@ -2121,6 +2228,7 @@ def str_isdigit(x):
     return _to_string_sequence(x).isdigit()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_isspace(x):
     """Check if all characters in a string sample are whitespaces.
 
@@ -2152,6 +2260,7 @@ def str_isspace(x):
     return _to_string_sequence(x).isspace()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_islower(x):
     """Check if all characters in a string sample are lowercase characters.
 
@@ -2183,6 +2292,7 @@ def str_islower(x):
     return _to_string_sequence(x).islower()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_isupper(x):
     """Check if all characters in a string sample are lowercase characters.
 
@@ -2214,6 +2324,7 @@ def str_isupper(x):
     return _to_string_sequence(x).isupper()
 
 @register_function(scope='str')
+@auto_str_unwrap
 def str_istitle(x, ascii=False):
     '''TODO'''
     return _arrow_string_kernel_dispatch('is_title', ascii, x)
@@ -2306,6 +2417,30 @@ def _choose_masked(ar, choices):
     ar[mask] == 0  # we fill it in with some values, doesn't matter, since it is masked
     ar = choices[ar]
     return np.ma.array(ar, mask=mask)
+
+
+@register_function()
+def _map(ar, value_to_index, choices, default_value=None, use_missing=False, axis=None):
+    flatten = axis is None
+    if flatten:
+        import vaex.arrow.utils
+        ar, wrapper = vaex.arrow.utils.list_unwrap(ar)
+
+    if not isinstance(ar, vaex.array_types.supported_array_types) or isinstance(value_to_index, vaex.superutils.ordered_set_string):
+        # sometimes the dtype can be object, but seen as an string array
+        ar = _to_string_sequence(ar)
+        # -1 points to missing
+        indices = value_to_index.map_ordinal(ar) + 1
+    else:
+        ar = vaex.array_types.to_numpy(ar)
+        indices = value_to_index.map_ordinal(ar) + 1
+        if np.ma.isMaskedArray(ar):
+            mask = np.ma.getmaskarray(ar)
+            indices[mask] = 1  # missing values are at offset 1 (see expression.map)
+    values = choices.take(indices)
+    if flatten:
+        values = wrapper(values)
+    return values
 
 
 @register_function(name='float')
@@ -2422,3 +2557,60 @@ def add_geo_json(ds, json_or_file, column_name, longitude_expression, latitude_e
         return ds, mapping_dict
     else:
         return ds
+
+import vaex.arrow.numpy_dispatch
+
+@register_function()
+def where(condition, x, y):
+    # special where support for strings
+    # TODO: this should be replaced by an arrow compute function in the future
+    if type(x) == str:
+        if type(y) == str:
+            condition = vaex.array_types.to_arrow(condition).cast(pa.int8())
+            choices = pa.array([y, x])
+            values = choices.take(condition)
+            return values
+        else:
+            condition = vaex.array_types.to_arrow(condition)
+            indices = np.arange(len(y), dtype=np.int64)
+            # point to the last value
+            indices[vaex.array_types.to_numpy(condition)] = len(y)
+            indices = vaex.array_types.to_arrow(indices)
+
+            indices = vaex.arrow.numpy_dispatch.combine_missing(indices, condition)
+            y = vaex.array_types.to_arrow(y)
+            choices = vaex.array_types.concat([y, pa.array([x], type=y.type)])
+            values = choices.take(indices)
+            return values
+    elif type(y) == str:
+        condition = vaex.array_types.to_arrow(condition)
+        indices = np.arange(len(x), dtype=np.int64)
+        # point to the last value
+        indices[~vaex.array_types.to_numpy(condition)] = len(x)
+        indices = vaex.array_types.to_arrow(indices)
+
+        indices = vaex.arrow.numpy_dispatch.combine_missing(indices, condition)
+        x = vaex.array_types.to_arrow(x)
+        choices = vaex.array_types.concat([x, pa.array([y], type=x.type)])
+        values = choices.take(indices)
+        return values
+    elif vaex.column.is_column_like(x) and vaex.dtype_of(x).is_string:
+        assert vaex.dtype_of(y).is_string
+        condition = vaex.array_types.to_arrow(condition)
+        assert len(x) == len(y) == len(condition)
+        N = len(x)
+        indices = np.arange(N, dtype=np.int64)
+        mask = vaex.array_types.to_numpy(condition)
+        indices[~mask] += len(x)
+        indices = vaex.array_types.to_arrow(indices)
+
+        indices = vaex.arrow.numpy_dispatch.combine_missing(indices, condition)
+        x = vaex.array_types.to_arrow(x)
+        y = vaex.array_types.to_arrow(y)
+        x, y = vaex.arrow.convert.same_type(x, y)
+        choices = vaex.array_types.concat([x, y])
+        values = choices.take(indices)
+        return values
+    # default callback is on numpy
+    ar = np.where(condition, x, y)
+    return ar

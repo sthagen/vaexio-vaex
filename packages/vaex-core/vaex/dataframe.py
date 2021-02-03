@@ -372,7 +372,7 @@ class DataFrame(object):
             pass
         return self.map_reduce(map, reduce, expressions, delay=delay, progress=progress, name='nop', to_numpy=False)
 
-    def _set(self, expression, progress=False, selection=None, delay=False):
+    def _set(self, expression, progress=False, selection=None, flatten=True, delay=False):
         column = _ensure_string_from_expression(expression)
         columns = [column]
         from .hash import ordered_set_type_from_dtype
@@ -386,16 +386,16 @@ class DataFrame(object):
                 transient = True
 
         dtype = self.data_type(column)
-        ordered_set_type = ordered_set_type_from_dtype(dtype, transient)
+        dtype_item = self.data_type(column, axis=-1 if flatten else 0)
+        ordered_set_type = ordered_set_type_from_dtype(dtype_item, transient)
         sets = [None] * self.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
             if sets[thread_index] is None:
                 sets[thread_index] = ordered_set_type()
-            if vaex.array_types.is_string_type(dtype):
-                previous_ar = ar
+            if dtype.is_list and flatten:
+                ar = ar.values
+            if dtype_item.is_string:
                 ar = _to_string_sequence(ar)
-                if not transient:
-                    assert ar is previous_ar.string_sequence
             else:
                 ar = vaex.array_types.to_numpy(ar)
             if np.ma.isMaskedArray(ar):
@@ -471,13 +471,25 @@ class DataFrame(object):
             index0.merge(other)
         return index0
 
-    def unique(self, expression, return_inverse=False, dropna=False, dropnan=False, dropmissing=False, progress=False, selection=None, delay=False):
+    @docsubst
+    def unique(self, expression, return_inverse=False, dropna=False, dropnan=False, dropmissing=False, progress=False, selection=None, axis=None, delay=False, array_type='python'):
+        """Returns all unique values.
+
+        :param dropmissing: do not count missing values
+        :param dropnan: do not count nan values
+        :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        :param int axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
+        :param str array_type: {array_type}
+        """
         if dropna:
             dropnan = True
             dropmissing = True
+        if axis is not None:
+            raise ValueError('only axis=None is supported')
         expression = _ensure_string_from_expression(expression)
-        ordered_set = self._set(expression, progress=progress, selection=selection)
+        ordered_set = self._set(expression, progress=progress, selection=selection, flatten=axis is None)
         transient = True
+        data_type_item = self.data_type(expression, axis=-1)
         if return_inverse:
             # inverse type can be smaller, depending on length of set
             inverse = np.zeros(self._length_unfiltered, dtype=np.int64)
@@ -495,22 +507,11 @@ class DataFrame(object):
                 pass
             self.map_reduce(map, reduce, [expression], delay=delay, name='unique_return_inverse', info=True, to_numpy=False, selection=selection)
         keys = ordered_set.keys()
-        if not dropnan:
-            if ordered_set.has_nan:
-                keys = [np.nan] + keys
-        if self.is_string(expression):
-            if not dropmissing:
-                if ordered_set.has_null:
-                    # arrow handles None as missing
-                    keys = [None] + keys
-            keys = pa.array(keys)
-        else:
-            masked = False
-            if not dropmissing:
-                if ordered_set.has_null:
-                    masked = True
-                    keys = [np.ma.core.MaskedConstant()] + keys
-            keys = np.ma.asarray(keys) if masked else np.asarray(keys)
+        if not dropnan and ordered_set.has_nan:
+            keys = [math.nan] + keys
+        if not dropmissing and ordered_set.has_null:
+            keys = [None] + keys
+        keys = vaex.array_types.convert(keys, array_type)
         if return_inverse:
             return keys, inverse
         else:
@@ -673,6 +674,8 @@ class DataFrame(object):
         grid = self._create_grid(binby, limits, shape, selection=selection, delay=True)
         @delayed
         def compute(expression, grid, selection, edges, progressbar):
+            if not hasattr(self.local, '_aggregator_nest_count'):
+                self.local._aggregator_nest_count = 0
             self.local._aggregator_nest_count += 1
             try:
                 if expression in ["*", None]:
@@ -1936,7 +1939,7 @@ class DataFrame(object):
         return (rows,) + sample.shape[1:]
 
     # TODO: remove array_type and internal arguments?
-    def data_type(self, expression, array_type=None, internal=False):
+    def data_type(self, expression, array_type=None, internal=False, axis=0):
         """Return the datatype for the given expression, if not a column, the first row will be evaluated to get the data type.
 
         Example:
@@ -1944,6 +1947,7 @@ class DataFrame(object):
         >>> df = vaex.from_scalars(x=1, s='Hi')
 
         :param str array_type: 'numpy', 'arrow' or None, to indicate if the data type should be converted
+        :param int axis: If a nested type (like list), it will return the value_type of the nested type, axis levels deep.
         """
         expression = _ensure_string_from_expression(expression)
         data_type = None
@@ -1989,6 +1993,13 @@ class DataFrame(object):
         if not internal:
             if isinstance(data_type.internal, np.dtype) and data_type.kind in 'US':
                 return DataType(pa.string())
+
+        if axis != 0:
+            axis_data_type = [data_type]
+            while data_type.is_list:
+                data_type = data_type.value_type
+                axis_data_type.append(data_type)
+            data_type = axis_data_type[axis]
         return data_type
 
     @property

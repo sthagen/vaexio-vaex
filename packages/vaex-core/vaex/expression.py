@@ -13,6 +13,7 @@ import numpy as np
 import tabulate
 import pyarrow as pa
 from vaex.datatype import DataType
+from vaex.docstrings import docsubst
 
 from vaex.utils import _ensure_strings_from_expressions, _ensure_string_from_expression
 from vaex.column import ColumnString, _to_string_sequence
@@ -282,8 +283,8 @@ class Expression(with_metaclass(Meta)):
         return self.df.data_type(self.expression)
 
     # TODO: remove this method?
-    def data_type(self, array_type=None):
-        return self.df.data_type(self.expression)
+    def data_type(self, array_type=None, axis=0):
+        return self.df.data_type(self.expression, axis=axis)
 
     @property
     def shape(self):
@@ -537,12 +538,51 @@ class Expression(with_metaclass(Meta)):
         kwargs['expression'] = self.expression
         return self.ds.count(**kwargs)
 
-    def sum(self, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
-        '''Shortcut for ds.sum(expression, ...), see `Dataset.sum`'''
-        kwargs = dict(locals())
-        del kwargs['self']
-        kwargs['expression'] = self.expression
-        return self.ds.sum(**kwargs)
+    def sum(self, axis=None, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
+        '''Sum elements over given axis.
+
+        If no axis is given, it will sum over all axes.
+
+        For non list elements, this is a shortcut for ds.sum(expression, ...), see `Dataset.sum`.
+
+        >>> list_data = [1, 2, None], None, [], [1, 3, 4, 5]
+        >>> df = vaex.from_arrays(some_list=pa.array(list_data))
+        >>> df.some_list.sum().item()  # will sum over all axis
+        16
+        >>> df.some_list.sum(axis=1).tolist()  # sums the list elements
+        [3, None, 0, 13]
+
+        :param int axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
+        '''
+        expression = self
+        if axis is None:
+            axis = [0]
+            dtype = self.dtype
+            while dtype.is_list:
+                axis.append(axis[-1] + 1)
+                dtype = dtype.value_type
+        elif not isinstance(axis, list):
+            axis = [axis]
+            axis = list(set(axis))  # remove repeated elements
+        dtype = self.dtype
+        if 1 in axis:
+            if self.dtype.is_list:
+                expression = expression.list_sum()
+                if axis:
+                    axis.remove(1)
+            else:
+                raise ValueError(f'axis=1 not supported for dtype={dtype}')
+        if axis and axis[0] != 0:
+            raise ValueError(f'Only axis 0 or 1 is supported')
+        if axis is None or 0 in axis:
+            kwargs = dict(locals())
+            del kwargs['self']
+            del kwargs['axis']
+            del kwargs['dtype']
+            kwargs['expression'] = expression.expression
+            return self.ds.sum(**kwargs)
+        else:
+            return expression
 
     def mean(self, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
         '''Shortcut for ds.mean(expression, ...), see `Dataset.mean`'''
@@ -600,7 +640,7 @@ class Expression(with_metaclass(Meta)):
         """Alias to df.is_masked(expression)"""
         return self.ds.is_masked(self.expression)
 
-    def value_counts(self, dropna=False, dropnan=False, dropmissing=False, ascending=False, progress=False):
+    def value_counts(self, dropna=False, dropnan=False, dropmissing=False, ascending=False, progress=False, axis=None):
         """Computes counts of unique values.
 
          WARNING:
@@ -611,10 +651,15 @@ class Expression(with_metaclass(Meta)):
         :param dropnan: when True, it will not report the nans(see :func:`Expression.isnan`)
         :param dropmissing: when True, it will not report the missing values (see :func:`Expression.ismissing`)
         :param ascending: when False (default) it will report the most frequent occuring item first
+        :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         :returns: Pandas series containing the counts
         """
         from pandas import Series
+        if axis is not None:
+            raise ValueError('only axis=None is supported')
+
         data_type = self.data_type()
+        data_type_item = self.data_type(axis=-1)
 
         transient = self.transient or self.ds.filtered or self.ds.is_masked(self.expression)
         if self.is_string() and not transient:
@@ -623,16 +668,17 @@ class Expression(with_metaclass(Meta)):
             if not isinstance(ar, ColumnString):
                 transient = True
 
-        counter_type = counter_type_from_dtype(data_type, transient)
+        counter_type = counter_type_from_dtype(data_type_item, transient)
         counters = [None] * self.ds.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
             if counters[thread_index] is None:
                 counters[thread_index] = counter_type()
-            if vaex.array_types.is_string_type(data_type):
-                previous_ar = ar
+            if data_type.is_list and axis is None:
+                ar = ar.values
+            if data_type_item.is_string:
                 ar = _to_string_sequence(ar)
-                if not transient:
-                    assert ar is previous_ar.string_sequence
+            else:
+                ar = vaex.array_types.to_numpy(ar)
             if np.ma.isMaskedArray(ar):
                 mask = np.ma.getmaskarray(ar)
                 counters[thread_index].update(ar, mask)
@@ -686,37 +732,41 @@ class Expression(with_metaclass(Meta)):
 
         return Series(counts, index=index)
 
-    def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, delay=False):
+    @docsubst
+    def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, array_type='list', delay=False):
         """Returns all unique values.
 
         :param dropmissing: do not count missing values
         :param dropnan: do not count nan values
         :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
+        :param bool array_type: {array_type}
         """
-        return self.ds.unique(self.expression, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, delay=delay)
+        return self.ds.unique(self.expression, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, array_type=array_type, axis=axis, delay=delay)
 
-    def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, delay=False):
+    def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, delay=False):
         """Counts number of unique values, i.e. `len(df.x.unique()) == df.x.nunique()`.
 
         :param dropmissing: do not count missing values
         :param dropnan: do not count nan values
         :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         """
-        return len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, delay=delay))
+        return len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, delay=delay))
 
     def countna(self):
         """Returns the number of Not Availiable (N/A) values in the expression.
         This includes missing values and np.nan values.
         """
-        return self.isna().astype('int').sum().item()  # so the output is int, not array
+        return self.isna().sum().item()  # so the output is int, not array
 
     def countnan(self):
         """Returns the number of NaN values in the expression."""
-        return self.isnan().astype('int').sum().item()  # so the output is int, not array
+        return self.isnan().sum().item()  # so the output is int, not array
 
     def countmissing(self):
         """Returns the number of missing values in the expression."""
-        return self.ismissing().astype('int').sum().item()  # so the output is int, not array
+        return self.ismissing().sum().item()  # so the output is int, not array
 
     def evaluate(self, i1=None, i2=None, out=None, selection=None, parallel=True, array_type=None):
         return self.ds.evaluate(self, i1, i2, out=out, selection=selection, array_type=array_type, parallel=parallel)
@@ -777,9 +827,9 @@ def f({0}):
 
             module = imp.load_dynamic(module_name, module_path)
             function_name = "f_" + m.hexdigest()
-            expression_namespace[function_name] = module.f
+            function = self.ds.add_function(function_name, module.f, unique=True)
 
-            return Expression(self.ds, "{0}({1})".format(function_name, argstring))
+            return Expression(self.ds, "{0}({1})".format(function.name, argstring))
         finally:
                 logger.setLevel(log_level)
 
@@ -883,7 +933,7 @@ def f({0}):
         df = df.dropna(column_names=[self.expression])
         return df._expr(self.expression)
 
-    def map(self, mapper, nan_value=None, missing_value=None, default_value=None, allow_missing=False):
+    def map(self, mapper, nan_value=None, missing_value=None, default_value=None, allow_missing=False, axis=None):
         """Map values of an expression or in memory column according to an input
         dictionary or a custom callable function.
 
@@ -929,10 +979,13 @@ def f({0}):
         :param default_value: value to be used when a value is not in the mapper (like dict.get(key, default))
         :param allow_missing: used to signal that values in the mapper should map to a masked array with missing values,
             assumed True when default_value is not None.
+        :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         :return: A vaex expression
         :rtype: vaex.expression.Expression
         """
         assert isinstance(mapper, collectionsAbc.Mapping), "mapper should be a dict like object"
+        if axis is not None:
+            raise ValueError('only axis=None is supported')
 
         df = self.ds
         mapper_keys = list(mapper.keys())
@@ -949,9 +1002,18 @@ def f({0}):
         mapper_has_nan = mapper_nan_key_mask.sum() > 0
         if mapper_nan_key_mask.sum() > 1:
             raise ValueError('Insanity, you provided multiple nan values as keys for your dict')
+        if mapper_has_nan:
+            for key, value in mapper.items():
+                if key != key:
+                    nan_value = value
+        for key, value in mapper.items():
+            if key is None:
+                missing_value = value
 
+        if axis is not None:
+            raise ValueError('only axis=None is supported')
         # we map the keys to a ordinal values [0, N-1] using the set
-        key_set = df._set(self.expression)
+        key_set = df._set(self.expression, flatten=axis is None)
         found_keys = key_set.keys()
 
         # we want all possible values to be converted
@@ -979,28 +1041,36 @@ def f({0}):
         # note that here we map 'planned' unknown values to the default values
         # and later on in _choose, we map values not even seen in the dataframe
         # to the default_value
-        choices = [mapper.get(key, default_value) for key in found_keys]
-        if key_set.has_nan:
-            if mapper_has_nan:
-                # since np.nan is not np.nan/2, we have to use the real key object
-                nan_index = np.arange(len(mapper_keys))[mapper_nan_key_mask][0]
-                nan_key_used = mapper_keys[nan_index]
-                choices = [mapper[nan_key_used]] + choices
-            else:
-                choices = [nan_value] + choices
-        if key_set.has_null:
-            choices = [missing_value] + choices
-        choices = np.array(choices)
+        dtype = self.data_type(self.expression)
+        dtype_item = self.data_type(self.expression, axis=-1)
+        if dtype_item.is_float:
+            print(nan_value)
+            values  = [np.nan, None] + [key for key in mapper if key == key and key is not None]
+            choices = [default_value, nan_value, missing_value] + [mapper[key] for key in mapper if key == key and key is not None]
+        else:
+            values  = [None] + [key for key in mapper if key is not None]
+            choices = [default_value, missing_value] + [mapper[key] for key in mapper if key is not None]
+        values = pa.array(values)
+        choices = pa.array(choices)
+        from .hash import ordered_set_type_from_dtype
+        ordered_set_type = ordered_set_type_from_dtype(dtype_item)
+        ordered_set = ordered_set_type()
+        if vaex.array_types.is_string_type(dtype_item):
+            values = _to_string_sequence(values)
+        else:
+            values = vaex.array_types.to_numpy(values)
+        if np.ma.isMaskedArray(values):
+            mask = np.ma.getmaskarray(values)
+            ordered_set.update(values.data, mask)
+        else:
+            ordered_set.update(values)
 
-        key_set_name = df.add_variable('map_key_set', key_set, unique=True)
+        key_set_name = df.add_variable('map_key_set', ordered_set, unique=True)
         choices_name = df.add_variable('map_choices', choices, unique=True)
         if allow_missing:
-            if use_masked_array:
-                expr = '_choose_masked(_ordinal_values({}, {}), {})'.format(self, key_set_name, choices_name)
-            else:
-                expr = '_choose(_ordinal_values({}, {}), {}, {!r})'.format(self, key_set_name, choices_name, default_value)
+            expr = '_map({}, {}, {}, use_missing={!r}, axis={!r})'.format(self, key_set_name, choices_name, use_masked_array, axis)
         else:
-            expr = '_choose(_ordinal_values({}, {}), {})'.format(self, key_set_name, choices_name)
+            expr = '_map({}, {}, {}, axis={!r})'.format(self, key_set_name, choices_name, axis)
         return Expression(df, expr)
 
     @property
@@ -1138,8 +1208,13 @@ def f({0}):
         f = scope['f']
 
         # numba part
-        argument_dtypes_numba = [getattr(numba, argument_dtype.numpy.name) for argument_dtype in self.argument_dtypes]
-        return_dtype_numba = getattr(numba, self.return_dtype.numpy.name)
+        def get_type(name):
+            if name == "bool":
+                name = "bool_"
+            return getattr(numba, name)
+
+        argument_dtypes_numba = [get_type(argument_dtype.numpy.name) for argument_dtype in self.argument_dtypes]
+        return_dtype_numba = get_type(self.return_dtype.numpy.name)
         vectorizer = numba.vectorize([return_dtype_numba(*argument_dtypes_numba)])
         return vectorizer(f)
 

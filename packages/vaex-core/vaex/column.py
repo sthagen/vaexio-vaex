@@ -27,6 +27,9 @@ class Column(object):
 
 supported_column_types = (Column, ) + supported_array_types
 
+def is_column_like(col):
+    return isinstance(col, supported_column_types)
+
 
 class ColumnVirtualRange(Column):
     def __init__(self, start, stop, step=1, dtype=None):
@@ -213,15 +216,15 @@ class ColumnIndexed(Column):
                 indices = indices - i1
             else:
                 indices = indices - i1
+        take_indices = indices
+        if self.masked:
+            # arrow and numpy do not like the negative indices, so we set them to 0
+            take_indices = indices.copy()
+            take_indices[mask] = 0
         if isinstance(ar_unfiltered, supported_arrow_array_types):
-            take_indices = indices
-            if self.masked:
-                # arrow does not like the -1 index, so we set them to 0
-                take_indices = indices.copy()
-                take_indices[mask] = 0
             ar = ar_unfiltered.take(vaex.array_types.to_arrow(take_indices))
         else:
-            ar = ar_unfiltered[indices]
+            ar = ar_unfiltered[take_indices]
         assert not np.ma.isMaskedArray(indices)
         if self.masked:
             # TODO: we probably want to keep this as arrow array if it originally was
@@ -430,8 +433,11 @@ def _to_string_sequence(x, force=True):
         table = pa.Table.from_arrays([x], ["single"])
         table_concat = table.combine_chunks()
         column = table_concat.columns[0]
-        assert column.num_chunks == 1
-        x = column.chunk(0)
+        if column.num_chunks == 0:
+            x = pa.array([], type=column.type)
+        else:
+            assert column.num_chunks == 1
+            x = column.chunk(0)
 
     if isinstance(x, ColumnString):
         return x.string_sequence
@@ -500,7 +506,7 @@ def _trim_bits(column, i1, i2):
 
 class ColumnStringArrow(ColumnString):
     """Column that unpacks the arrow string column on the fly"""
-    def __init__(self, indices, bytes, length=None, offset=0, string_sequence=None, null_bitmap=None, references=None):
+    def __init__(self, indices, bytes, length=None, offset=0, string_sequence=None, null_bitmap=None):
         self._string_sequence = string_sequence
         self.indices = indices
         self.offset = offset  # to avoid memory copies in trim
@@ -515,8 +521,6 @@ class ColumnStringArrow(ColumnString):
         self.shape = (self.__len__(),)
         self.nbytes = self.bytes.nbytes + self.indices.nbytes
         self.null_bitmap = null_bitmap
-        # references is to keep other objects alive, similar to pybind11's keep_alive
-        self.references = references or []
 
         if not (self.indices.dtype.kind == 'i' and self.indices.dtype.itemsize in [4,8]):
             raise ValueError('unsupported index type' + str(self.indices.dtype))
@@ -623,9 +627,7 @@ class ColumnStringArrow(ColumnString):
 
     def trim(self, i1, i2):
         assert i2 >= i1
-        references = self.references + [self]
-        return type(self)(self.indices, self.bytes, i2-i1, self.offset + i1, null_bitmap=self.null_bitmap,
-                references=references)
+        return type(self)(self.indices, self.bytes, i2-i1, self.offset + i1, null_bitmap=self.null_bitmap)
 
     @classmethod
     def from_string_sequence(cls, string_sequence):

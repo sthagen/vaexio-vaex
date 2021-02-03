@@ -107,7 +107,7 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
     :param dict fs_options: Extra arguments passed to an optional file system if needed:
         * Amazon AWS S3
             * `anonymous` - access file without authentication (public files)
-            * `access_key` - AWS access key, if not provided will use the standard env vars, or the `~/.aws/credentials` file 
+            * `access_key` - AWS access key, if not provided will use the standard env vars, or the `~/.aws/credentials` file
             * `secret_key` - AWS secret key, similar to `access_key`
             * `profile` - If multiple profiles are present in `~/.aws/credentials`, pick this one instead of 'default', see https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html
             * `region` - AWS Region, e.g. 'us-east-1`, will be determined automatically if not provided.
@@ -411,6 +411,8 @@ def from_pandas(df, name="pandas", copy_index=False, index_name="index"):
             values = np.ma.array(values._data, mask=values._mask)
         elif hasattr(pd.core.arrays, 'StringArray') and isinstance(values, pd.core.arrays.StringArray):
             values = pa.array(values)
+        elif hasattr(pd.core.arrays, 'FloatingArray') and isinstance(values, pd.core.arrays.FloatingArray):
+            values = np.ma.array(values._data, mask=values._mask)
         try:
             columns[name] = vaex.dataset.to_supported_array(values)
         except Exception as e:
@@ -757,3 +759,17 @@ def vrange(start, stop, step=1, dtype='f8'):
 def string_column(strings):
     import pyarrow as pa
     return pa.array(strings)
+
+
+def dtype(type):
+    '''Creates a Vaex DataType based on a NumPy or Arrow type'''
+    return vaex.datatype.DataType(type)
+
+def dtype_of(ar):
+    '''Creates a Vaex DataType from a NumPy or Arrow array'''
+    if vaex.array_types.is_arrow_array(ar):
+        return dtype(ar.type)
+    elif vaex.array_types.is_numpy_array(ar) or isinstance(ar, vaex.column.supported_column_types):
+        return dtype(ar.dtype)
+    else:
+        raise TypeError(f'{ar} is not a an Arrow or NumPy array')

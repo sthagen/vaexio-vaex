@@ -18,7 +18,7 @@ target_path = os.path.join(path, 'data', 'output')
 
 
 def test_open_convert_kwargs():
-    csv2 = os.path.join(path, 'data', 'small2.csv')
+    csv2 = os.path.join(path, 'data', 'smæll2.csv')
     df = vaex.open(csv2, convert=True)
     assert df.x.dtype == 'integer'
     mtime = os.path.getmtime(csv2 + ".hdf5")
@@ -30,6 +30,11 @@ def test_open_convert_kwargs():
     df = vaex.open(csv2, convert=True, dtype={'x': 'float64'})
     assert mtime != os.path.getmtime(csv2 + ".hdf5")
     assert df.x.dtype == 'float64'
+
+
+def test_open_convert_non_hdf5():
+    csv2 = os.path.join(path, 'data', 'smæll2.csv')
+    df = vaex.open(csv2, convert='smæll2.parquet')
 
 
 def test_open_convert_explicit_path():

@@ -237,7 +237,6 @@ def test_string_index(dfs, sub, start, end):
 def test_string_join(dfs, pattern):
     assert dfs.s.str.split(pattern).str.join('-').tolist() == dfs.s.str.split(pattern).str.join('-').tolist()
 
-
 def test_string_len(dfs):
     assert dfs.s.str.len().astype('i4').tolist() == [len(k) for k in string_list]
     assert dfs.s.str_pandas.len().astype('i4').tolist() == [len(k) for k in string_list]
@@ -465,3 +464,36 @@ def test_string_operations_from_mmap_file(tmpdir):
     df_from_file = vaex.open(filename)
     assert df_from_file.y.str.slice(start=0, stop=2).tolist() == ['Th', 'is', 'a', None, 'te']
     assert df_from_file.y.str.upper().tolist() == ['THIS', 'IS', 'A', None, 'TEST']
+
+
+def test_string_operation_empty_df(df_factory):
+    df = df_factory(s=["aap", "noot"])
+    df[df.s == "MIES"].s.unique()
+
+
+def test_string_split():
+    df = vaex.from_arrays(s=["aap noot  mies", None, "kees", ""])
+    assert df.s.str.split().tolist() == [["aap", "noot", "mies"], None, ["kees"], [""]]
+    assert df.s.str.split(max_splits=1).tolist() == [["aap", "noot  mies"], None, ["kees"], [""]]
+
+
+def test_string_split_upper():
+    df = vaex.from_arrays(s=["aap noot  mies", None, "kees", ""])
+    assert df.s.str.split().str.upper().tolist() == [["AAP", "NOOT", "MIES"], None, ["KEES"], [""]]
+
+
+def test_string_split_contains():
+    df = vaex.from_arrays(s=["aap noot  mies", None, "kees", ""])
+    assert df.s.str.split().str.contains('aap').tolist() == [[True, False, False], None, [False], [False]]
+
+
+def test_string_join_split_nested():
+    df = vaex.from_arrays(s=['foo-bar a-b', '1-2 3-4-5'])
+    level1 = df.s.str.split(' ')
+    assert level1.tolist() == [['foo-bar', 'a-b'], ['1-2', '3-4-5']]
+    level2 = level1.str.split('-')
+    assert level2.tolist() == [[['foo', 'bar'], ['a', 'b']], [['1', '2'], ['3', '4', '5']]]
+    level1 = level2.str.join('**')
+    assert level1.tolist() == [['foo**bar', 'a**b'], ['1**2', '3**4**5']]
+    level0 = level1.str.join('--')
+    assert level0.tolist() == ['foo**bar--a**b', '1**2--3**4**5']

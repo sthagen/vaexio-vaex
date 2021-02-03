@@ -164,6 +164,21 @@ def vaex_df_from_arrow_table(table):
     return DatasetArrow(table=table)
 
 
+def trim_offsets(offset, length, null_buffer, offsets_buffer, large=False):
+    if offset == 0:
+        return null_buffer, offsets_buffer
+    if large:
+        offsets = np.frombuffer(offsets_buffer, np.int64, length + 1 + offset)
+    else:
+        offsets = np.frombuffer(offsets_buffer, np.int32, length + 1 + offset)
+    nulls = pa.BooleanArray.from_buffers(pa.bool_(), length, [None, null_buffer], offset=offset)
+    nulls = pa.concat_arrays([nulls])
+    assert nulls.offset == 0
+    assert len(nulls) == length
+    offsets = offsets[offset:] - offsets[offset]
+    return nulls.buffers()[1], pa.py_buffer(offsets)
+
+
 def trim_buffers(ar):
     # there are cases where memcopy are made, of modifications are mode (large_string_to_string)
     # in those cases, we don't want to work on the full array, and get rid of the offset if possible
@@ -274,3 +289,14 @@ def align(a, b):
     else:
         return a, b
     return
+
+
+def same_type(*arrays):
+    types = [ar.type for ar in arrays]
+    if any(types[0] != type for type in types):
+        if vaex.dtype(types[0]) == str:
+            # we have mixed large and normal string
+            return [large_string_to_string(ar) if ar.type == pa.large_string() else ar for ar in arrays]
+        else:
+            raise NotImplementedError
+    return arrays

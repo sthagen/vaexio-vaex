@@ -9,6 +9,14 @@ supported_array_types = (np.ndarray, ) + supported_arrow_array_types
 string_types = [pa.string(), pa.large_string()]
 
 
+def is_arrow_array(ar):
+    return isinstance(ar, supported_arrow_array_types)
+
+
+def is_numpy_array(ar):
+    return isinstance(ar, np.ndarray)
+
+
 def filter(ar, boolean_mask):
     if isinstance(ar, supported_arrow_array_types):
         return ar.filter(pa.array(boolean_mask))
@@ -76,6 +84,8 @@ def same_type(type1, type2):
 
 
 def tolist(ar):
+    if isinstance(ar, list):
+        return ar
     if isinstance(ar, supported_arrow_array_types):
         return ar.to_pylist()
     else:
@@ -144,7 +154,10 @@ def convert(x, type, default_type="numpy"):
     elif type == "xarray":
         return to_xarray(x)
     elif type in ['list', 'python']:
-        return convert(x, 'numpy').tolist()
+        try:
+            return pa.array(x).tolist()
+        except:
+            return np.array(x).tolist()
     elif type is None:
         if isinstance(x, (list, tuple)):
             chunks = [convert(k, type) for k in x]
