@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 import logging
 import os
 import warnings
@@ -7,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 
 import vaex
+import vaex.cache
 from .array_types import supported_array_types, supported_arrow_array_types, string_types, is_string_type
 
 on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
@@ -16,14 +18,26 @@ if not on_rtd:
 logger = logging.getLogger("vaex.column")
 
 
+register = vaex.encoding.make_class_registery('column')
 
-class Column(object):
+class Column(ABC):
+    _cached_fingerprint = None
+
     def tolist(self):
         return self.to_numpy().tolist()
 
+    def fingerprint(self):
+        '''id that uniquely identifies a column cross runtime'''
+        if self._cached_fingerprint is None:
+            self._cached_fingerprint = self._fingerprint()
+        return self._cached_fingerprint
+
+    @abstractmethod
+    def _fingerprint(self):
+        raise NotImplementedError
+
     def to_arrow(self, type=None):
         return pa.array(self, type=type)
-
 
 supported_column_types = (Column, ) + supported_array_types
 
@@ -42,6 +56,10 @@ class ColumnVirtualRange(Column):
     def __len__(self):
         return (self.stop - self.start) // self.step
 
+    def _fingerprint(self):
+        fp = vaex.cache.fingerprint(self.start, self.stop, self.step, self.dtype, self.shape)
+        return f'column-vrange-{fp}'
+
     def __getitem__(self,  slice):
         start, stop, step = slice.start, slice.stop, slice.step
         return np.arange(self.start + start, self.start + stop, step, dtype=self.dtype)
@@ -56,6 +74,12 @@ class ColumnMaskedNumpy(Column):
         self.mask = mask
         self.dtype = data.dtype
         assert len(data) == len(mask)
+
+    def _fingerprint(self):
+        hash1 = vaex.dataset.hash_array_data(self.data[:])
+        hash2 = vaex.dataset.hash_array_data(self.indimaskces[:])
+        fp = vaex.cache.fingerprint(hash1, hash2)
+        return f'column-masked-numpy-{fp}'
 
     def __len__(self):
         return len(self.data)
@@ -75,6 +99,10 @@ class ColumnSparse(Column):
         self.column_index = column_index
         self.shape = self.matrix.shape[:1]
         self.dtype = self.matrix.dtype
+
+    def _fingerprint(self):
+        fp = vaex.cache.fingerprint(self.matrix, self.column_index)
+        return f'column-sparse-{fp}'
 
     def __len__(self):
         return self.shape[0]
@@ -105,13 +133,39 @@ class ColumnNumpyLike(Column):
     def __setitem__(self, slice, value):
         self.ar[slice] = value
 
+    def _fingerprint(self):
+        ar = self[:]
+        hash = vaex.dataset.hash_array(ar)
+        fp = vaex.cache.fingerprint(hash)
+        return f'column-numpy-like-{fp}'
 
 
+@register
 class ColumnArrowLazyCast(Column):
+    snake_name = "lazy_cast"
     """Wraps an array like object and cast it lazily"""
     def __init__(self, ar, type):
         self.ar = ar  # this should behave like a numpy array
-        self.type = type
+        self.type = vaex.dtype(type)
+
+    def encode(self, encoding):
+        return {
+            'array': encoding.encode('array', self.ar),
+            'dtype': encoding.encode('dtype', self.type),
+        }
+
+    @classmethod
+    def decode(cls, encoding, spec):
+        return cls(encoding.decode('array', spec['array']),
+                   encoding.decode('dtype', spec['dtype']))
+
+    def __arrow_array__(self, type=None):
+        return pa.array(self.ar)
+
+    def _fingerprint(self):
+        hash = vaex.dataset.hash_array_data(self.ar)
+        fp = vaex.cache.fingerprint(hash, self.type)
+        return f'column-arrow-lazy-cast-{fp}'
 
     @property
     def nbytes(self):
@@ -130,8 +184,8 @@ class ColumnArrowLazyCast(Column):
     def __getitem__(self, slice):
         if self.ar.dtype == object and vaex.array_types.is_string_type(self.type):
             # this seem to be the only way to convert mixed str and nan to include nulls
-            return pa.Array.from_pandas(self.ar[slice], type=self.type)
-        return pa.array(self.ar[slice], type=self.type)
+            return pa.Array.from_pandas(self.ar[slice], type=self.type.arrow)
+        return pa.array(self.ar[slice], type=self.type.arrow)
 
 
 class ColumnIndexed(Column):
@@ -145,6 +199,12 @@ class ColumnIndexed(Column):
         # max_index = self.indices.max()
         # if not np.ma.is_masked(max_index):
         #     assert max_index < self.df._length_original
+
+    def _fingerprint(self):
+        hash1 = vaex.dataset.hash_array_data(self.column[:])
+        hash2 = vaex.dataset.hash_array_data(self.indices[:])
+        fp = vaex.cache.fingerprint(hash1, hash2, self.masked)
+        return f'column-indexed-{fp}'
 
     @staticmethod
     def index(column, indices, direct_indices_map=None, masked=False):
@@ -290,6 +350,10 @@ class ColumnConcatenatedLazy(Column):
                 shape_i = (len(self), ) + expressions[i].evaluate(0, 1, array_type='numpy', parallel=False).shape[1:]
                 if self.shape != shape_i:
                     raise ValueError("shape of of expression %s, array index 0, is %r and is incompatible with the shape of the same column of array index %d, %r" % (self.expressions[0], self.shape, i, shape_i))
+
+    def _fingerprint(self):
+        fp = vaex.cache.fingerprint([k.fingerprint() for k in self.expressions])
+        return f'column-concat-{fp}'
 
     def to_arrow(self, type=None):
         values = [e.values for e in self.expressions]
@@ -524,6 +588,12 @@ class ColumnStringArrow(ColumnString):
 
         if not (self.indices.dtype.kind == 'i' and self.indices.dtype.itemsize in [4,8]):
             raise ValueError('unsupported index type' + str(self.indices.dtype))
+
+    def _fingerprint(self):
+        hash1 = vaex.dataset.hash_array_data(self.indices)
+        hash2 = vaex.dataset.hash_array_data(self.bytes)
+        fp = vaex.cache.fingerprint(hash1, hash2, self.length, self.offset, self.null_bitmap)
+        return 'column-string-arrow-{fp}'
 
     def __arrow_array__(self, type=None):
         offsets = self.indices

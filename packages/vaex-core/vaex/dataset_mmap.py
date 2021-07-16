@@ -28,8 +28,8 @@ no_mmap = os.environ.get('VAEX_NO_MMAP', False)
 class DatasetMemoryMapped(vaex.dataset.DatasetFile):
     """Represents a dataset where the data is memory mapped for efficient reading"""
 
-    def __init__(self, path, write=False, nommap=False):
-        super().__init__(path=path, write=write)
+    def __init__(self, path, write=False, nommap=False, fs_options={}, fs=None):
+        super().__init__(path=path, write=write, fs_options=fs_options, fs=fs)
         self.nommap = nommap
         self.file_map = {}
         self.fileno_map = {}

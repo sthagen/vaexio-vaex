@@ -221,6 +221,11 @@ def list_sum(ar,  fill_empty=0):
 
 
 @register_function()
+def array_sum(ar, axis):
+    return np.sum(ar, axis=tuple(axis))
+
+
+@register_function()
 def fillmissing(ar, value):
     '''Returns an array where missing values are replaced by value.
     See :`ismissing` for the definition of missing values.
@@ -827,6 +832,64 @@ def dt_floor(x, freq, *args):
     import pandas as pd
     return _to_pandas_series(x).dt.floor(freq, *args).values
 
+
+@register_function(scope='dt', as_property=True)
+def dt_quarter(x):
+    """Return the quarter of the date. Values range from 1-4.
+
+    :returns: an expression containing the quarter extracted from a datetime column.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> date = np.array(['2009-10-12T03:31:00', '2016-02-11T10:17:34', '2015-11-12T11:34:22'], dtype=np.datetime64)
+    >>> df = vaex.from_arrays(date=date)
+    >>> df
+      #  date
+      0  2009-10-12 03:31:00
+      1  2016-02-11 10:17:34
+      2  2015-11-12 11:34:22
+    >>> df.date.dt.quarter
+    Expression = dt_quarter(date)
+    Length: 3 dtype: int64 (expression)
+    -----------------------------------
+    0  4
+    1  1
+    2  4
+    """
+    import pandas as pd
+    return _to_pandas_series(x).dt.quarter.values
+
+
+@register_function(scope='dt', as_property=True)
+def dt_halfyear(x):
+    """Return the half-year of the date. Values can be 1 and 2, for the first and second half of the year respectively.
+
+    :returns: an expression containing the half-year extracted from the datetime column.
+
+    Example:
+
+    >>> import vaex
+    >>> import numpy as np
+    >>> date = np.array(['2009-10-12T03:31:00', '2016-02-11T10:17:34', '2015-11-12T11:34:22'], dtype=np.datetime64)
+    >>> df = vaex.from_arrays(date=date)
+    >>> df
+      #  date
+      0  2009-10-12 03:31:00
+      1  2016-02-11 10:17:34
+      2  2015-11-12 11:34:22
+    >>> df.date.dt.halfyear
+    Expression = dt_halfyear(date)
+    Length: 3 dtype: int64 (expression)
+    -----------------------------------
+    0  2
+    1  1
+    2  2
+    """
+    return ((_to_pandas_series(x).dt.quarter-1) // 2 + 1).values
+
+
 ########## timedelta operations ##########
 
 @register_function(scope='td', as_property=True)
@@ -1034,6 +1097,49 @@ def str_equals(x, y):
         y = _to_string_sequence(y)
     equals_mask = x.equals(y)
     return equals_mask
+
+
+@register_function(scope='str')
+@auto_str_unwrap
+def str_notequals(x, y):
+    """Tests if strings x and y are the not same
+
+    :returns: a boolean expression
+
+    Example:
+
+    >>> import vaex
+    >>> text = ['Something', 'very pretty', 'is coming', 'our', 'way.']
+    >>> df = vaex.from_arrays(text=text)
+    >>> df
+      #  text
+      0  Something
+      1  very pretty
+      2  is coming
+      3  our
+      4  way.
+
+    >>> df.text.str.notequals(df.text)
+    Expression = str_notequals(text, text)
+    Length: 5 dtype: bool (expression)
+    ----------------------------------
+    0  False
+    1  False
+    2  False
+    3  False
+    4  False
+
+    >>> df.text.str.notequals('our')
+    Expression = str_notequals(text, 'our')
+    Length: 5 dtype: bool (expression)
+    ----------------------------------
+    0   True
+    1   True
+    2   True
+    3  False
+    4   True
+    """
+    return ~str_equals(x, y)
 
 
 @register_function(scope='str')
@@ -2340,8 +2446,13 @@ def str_istitle(x, ascii=False):
 
 @register_function()
 def to_string(x):
+    '''Cast/convert to string, same as `expression.astype('str')`'''
     # don't change the dtype, otherwise for each block the dtype may be different (string length)
-    sl = vaex.strings.to_string(x)
+    ar = vaex.array_types.to_numpy(x)
+    if np.ma.isMaskedArray(ar):
+        sl = vaex.strings.to_string(ar.data, ar.mask)
+    else:
+        sl = vaex.strings.to_string(ar)
     return column.ColumnStringArrow.from_string_sequence(sl)
 
 
@@ -2359,7 +2470,6 @@ def format(x, format):
 for name in dir(scopes['str']):
     if name.startswith('__'):
         continue
-    force_string = ['get']
     def pandas_wrapper(name=name):
         def wrapper(*args, **kwargs):
             import pandas
@@ -2370,14 +2480,10 @@ for name in dir(scopes['str']):
             args = list(map(fix_arg, args))
             x = args[0]
             args = args[1:]
-            series = pandas.Series(x)
+            series = pandas.Series(x, dtype='string')
             method = getattr(series.str, name)
             value = method(*args, **kwargs)
-            if name in force_string:
-                value = _to_string_column(value.values, force=True)
-                return value
-            else:
-                return value.values
+            return pa.array(value)
         return wrapper
     wrapper = pandas_wrapper()
     wrapper.__doc__ = "Wrapper around pandas.Series.%s" % name
@@ -2468,8 +2574,7 @@ def _astype(x, dtype):
         return y
     else:  # numpy case
         if dtype in ['str', 'string', 'large_string']:
-            y = x.astype('str')
-            return vaex.column._to_string_column(y)
+            return to_string(x)
         else:
             return x.astype(dtype)
 
@@ -2478,6 +2583,7 @@ def _astype(x, dtype):
 def _isin(x, values):
     if vaex.column._is_stringy(x):
         x = vaex.column._to_string_column(x)
+        values = vaex.column._to_string_sequence(values)
         return x.string_sequence.isin(values)
     else:
         # TODO: this happens when a column is of dtype=object
@@ -2485,10 +2591,17 @@ def _isin(x, values):
         # but numpy doesn't know what to do with that
         if hasattr(values, 'to_numpy'):
             values = values.to_numpy()
-        if np.ma.isMaskedArray(x):
-            return np.ma.isin(x, values)
+        mask = isnan(values)
+        if np.any(mask):
+            if np.ma.isMaskedArray(x):
+                return np.ma.isin(x, values) | isnan(x)
+            else:
+                return np.isin(x, values) | isnan(x)
         else:
-            return np.isin(x, values)
+            if np.ma.isMaskedArray(x):
+                return np.ma.isin(x, values)
+            else:
+                return np.isin(x, values)
 
 
 @register_function(name='isin_set', on_expression=False)
@@ -2561,7 +2674,7 @@ def add_geo_json(ds, json_or_file, column_name, longitude_expression, latitude_e
 import vaex.arrow.numpy_dispatch
 
 @register_function()
-def where(condition, x, y):
+def where(condition, x, y, dtype=None):
     # special where support for strings
     # TODO: this should be replaced by an arrow compute function in the future
     if type(x) == str:
@@ -2611,6 +2724,37 @@ def where(condition, x, y):
         choices = vaex.array_types.concat([x, y])
         values = choices.take(indices)
         return values
+
+    # cast x and y
+    if dtype is not None:
+        if np.can_cast(x, dtype):
+            dtype_scalar = np.dtype(dtype)
+            x = dtype_scalar.type(x)
+        if np.can_cast(y, dtype):
+            dtype_scalar = np.dtype(dtype)
+            y = dtype_scalar.type(y)
+
     # default callback is on numpy
+    # where() respects the dtypes of x and y; ex: if x and y are 'uint8', the resulting array will also be 'uint8'
     ar = np.where(condition, x, y)
+
     return ar
+
+
+@register_function()
+def index_values(ar):
+    dtype = vaex.dtype_of(ar)
+    if not dtype.is_encoded:
+        raise TypeError(f'Can only get index values from a (dictionary) encoded array, not for {ar}')
+    if isinstance(ar, pa.ChunkedArray):
+        return pa.chunked_array([k.indices for k in ar.chunks], type=ar.type.index_type)
+    else:
+        return ar.indices
+
+
+@register_function(on_expression=False)
+def stack(arrays, strict=False):
+    '''Stack multiple arrays into a multidimensional array'''
+    arrays = [vaex.arrow.numpy_dispatch.unwrap(k) for k in arrays]
+    arrays = [vaex.array_types.to_numpy(k) for k in arrays]
+    return np.ma.stack(arrays, axis=1)

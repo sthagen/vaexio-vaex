@@ -9,12 +9,25 @@ supported_array_types = (np.ndarray, ) + supported_arrow_array_types
 string_types = [pa.string(), pa.large_string()]
 
 
+def full(n, value, dtype):
+    from .datatype import DataType
+    dtype = DataType(dtype)
+    values = np.full(n, value, dtype=dtype.numpy)
+    if dtype.is_arrow:
+        return pa.array(values)
+    else:
+        return values
+
 def is_arrow_array(ar):
     return isinstance(ar, supported_arrow_array_types)
 
 
 def is_numpy_array(ar):
     return isinstance(ar, np.ndarray)
+
+
+def is_array(ar):
+    return is_arrow_array(ar) or is_numpy_array(ar)
 
 
 def filter(ar, boolean_mask):
@@ -25,6 +38,8 @@ def filter(ar, boolean_mask):
 
 
 def slice(ar, offset, length=None):
+    if offset == 0 and len(ar) == length:
+        return ar
     if isinstance(ar, supported_arrow_array_types):
         return ar.slice(offset, length)
     else:
@@ -38,6 +53,7 @@ def concat(arrays):
     if len(arrays) == 1:
         return arrays[0]
     if any([isinstance(k, vaex.array_types.supported_arrow_array_types) for k in arrays]):
+        arrays = [to_arrow(k) for k in arrays]
         flat_chunks = []
         type = arrays[0].type
         for chunk in arrays:
@@ -140,11 +156,10 @@ def convert(x, type, default_type="numpy"):
         else:
             return to_numpy(x, strict=True)
     if type == "numpy-arrow":  # used internally, numpy if possible, otherwise arrow
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple)) and len(x) > 0 and is_array(x[0]):
             return concat([convert(k, type) for k in x])
         else:
             return to_numpy(x, strict=False)
-
     elif type == "arrow":
         if isinstance(x, (list, tuple)):
             chunks = [convert(k, type) for k in x]
@@ -216,6 +231,7 @@ def arrow_type(x):
 
 
 def to_arrow_type(data_type):
+    data_type = vaex.dtype(data_type).internal
     if isinstance(data_type, np.dtype):
         return arrow_type_from_numpy_dtype(data_type)
     else:

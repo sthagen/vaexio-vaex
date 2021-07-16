@@ -115,6 +115,7 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
         * Google Cloud Storage
             * :py:class:`gcsfs.core.GCSFileSystem`
         In addition you can pass the boolean "cache" option.
+    :param group: (optional) Specify the group to be read from and HDF5 file. By default this is set to "/table".
     :param fs: Apache Arrow FileSystem object, or FSSpec FileSystem object, if specified, fs_options should be empty.
     :param args: extra arguments for file readers that need it
     :param kwargs: extra keyword arguments
@@ -159,82 +160,89 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
     import vaex
     import vaex.convert
     try:
-        path = vaex.file.stringyfy(path)
-        if path in aliases:
-            path = aliases[path]
-        path = vaex.file.stringyfy(path)
-        if path.startswith("http://") or path.startswith("ws://") or \
-           path.startswith("vaex+http://") or path.startswith("vaex+ws://"):  # TODO: think about https and wss
-            server, name = path.rsplit("/", 1)
-            url = urlparse(path)
-            if '?' in name:
-                name = name[:name.index('?')]
-            extra_args = {key: values[0] for key, values in parse_qs(url.query).items()}
-            if 'token' in extra_args:
-                kwargs['token'] = extra_args['token']
-            if 'token_trusted' in extra_args:
-                kwargs['token_trusted'] = extra_args['token_trusted']
-            client = vaex.connect(server, **kwargs)
-            return client[name]
-        if path.startswith("cluster"):
-            import vaex.enterprise.distributed
-            return vaex.enterprise.distributed.open(path, *args, **kwargs)
+        if not isinstance(path, (list, tuple)):
+            # remote and clusters only support single path, not a list
+            path = vaex.file.stringyfy(path)
+            if path in aliases:
+                path = aliases[path]
+            path = vaex.file.stringyfy(path)
+            if path.startswith("http://") or path.startswith("ws://") or \
+                path.startswith("vaex+wss://") or path.startswith("wss://") or \
+               path.startswith("vaex+http://") or path.startswith("vaex+ws://"):
+                server, name = path.rsplit("/", 1)
+                url = urlparse(path)
+                if '?' in name:
+                    name = name[:name.index('?')]
+                extra_args = {key: values[0] for key, values in parse_qs(url.query).items()}
+                if 'token' in extra_args:
+                    kwargs['token'] = extra_args['token']
+                if 'token_trusted' in extra_args:
+                    kwargs['token_trusted'] = extra_args['token_trusted']
+                client = vaex.connect(server, **kwargs)
+                return client[name]
+            if path.startswith("cluster"):
+                import vaex.enterprise.distributed
+                return vaex.enterprise.distributed.open(path, *args, **kwargs)
+
+        import vaex.file
+        import glob
+        if isinstance(path, str):
+            paths = [path]
         else:
-            import vaex.file
-            import glob
-            if isinstance(path, str):
-                paths = [path]
+            paths = path
+        filenames = []
+        for path in paths:
+            path = vaex.file.stringyfy(path)
+            if path in aliases:
+                path = aliases[path]
+            path = vaex.file.stringyfy(path)
+            naked_path, options = vaex.file.split_options(path)
+            if glob.has_magic(naked_path):
+                filenames.extend(list(sorted(vaex.file.glob(path, fs_options=fs_options, fs=fs))))
             else:
-                paths = path
-            filenames = []
-            for path in paths:
-                naked_path, options = vaex.file.split_options(path)
-                if glob.has_magic(naked_path):
-                    filenames.extend(list(sorted(vaex.file.glob(path, **kwargs))))
-                else:
-                    filenames.append(path)
-            df = None
-            if len(filenames) == 0:
-                raise IOError(f'File pattern did not match anything {path}')
-            filename_hdf5 = vaex.convert._convert_name(filenames, shuffle=shuffle)
-            filename_hdf5_noshuffle = vaex.convert._convert_name(filenames, shuffle=False)
-            if len(filenames) == 1:
-                path = filenames[0]
-                # # naked_path, _ = vaex.file.split_options(path, fs_options)
-                _, ext, _ = vaex.file.split_ext(path)
-                if ext == '.csv':  # special case for csv
-                    return vaex.from_csv(path, fs_options=fs_options, fs=fs, convert=convert, **kwargs)
+                filenames.append(path)
+        df = None
+        if len(filenames) == 0:
+            raise IOError(f'File pattern did not match anything {path}')
+        filename_hdf5 = vaex.convert._convert_name(filenames, shuffle=shuffle)
+        filename_hdf5_noshuffle = vaex.convert._convert_name(filenames, shuffle=False)
+        if len(filenames) == 1:
+            path = filenames[0]
+            # # naked_path, _ = vaex.file.split_options(path, fs_options)
+            _, ext, _ = vaex.file.split_ext(path)
+            if ext == '.csv':  # special case for csv
+                return vaex.from_csv(path, fs_options=fs_options, fs=fs, convert=convert, **kwargs)
+            if convert:
+                path_output = convert if isinstance(convert, str) else filename_hdf5
+                vaex.convert.convert(
+                    path_input=path, fs_options_input=fs_options, fs_input=fs,
+                    path_output=path_output, fs_options_output=fs_options, fs_output=fs,
+                    *args, **kwargs
+                )
+                ds = vaex.dataset.open(path_output, fs_options=fs_options, fs=fs, **kwargs)
+            else:
+                ds = vaex.dataset.open(path, fs_options=fs_options, fs=fs, **kwargs)
+            df = vaex.from_dataset(ds)
+            if df is None:
+                if os.path.exists(path):
+                    raise IOError('Could not open file: {}, did you install vaex-hdf5? Is the format supported?'.format(path))
+        elif len(filenames) > 1:
+            if convert not in [True, False]:
+                filename_hdf5 = convert
+            else:
+                filename_hdf5 = vaex.convert._convert_name(filenames, shuffle=shuffle)
+            if os.path.exists(filename_hdf5) and convert:  # also check mtime
+                df = vaex.open(filename_hdf5)
+            else:
+                dfs = []
+                for filename in filenames:
+                    dfs.append(vaex.open(filename, convert=bool(convert), shuffle=shuffle, **kwargs))
+                df = vaex.concat(dfs)
                 if convert:
-                    path_output = convert if isinstance(convert, str) else filename_hdf5
-                    vaex.convert.convert(
-                        path_input=path, fs_options_input=fs_options, fs_input=fs,
-                        path_output=path_output, fs_options_output=fs_options, fs_output=fs,
-                        *args, **kwargs
-                    )
-                    ds = vaex.dataset.open(path_output, fs_options=fs_options, fs=fs, **kwargs)
-                else:
-                    ds = vaex.dataset.open(path, fs_options=fs_options, fs=fs, **kwargs)
-                df = vaex.from_dataset(ds)
-                if df is None:
-                    if os.path.exists(path):
-                        raise IOError('Could not open file: {}, did you install vaex-hdf5? Is the format supported?'.format(path))
-            elif len(filenames) > 1:
-                if convert not in [True, False]:
-                    filename_hdf5 = convert
-                else:
-                    filename_hdf5 = vaex.convert._convert_name(filenames, shuffle=shuffle)
-                if os.path.exists(filename_hdf5) and convert:  # also check mtime
+                    if shuffle:
+                        df = df.shuffle()
+                    df.export_hdf5(filename_hdf5)
                     df = vaex.open(filename_hdf5)
-                else:
-                    dfs = []
-                    for filename in filenames:
-                        dfs.append(vaex.open(filename, convert=bool(convert), shuffle=shuffle, **kwargs))
-                    df = vaex.concat(dfs)
-                    if convert:
-                        if shuffle:
-                            df = df.shuffle()
-                        df.export_hdf5(filename_hdf5)
-                        df = vaex.open(filename_hdf5)
 
         if df is None:
             raise IOError('Unknown error opening: {}'.format(path))
@@ -585,44 +593,59 @@ def zeldovich(dim=2, N=256, n=-2.5, t=None, scale=1, seed=None):
     return vaex.file.other.Zeldovich(dim=dim, N=N, n=n, t=t, scale=scale)
 
 
-def set_log_level_debug():
+# create named logger, for all loglevels
+logger = logging.getLogger('vaex')
+logger.setLevel(logging.DEBUG)
+
+# create console handler and accept all loglevels
+ch = logging.StreamHandler()
+ch.setLevel(logging.DEBUG)
+
+# create formatter
+formatter = logging.Formatter('%(levelname)s:%(threadName)s:%(name)s:%(message)s')
+
+# add formatter to console handler
+ch.setFormatter(formatter)
+
+# add console handler to logger
+logger.addHandler(ch)
+
+
+def set_log_level_debug(loggers=["vaex"]):
     """set log level to debug"""
-    import logging
-    logging.getLogger("vaex").setLevel(logging.DEBUG)
+    for logger in loggers:
+        logging.getLogger(logger).setLevel(logging.DEBUG)
 
 
 def set_log_level_info():
     """set log level to info"""
-    import logging
     logging.getLogger("vaex").setLevel(logging.INFO)
 
 
 def set_log_level_warning():
     """set log level to warning"""
-    import logging
     logging.getLogger("vaex").setLevel(logging.WARNING)
 
 
 def set_log_level_exception():
     """set log level to exception"""
-    import logging
-    logging.getLogger("vaex").setLevel(logging.FATAL)
+    logging.getLogger("vaex").setLevel(logging.ERROR)
 
 
 def set_log_level_off():
     """Disabled logging"""
-    import logging
-    logging.disable(logging.CRITICAL)
+    logging.getLogger('vaex').removeHandler(ch)
+    logging.getLogger('vaex').addHandler(logging.NullHandler())
 
 
-format = "%(levelname)s:%(threadName)s:%(name)s:%(message)s"
-logging.basicConfig(level=logging.INFO, format=format)
-DEBUG_MODE = bool(os.environ.get('VAEX_DEBUG', ''))
+DEBUG_MODE = os.environ.get('VAEX_DEBUG', '')
 if DEBUG_MODE:
-    logging.basicConfig(level=logging.DEBUG)
-    set_log_level_debug()
+    set_log_level_warning()
+    if DEBUG_MODE.startswith('vaex'):
+        set_log_level_debug(DEBUG_MODE.split(","))
+    else:
+        set_log_level_debug()
 else:
-    # logging.basicConfig(level=logging.DEBUG)
     set_log_level_warning()
 
 import_script = os.path.expanduser("~/.vaex/vaex_import.py")
@@ -634,9 +657,6 @@ if os.path.exists(import_script):
     except:
         import traceback
         traceback.print_stack()
-
-
-logger = logging.getLogger('vaex')
 
 
 def register_dataframe_accessor(name, cls=None, override=False):
@@ -773,3 +793,7 @@ def dtype_of(ar):
         return dtype(ar.dtype)
     else:
         raise TypeError(f'{ar} is not a an Arrow or NumPy array')
+
+
+class RowLimitException(ValueError):
+    pass

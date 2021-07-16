@@ -1,5 +1,6 @@
 from common import small_buffer
 
+import pytest
 import numpy as np
 import pyarrow as pa
 
@@ -77,3 +78,18 @@ def test_unique_list(df_types):
     df = df_types
     assert set(df.string_list.unique()) == {'aap', 'noot', 'mies', None}
     assert set(df.int_list.unique()) == {1, 2, 3, 4, 5, None}
+
+
+@pytest.mark.parametrize("future", [False, True])
+def test_unique_categorical(df_factory, future):
+    df = df_factory(x=vaex.string_column(['a', 'c', 'b', 'a', 'a']))
+    df = df.ordinal_encode('x')
+    df = df._future() if future else df
+    if future:
+        assert df.x.dtype == str
+        assert set(df.x.unique()) == {'a', 'b', 'c'}
+        assert df.x.nunique() == 3
+    else:
+        assert df.x.dtype == int
+        assert set(df.x.unique()) == {0, 1, 2}
+        assert df.x.nunique() == 3

@@ -1,8 +1,9 @@
-import vaex
-import vaex.array_types
+import dask.base
 import numpy as np
 import pyarrow as pa
 
+import vaex
+import vaex.array_types
 
 class DataType:
     """Wraps numpy and arrow data types in a uniform interface
@@ -15,33 +16,57 @@ class DataType:
     float64
     >>> type2 = DataType(np.dtype('>f8'))
     >>> type2
-    float64
+    >f8
     >>> type1 in [float, int]
     True
+    >>> type1 == type2
+    False
+    >>> type1 == pa.float64()
+    True
+    >>> type1 == pa.int64()
+    False
 
     """
-    def __init__(self, internal):
-        self.internal = internal
+    def __init__(self, dtype):
+        if isinstance(dtype, DataType):
+            self.internal = dtype.internal
+        else:
+            if isinstance(dtype, pa.DataType):
+                self.internal = dtype
+            else:
+                self.internal = np.dtype(dtype)
 
     def to_native(self):
         '''Removes non-native endianness'''
         return DataType(vaex.utils.to_native_dtype(self.internal))        
 
+    def __hash__(self):
+        return hash((self.__class__.__name__, self.internal))
+
     def __eq__(self, other):
-        if other == str:
+        if self.is_encoded:
+            return self.value_type == other
+        if other is str:
             return self.is_string
-        if other == float:
+        if other is float:
             return self.is_float
-        if other == int:
+        if other is int:
             return self.is_integer
-        if other == list:
+        if other is list:
             return self.is_list
+        if other is dict:
+            return self.is_struct
         if isinstance(other, str):
             tester = 'is_' + other
             if hasattr(self, tester):
                 return getattr(self, tester)
         if not isinstance(other, DataType):
             other = DataType(other)
+        if other.is_primitive:
+            if self.is_arrow:
+                other = DataType(other.arrow)
+            if self.is_numpy:
+                other = DataType(other.numpy)
         return vaex.array_types.same_type(self.internal, other.internal)
 
     def __repr__(self):
@@ -55,12 +80,11 @@ class DataType:
         float64
         >>> DataType(pa.float32())
         float32
+        >>> DataType(pa.dictionary(pa.int32(), pa.string()))
+        dictionary<values=string, indices=int32, ordered=0>
         '''
 
         internal = self.internal
-        if isinstance(internal, np.dtype):
-            if internal.byteorder == ">":
-                internal = internal.newbyteorder()
         if self.is_datetime:
             internal = self.numpy
 
@@ -74,8 +98,26 @@ class DataType:
 
     @property
     def name(self):
-        '''Alias of dtype.numpy.name'''
-        return self.numpy.name
+        '''Alias of dtype.numpy.name or str(dtype.arrow) if not primitive
+
+        >>> DataType(np.dtype('f8')).name
+        'float64'
+        >>> DataType(np.dtype('>f4')).name
+        'float32'
+        >>> DataType(pa.float64()).name
+        'float64'
+        >>> DataType(pa.large_string()).name
+        'large_string'
+        >>> DataType(pa.string()).name
+        'string'
+        >>> DataType(pa.bool_()).name
+        'bool'
+        >>> DataType(np.dtype('?')).name
+        'bool'
+        >>> DataType(pa.dictionary(pa.int32(), pa.string())).name
+        'dictionary<values=string, indices=int32, ordered=0>'
+        '''
+        return self.numpy.name if (self.is_primitive or self.is_datetime) else str(self.internal)
 
     @property
     def kind(self):
@@ -133,8 +175,13 @@ class DataType:
         True
         >>> DataType(pa.float32()).is_numeric
         True
+        >>> DataType(pa.large_string()).is_numeric
+        False
         '''
-        return self.kind in 'fiu'
+        try:
+            return self.kind in 'fiu'
+        except NotImplementedError:
+            return False
 
     @property
     def is_primitive(self):
@@ -145,10 +192,10 @@ class DataType:
         >>> DataType(pa.bool_()).is_primitive
         True
         '''
-        try:
+        if self.is_arrow:
+            return pa.types.is_primitive(self.internal)
+        else:
             return self.kind in 'fiub'
-        except NotImplementedError:
-            return False
 
     @property
     def is_datetime(self):
@@ -170,6 +217,8 @@ class DataType:
         True
         """
         if self.is_string:
+            return False
+        if self.is_encoded:
             return False
         return vaex.array_types.to_numpy_type(self.internal).kind in 'M'
 
@@ -292,17 +341,57 @@ class DataType:
         return self.is_arrow and (pa.types.is_list(self.internal) or pa.types.is_large_list(self.internal))
 
     @property
+    def is_struct(self):
+        '''Test if an (arrow) struct
+
+        >>> DataType(pa.struct([pa.field('a', pa.utf8())])) == dict
+        True
+        >>> DataType(pa.struct([pa.field('a', pa.utf8())])).is_struct
+        True
+        >>> DataType(pa.struct([pa.field('a', pa.utf8())])) == 'struct'
+        True
+        '''
+        return self.is_arrow and pa.types.is_struct(self.internal)
+
+    @property
+    def is_encoded(self):
+        '''Test if an (arrow) dictionary type (encoded data)
+
+        >>> DataType(pa.dictionary(pa.int32(), pa.string())) == str
+        True
+        >>> DataType(pa.dictionary(pa.int32(), pa.string())).is_encoded
+        True
+        '''
+        return self.is_arrow and (pa.types.is_dictionary(self.internal))
+
+    @property
     def value_type(self):
-        '''Return the DataType of the list values
+        '''Return the DataType of the list values or values of an encoded type
 
         >>> DataType(pa.list_(pa.string())).value_type
         string
         >>> DataType(pa.list_(pa.float64())).value_type
         float64
+        >>> DataType(pa.dictionary(pa.int32(), pa.string())).value_type
+        string
         '''
-        if not self.is_list:
-            raise TypeError(f'{self} is not a list type')
+        if not (self.is_list or self.is_encoded):
+            raise TypeError( f'{self} is not a list or encoded type')
         return DataType(self.internal.value_type)
+
+    @property
+    def index_type(self):
+        '''Return the DataType of the index of an encoded type, or simple the type
+
+        >>> DataType(pa.string()).index_type
+        string
+        >>> DataType(pa.dictionary(pa.int32(), pa.string())).index_type
+        int32
+        '''
+        type = self.internal
+        if self.is_encoded:
+            type = self.internal.index_type
+        return DataType(type)
 
     def upcast(self):
         '''Cast to the higest data type matching the type
@@ -323,3 +412,13 @@ class DataType:
     @property
     def byteorder(self):
         return self.numpy.byteorder
+
+    def create_array(self, values):
+        if self.is_arrow:
+            return pa.array(values, type=self.arrow)
+        else:
+            return np.asarray(values, dtype=self.numpy)
+
+@dask.base.normalize_token.register(DataType)
+def normalize_DataType(t):
+    return type(t).__name__, t.internal

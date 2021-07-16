@@ -13,16 +13,16 @@ author = 'Maarten A. Breddels'
 author_email = 'maartenbreddels@gmail.com'
 license = 'MIT'
 version = version.__version__
-url = 'https://www.github.com/maartenbreddels/vaex'
+url = 'https://www.github.com/vaexio/vaex'
 
 install_requires = [
-      'vaex-core>=4.0.0-alpha.19,<5',
-      'vaex-viz>=0.5.0-dev.1,<0.6',
-      'vaex-server>=0.4.0-alpha.3,<0.5',
-      'vaex-hdf5>=0.7.0-alpha.6,<0.8',
-      'vaex-astro>=0.8.0-alpha.1,<0.9',
-      'vaex-jupyter>=0.6.0-dev.1,<0.7',
-      'vaex-ml>=0.11.0-alpha.5,<0.12',
+      'vaex-core>=4.3.0-post.1,<5',
+      'vaex-viz>=0.5.0,<0.6',
+      'vaex-server>=0.5.0,<0.6',
+      'vaex-hdf5>=0.8.0,<0.9',
+      'vaex-astro>=0.8.2,<0.9',
+      'vaex-jupyter>=0.6.0,<0.7',
+      'vaex-ml>=0.12.0,<0.13',
       # vaex-graphql is not on conda-forge yet
 ]
 

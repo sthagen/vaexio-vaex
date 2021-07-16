@@ -18,7 +18,6 @@ import keyword
 import numpy as np
 import pyarrow as pa
 import progressbar
-import psutil
 import six
 import yaml
 
@@ -419,7 +418,7 @@ def yaml_load(f):
     return yaml.safe_load(f)
 
 
-def write_json_or_yaml(file, data, fs_options={}, fs=None):
+def write_json_or_yaml(file, data, fs_options={}, fs=None, old_style=True):
     file, path = vaex.file.file_and_path(file, mode='w', fs_options=fs_options, fs=fs)
     try:
         if path:
@@ -427,7 +426,7 @@ def write_json_or_yaml(file, data, fs_options={}, fs=None):
         else:
             ext = '.json'  # default
         if ext == ".json":
-            json.dump(data, file, indent=2, cls=VaexJsonEncoder)
+            json.dump(data, file, indent=2, cls=VaexJsonEncoder if old_style else None)
         elif ext == ".yaml":
             yaml_dump(file, data)
         else:
@@ -436,7 +435,7 @@ def write_json_or_yaml(file, data, fs_options={}, fs=None):
         file.close()
 
 
-def read_json_or_yaml(file, fs_options={}, fs=None):
+def read_json_or_yaml(file, fs_options={}, fs=None, old_style=True):
     file, path = vaex.file.file_and_path(file, fs_options=fs_options, fs=fs)
     try:
         if path:
@@ -444,7 +443,7 @@ def read_json_or_yaml(file, fs_options={}, fs=None):
         else:
             ext = '.json'  # default
         if ext == ".json":
-            return json.load(file, cls=VaexJsonDecoder) or {}
+            return json.load(file, cls=VaexJsonDecoder if old_style else None) or {}
         elif ext == ".yaml":
             return yaml_load(file) or {}
         else:
@@ -471,6 +470,7 @@ yaml.add_constructor(_mapping_tag, dict_constructor, yaml.SafeLoader)
 
 
 def check_memory_usage(bytes_needed, confirm):
+    psutil = optional_import('psutil')
     if bytes_needed > psutil.virtual_memory().available:
         if bytes_needed < (psutil.virtual_memory().available + psutil.swap_memory().free):
             text = "Action requires %s, you have enough swap memory available but it will make your computer slower, do you want to continue?" % (
@@ -557,10 +557,11 @@ def valid_identifier(name):
     return name.isidentifier() and not keyword.iskeyword(name)
 
 
-def find_valid_name(name, used=[]):
+def find_valid_name(name, used=None):
+    if used is None:
+        used = []
     if isinstance(name, int):
         name = str(name)
-    first, rest = name[0], name[1:]
     if name in used:
         nr = 1
         while name + ("_%d" % nr) in used:
@@ -569,7 +570,17 @@ def find_valid_name(name, used=[]):
     return name
 
 
-_python_save_name = find_valid_name
+def _python_save_name(name, used=None):
+    if used is None:
+        used = []
+    first, rest = name[0], name[1:]
+    name = re.sub("[^a-zA-Z_]", "_", first) + re.sub("[^a-zA-Z_0-9]", "_", rest)
+    if name in used:
+        nr = 1
+        while name + ("_%d" % nr) in used:
+            nr += 1
+        name = name + ("_%d" % nr)
+    return name
 
 
 @contextlib.contextmanager
@@ -818,15 +829,15 @@ def as_contiguous(ar):
 
 
 def _split_and_combine_mask(arrays):
-	'''Combines all masks from a list of arrays, and logically ors them into a single mask'''
-	masks = [np.ma.getmaskarray(block) for block in arrays if np.ma.isMaskedArray(block)]
-	arrays = [block.data if np.ma.isMaskedArray(block) else block for block in arrays]
-	mask = None
-	if masks:
-		mask = masks[0].copy()
-		for other in masks[1:]:
-			mask |= other
-	return arrays, mask
+    '''Combines all masks from a list of arrays, and logically ors them into a single mask'''
+    masks = [np.ma.getmaskarray(block) for block in arrays if np.ma.isMaskedArray(block)]
+    arrays = [block.data if np.ma.isMaskedArray(block) else block for block in arrays]
+    mask = None
+    if masks:
+        mask = masks[0].copy()
+        for other in masks[1:]:
+            mask |= other
+    return arrays, mask
 
 def gen_to_list(fn=None, wrapper=list):
     '''A decorator which wraps a function's return value in ``list(...)``.
@@ -865,7 +876,7 @@ def gen_to_list(fn=None, wrapper=list):
     return listify_return(fn)
 
 
-def find_type_from_dtype(namespace, prefix, dtype, transient=True):
+def find_type_from_dtype(namespace, prefix, dtype, transient=True, support_non_native=True):
     from .array_types import is_string_type
     if dtype == 'string':
         if transient:
@@ -882,7 +893,7 @@ def find_type_from_dtype(namespace, prefix, dtype, transient=True):
         if dtype.kind == "m":
             postfix = "int64"
         # for object there is no non-native version
-        if dtype.kind != 'O' and dtype.byteorder not in ["<", "=", "|"]:
+        if support_non_native and dtype.kind != 'O' and dtype.byteorder not in ["<", "=", "|"]:
             postfix += "_non_native"
     name = prefix + postfix
     if hasattr(namespace, name):
@@ -940,7 +951,7 @@ def required_dtype_for_max(N, signed=True):
         dtypes = [np.uint8, np.uint16, np.uint32, np.uint64]
     for dtype in dtypes:
         if N <= np.iinfo(dtype).max:
-            return dtype
+            return np.dtype(dtype)
     else:
         raise ValueError(f'Cannot store a max value on {N} inside an uint64/int64')
 
@@ -963,16 +974,21 @@ def format_exception_trace(e):
 
 
 class ProxyModule:
-    def __init__(self, name, version):
+    def __init__(self, name, version, modules=None):
         self.name = name
         self.module = None
         self.version = version
+        self.modules = modules if modules else [self.name]
 
     def _ensure_import(self):
         if self.module is None:
             import importlib
             try:
-                self.module = importlib.import_module(self.name)
+                for module_name in self.modules:
+                    importlib.import_module(module_name)
+                # the module object itself needs to be the top module
+                top_name = self.name.split(".")[0]
+                self.module = importlib.import_module(top_name)
             except Exception as e:
                 raise ImportError(f'''Error importing module {self.name}: {e}
 
@@ -990,8 +1006,8 @@ $ conda install -c conda-forge "{self.name}{self.version}""
         return getattr(self.module, name)
 
 
-def optional_import(name, version=''):
-    return ProxyModule(name, version=version)
+def optional_import(name, version='', modules=None):
+    return ProxyModule(name, version=version, modules=modules)
 
 
 def div_ceil(n, d):

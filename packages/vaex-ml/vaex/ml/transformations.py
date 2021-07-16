@@ -5,8 +5,12 @@ from . import generate
 from .state import HasState
 import traitlets
 from vaex.utils import _ensure_strings_from_expressions
-import numpy as np
 import warnings
+
+sklearn = vaex.utils.optional_import("sklearn", modules=[
+    "sklearn.decomposition",
+    "sklearn.random_projection"
+])
 
 help_features = 'List of features to transform.'
 help_prefix = 'Prefix for the names of the transformed features.'
@@ -52,6 +56,7 @@ class PCA(Transformer):
     Example:
 
     >>> import vaex
+    >>> import vaex.ml
     >>> df = vaex.from_arrays(x=[2,5,7,2,15], y=[-2,3,0,0,10])
     >>> df
      #   x   y
@@ -71,31 +76,33 @@ class PCA(Transformer):
 
     '''
     # title = traitlets.Unicode(default_value='PCA', read_only=True).tag(ui='HTML')
-    n_components = traitlets.Int(help='Number of components to retain. If None, all the components will be retained.').tag(ui='IntText')
+    n_components = traitlets.Int(default_value=None, allow_none=True, help='Number of components to retain. If None, all the components will be retained.').tag(ui='IntText')
     prefix = traitlets.Unicode(default_value="PCA_", help=help_prefix)
-    progress = traitlets.CBool(default_value=False, help='If True, display a progressbar of the PCA fitting process.').tag(ui='Checkbox')
+    whiten = traitlets.Bool(default_value=False, allow_none=False, help='If True perform whitening, i.e. remove the relative variance schale of the transformed components.')
+    # progress = traitlets.Any(default_value=False, help='If True, display a progressbar of the PCA fitting process.').tag(ui='Checkbox')
     eigen_vectors_ = traitlets.List(traitlets.List(traitlets.CFloat()), help='The eigen vectors corresponding to each feature').tag(output=True)
     eigen_values_ = traitlets.List(traitlets.CFloat(), help='The eigen values that correspond to each feature.').tag(output=True)
     means_ = traitlets.List(traitlets.CFloat(), help='The mean of each feature').tag(output=True)
+    explained_variance_ = traitlets.List(traitlets.CFloat(), help='Variance explained by each of the components. Same as the eigen values.').tag(output=True)
+    explained_variance_ratio_ = traitlets.List(traitlets.CFloat(), help='Percentage of variance explained by each of the selected components.').tag(output=True)
 
-    @traitlets.default('n_components')
-    def get_n_components_default(self):
-        return len(self.features)
-
-    def fit(self, df):
+    def fit(self, df, progress=None):
         '''Fit the PCA model to the DataFrame.
 
         :param df: A vaex DataFrame.
+        :param progress: If True or 'widget', display a progressbar of the fitting process.
         '''
         self.n_components = self.n_components or len(self.features)
         assert self.n_components >= 2, 'At least two features are required.'
         assert self.n_components <= len(self.features), 'Can not have more components than features.'
-        C = df.cov(self.features, progress=self.progress)
+        C = df.cov(self.features, progress=progress)
         eigen_values, eigen_vectors = np.linalg.eigh(C)
         indices = np.argsort(eigen_values)[::-1]
-        self.means_ = df.mean(self.features, progress=self.progress).tolist()
+        self.means_ = df.mean(self.features, progress=progress).tolist()
         self.eigen_vectors_ = eigen_vectors[:, indices].tolist()
         self.eigen_values_ = eigen_values[indices].tolist()
+        self.explained_variance_ = self.eigen_values_
+        self.explained_variance_ratio_ = (eigen_values[indices] / np.sum(eigen_values)).tolist()
 
     def transform(self, df, n_components=None):
         '''Apply the PCA transformation to the DataFrame.
@@ -115,10 +122,187 @@ class PCA(Transformer):
 
         expressions = [copy[feature]-mean for feature, mean in zip(self.features, self.means_)]
         for i in range(n_components):
-            v = eigen_vectors[:, i]
-            expr = dot_product(expressions, v)
+            vector = eigen_vectors[:, i]
+            if self.whiten:
+                expr = dot_product(expressions, vector)
+                expr = f'({expr}) / {np.sqrt(self.explained_variance_[i])}'
+            else:
+                expr = dot_product(expressions, vector)
             name = self.prefix + str(i + name_prefix_offset)
             copy[name] = expr
+        return copy
+
+def dot_product(a, b):
+    products = ['%s * %s' % (ai, bi) for ai, bi in zip(a, b)]
+    return ' + '.join(products)
+
+help_prefix = 'Prefix for the names of the transformed features.'
+
+
+@register
+@generate.register
+class PCAIncremental(PCA):
+    '''Transform a set of features using the "sklearn.decomposition.IncrementalPCA" algorithm.
+
+    Note that you need to have scikit-learn installed to fit this Transformer, but not
+    for transformations using an already fitted Transformer.
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(x=[2,5,7,2,15], y=[-2,3,0,0,10])
+    >>> df
+    #    x    y
+    0    2   -2
+    1    5    3
+    2    7    0
+    3    2    0
+    4   15   10
+    >>> pca = vaex.ml.PCAIncremental(n_components=2, features=['x', 'y'], batch_size=3)
+    >>> pca.fit_transform(df)
+    #    x    y      PCA_0      PCA_1
+    0    2   -2  -5.92532   -0.413011
+    1    5    3  -0.380494   1.39112
+    2    7    0  -0.840049  -2.18502
+    3    2    0  -4.61287    1.09612
+    4   15   10  11.7587     0.110794
+    '''
+    snake_name = 'pca_incremental'
+    batch_size = traitlets.Int(default_value=1000, help='Number of samples to be send to the transformer in each batch.')
+    noise_variance_ = traitlets.CFloat(default_value=0, help='The estimated noise covariance following the Probabilistic PCA model from Tipping and Bishop 1999.').tag(output=True)
+    n_samples_seen_ = traitlets.CInt(default_value=0, help='The number of samples processed by the transformer.').tag(output=True)
+
+    def fit(self, df, progress=None):
+        '''Fit the PCAIncremental model to the DataFrame.
+
+        :param df: A vaex DataFrame.
+        :param progress: If True or 'widget', display a progressbar of the fitting process.
+        '''
+
+        self.n_components = self.n_components or len(self.features)
+
+        n_samples = len(df)
+        progressbar = vaex.utils.progressbars(progress)
+        pca = sklearn.decomposition.IncrementalPCA(n_components=self.n_components,
+                                                   batch_size=self.batch_size,
+                                                   whiten=self.whiten)
+
+        for i1, i2, chunk in df.evaluate_iterator(self.features, chunk_size=self.batch_size, array_type='numpy'):
+            progressbar(i1 / n_samples)
+            chunk = np.array(chunk).T.astype(np.float64)
+            pca.partial_fit(X=chunk, check_input=False)
+        progressbar(1.0)
+
+        self.singular_values_ = pca.singular_values_.tolist()
+        self.eigen_vectors_ = pca.components_.T.tolist()
+        self.eigen_values_ = pca.explained_variance_.tolist()
+        self.explained_variance_ = pca.explained_variance_.tolist()
+        self.explained_variance_ratio_ = pca.explained_variance_ratio_.tolist()
+        self.means_ = pca.mean_.tolist()
+        self.noise_variance_ = pca.noise_variance_
+        self.n_samples_seen_ = pca.n_samples_seen_
+
+
+@register
+@generate.register
+class RandomProjections(Transformer):
+    '''Reduce dimensionality through a random matrix projection.
+
+    The random projections method is based on the Johnson-Lindenstrauss lemma.
+    For mode details see https://en.wikipedia.org/wiki/Johnson%E2%80%93Lindenstrauss_lemma
+
+    Note that you need scikit-learn to fit this Transformer but not for transformations using an already fitter Transformer.
+
+    Example:
+
+    >>> import vaex
+    >>> import vaex.ml
+    >>> df = vaex.from_arrays(x=[2,5,7,2,15], y=[-2,3,0,0,10], z=[2, -10, 2, 3, 0])
+    >>> df
+    #    x    y    z
+    0    2   -2    2
+    1    5    3  -10
+    2    7    0    2
+    3    2    0    3
+    4   15   10    0
+    >>> rand_proj = vaex.ml.RandomProjections(features=['x', 'y', 'z'], n_components=2)
+    >>> rand_proj.fit_transform(df)
+    #    x    y    z    random_projection_0    random_projection_1
+    0    2   -2    2                1.73363             -0.0700273
+    1    5    3  -10              -17.8742             -14.0226
+    2    7    0    2               -3.32911             -8.50181
+    3    2    0    3                2.04843             -1.27538
+    4   15   10    0              -17.0289             -28.6562
+    '''
+    snake_name = 'random_projections'
+    n_components = traitlets.CInt(default_value=None, allow_none=True, help='Number of components to retain. If None (default) the number will be set via the Johnson-Lindenstrauss formula. See https://scikit-learn.org/stable/modules/generated/sklearn.random_projection.johnson_lindenstrauss_min_dim.html for more details.')
+    eps = traitlets.Float(default_value=0.1, allow_none=True, help='Parameter to control the quality of the embedding according to the Johnson-Lindenstrauss lemma when `n_components` is set to None. The value must be positive.')
+    matrix_type = traitlets.Enum(values=['gaussian', 'sparse'], default_value='gaussian', help='The type of random matrix to create. The values can be "gaussian" and "sparse".')
+    density = traitlets.Float(default_value=None, allow_none=True, help='Ratio in the range (0, 1] of non-zero component in the random projection matrix. Only valid if `matrix_type` is "sparse". If density is None, the value is set to the minimum density as recommended by Ping Li et al.: 1 / sqrt(n_features).')
+    prefix = traitlets.Unicode(default_value="random_projection_", help=help_prefix)
+    random_state = traitlets.Int(default_value=None, allow_none=True, help='Controls the pseudo random number generator used to generate the projection matrix at fit time. Used to get reproducible results.')
+    random_matrix_ = traitlets.List(traitlets.List(traitlets.CFloat()), help='The random matrix.').tag(output=True)
+
+    @traitlets.validate('eps')
+    def _valid_eps(self, proposal):
+        if (proposal['value'] > 0) & (proposal['value'] < 1):
+            return proposal['value']
+        else:
+            raise traitlets.TraitError('`eps` must be between 0 and 1.')
+
+    @traitlets.validate('density')
+    def _valid_density(self, proposal):
+        if (proposal['value'] > 0) & (proposal['value'] <= 1):
+            return proposal['value']
+        else:
+            raise traitlets.TraitError('`density` must be 0 < density <= 1.')
+
+    def fit(self, df):
+        '''Fit the RandomProjections to the DataFrame.
+
+        :param df: A vaex DataFrame.
+        '''
+        n_samples = len(df)
+        n_features = len(self.features)
+
+        if self.n_components is None:
+            self.n_components = sklearn.random_projection.johnson_lindenstrauss_min_dim(n_samples=n_samples,
+                                                                                        eps=self.eps)
+
+        if self.matrix_type == 'gaussian':
+            self.random_matrix_ = sklearn.random_projection._gaussian_random_matrix(n_components=self.n_components,
+                                                                                    n_features=n_features,
+                                                                                    random_state=self.random_state).tolist()
+
+        else:
+            density = self.density or 'auto'
+            self.random_matrix_ = sklearn.random_projection._sparse_random_matrix(n_components=self.n_components,
+                                                                                  n_features=n_features,
+                                                                                  density=density,
+                                                                                  random_state=self.random_state).toarray().tolist()
+
+
+    def transform(self, df):
+        '''Apply the RandomProjection transformation to the DataFrame.
+
+        :param df: A vaex DataFrame
+
+        :return copy: A shallow copy of the DataFrame that includes the RandomProjection components.
+        :rtype: DataFrame
+        '''
+        copy = df.copy()
+        random_matrix = np.array(self.random_matrix_)
+        name_prefix_offset = 0
+        while self.prefix + str(name_prefix_offset) in copy.get_column_names(virtual=True, strings=True):
+            name_prefix_offset += 1
+
+        for component in range(self.n_components):
+            vector = random_matrix[component]
+            expr = dot_product(self.features, vector)
+            name = self.prefix + str(component + name_prefix_offset)
+            copy[name] = expr
+
         return copy
 
 
@@ -196,7 +380,7 @@ class OneHotEncoder(Transformer):
     >>> import vaex
     >>> df = vaex.from_arrays(color=['red', 'green', 'green', 'blue', 'red'])
     >>> df
-     #  color
+     #  color®
      0  red
      1  green
      2  green
@@ -238,6 +422,8 @@ class OneHotEncoder(Transformer):
             uniques.append(unique_values)
         self.uniques_ = uniques
 
+        # detect ability to downcast to uint8
+
     def transform(self, df):
         '''Transform a DataFrame with a fitted OneHotEncoder.
 
@@ -246,17 +432,19 @@ class OneHotEncoder(Transformer):
         :rtype: DataFrame
         '''
         copy = df.copy()
+        downcast_uint8 = np.can_cast(self.one, np.uint8) and np.can_cast(self.zero, np.uint8)
+        dtype = 'uint8' if downcast_uint8 else None
         # for each feature, add a virtual column for each unique entry
         for i, feature in enumerate(self.features):
             for j, value in enumerate(self.uniques_[i]):
                 str_value = str(value) if value is not None else 'missing'
                 column_name = self.prefix + feature + '_' + str_value
                 if value is None:
-                    copy[column_name] = copy.func.where(copy[feature].ismissing(), self.one, self.zero)
+                    copy[column_name] = copy.func.where(copy[feature].ismissing(), self.one, self.zero, dtype=dtype)
                 elif isinstance(value, np.float) and np.isnan(value):
-                    copy[column_name] = copy.func.where(copy[feature].isnan(), self.one, self.zero)
+                    copy[column_name] = copy.func.where(copy[feature].isnan(), self.one, self.zero, dtype=dtype)
                 else:
-                    copy[column_name] = copy.func.where(copy[feature] == value, self.one, self.zero)
+                    copy[column_name] = copy.func.where(copy[feature] == value, self.one, self.zero, dtype=dtype)
         return copy
 
 
@@ -830,7 +1018,7 @@ class KBinsDiscretizer(Transformer):
     '''
     snake_name = 'kbins_discretizer'
     n_bins = traitlets.Int(allow_none=False, default_value=5, help='Number of bins. Must be greater than 1.')
-    strategy = traitlets.Enum(values=['uniform', 'quantile', 'kmeans'], default_value='uniform', help='Strategy used to define the widths of the bins.')
+    strategy = traitlets.Enum(values=['uniform', 'quantile', 'kmeans'], default_value='uniform', help='Strategy used to define the widths of the bins. Can be either "uniform", "quantile" or "kmeans".')
     prefix = traitlets.Unicode(default_value='binned_', help=help_prefix)
     epsilon = traitlets.Float(default_value=1e-8, allow_none=False, help='Tiny value added to the bin edges ensuring samples close to the bin edges are binned correcly.')
     n_bins_ = traitlets.Dict(help='Number of bins per feature.').tag(output=True)

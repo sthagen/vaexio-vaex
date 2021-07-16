@@ -12,6 +12,7 @@ if sys.platform.startswith("win"):
     pytest.skip("skipping windows, since it has issues re-opening files", allow_module_level=True)
 
 csv2 = os.path.join(path, 'data', 'small2.csv')
+csv3 = os.path.join(path, 'data', 'small2.csv')
 h51 = os.path.join(path, 'data', 'small2.csv.hdf5')
 h52 = os.path.join(path, 'data', 'small3.csv.hdf5')
 target_path = os.path.join(path, 'data', 'output')
@@ -98,12 +99,47 @@ def test_open():
     assert not os.path.exists(target)
 
 
+def test_open_list():
+    df2 = vaex.open(csv2)
+    df3 = vaex.open(csv3)
+    df = vaex.open([csv2, csv3])
+    assert df.x.tolist() == (df2.x.tolist() + df3.x.tolist())
+
+
+def test_open_nonstandard_extension(tmpdir):
+    df = vaex.from_scalars(x=1, s='Hello')
+    df.export_hdf5(tmpdir / 'this_is_hdf5.xyz')
+    df = vaex.open(tmpdir / 'this_is_hdf5.xyz')
+    assert df.x.tolist() == [1]
+    assert df.s.tolist() == ['Hello']
+
+
+def test_open_export_hdf5_groups(tmpdir):
+    df1 = vaex.from_arrays(s=['Groningen', 'Ohrid'])
+    df2 = vaex.from_arrays(z=[10, -10])
+    df3 = vaex.from_arrays(first_name=['Reggie', 'Michael'], last_name=['Miller', 'Jordan'])
+
+    df1.export_hdf5(tmpdir / 'hdf5_with_groups.hdf5', mode='a', group='my/table/cities')
+    df2.export_hdf5(tmpdir / 'hdf5_with_groups.hdf5', mode='a', group='my/table/coords')
+    df3.export_hdf5(tmpdir / 'hdf5_with_groups.hdf5', mode='a', group='my/table/players')
+
+    df1_open = vaex.open(tmpdir / 'hdf5_with_groups.hdf5', group='my/table/cities')
+    assert df1_open.s.tolist() == ['Groningen', 'Ohrid']
+    df2_open = vaex.open(tmpdir / 'hdf5_with_groups.hdf5', group='my/table/coords')
+    assert df2_open.z.tolist() == [10, -10]
+    df3_open = vaex.open(tmpdir / 'hdf5_with_groups.hdf5', group='my/table/players')
+    assert df3_open.first_name.tolist() == ['Reggie', 'Michael']
+    assert df3_open.last_name.tolist() == ['Miller', 'Jordan']
+
+
 def _cleanup_generated_files():
     for hdf5_file in glob.glob(os.path.join(path, 'data', '*.yaml')):
         os.remove(hdf5_file)
     for hdf5_file in glob.glob(os.path.join(path, 'data', 'output', '*.yaml')):
         os.remove(hdf5_file)
-    for hdf5_file in glob.glob(os.path.join(path, 'data', 'small*.hdf5')):
+    for hdf5_file in glob.glob(os.path.join(path, 'data', 's*.hdf5')):
         os.remove(hdf5_file)
     for hdf5_file in glob.glob(os.path.join(path, 'data', 'output', '*.hdf5')):
+        os.remove(hdf5_file)
+    for hdf5_file in glob.glob(os.path.join(path, '..', 'smæll2*')):
         os.remove(hdf5_file)

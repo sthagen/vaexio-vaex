@@ -95,6 +95,14 @@ class Meta(type):
                 def f(a, b):
                     self = a
                     # print(op, a, b)
+                    if isinstance(b, str) and self.dtype.is_datetime:
+                        b = np.datetime64(b)
+                    if self.df.is_category(self.expression) and self.df._future_behaviour and not isinstance(b, Expression):
+                        labels = self.df.category_labels(self.expression)
+                        if b not in labels:
+                            raise ValueError(f'Value {b} not present in {labels}')
+                        b = labels.index(b)
+                        a = self.index_values()
                     try:
                         stringy = isinstance(b, str) or b.is_string()
                     except:
@@ -106,6 +114,8 @@ class Meta(type):
                             b = repr(b)
                         if op['code'] == '==':
                             expression = 'str_equals({0}, {1})'.format(a.expression, b)
+                        elif op['code'] == '!=':
+                            expression = 'str_notequals({0}, {1})'.format(a.expression, b)
                         elif op['code'] == '+':
                             expression = 'str_cat({0}, {1})'.format(a.expression, b)
                         else:
@@ -193,10 +203,30 @@ class Expression(with_metaclass(Meta)):
         assert not isinstance(ds, Expression)
         if isinstance(expression, Expression):
             expression = expression.expression
+        if expression is None and ast is None:
+            raise ValueError('Not both expression and the ast can be None')
         self._ast = ast
         self._expression = expression
         self.df._expressions.append(weakref.ref(self))
         self._ast_names = None
+
+    @property
+    def _label(self):
+        '''If a column is an invalid identified, the expression is df['long name']
+        This will return 'long name' in that case, otherwise simply the expression
+        '''
+        ast = self.ast
+        if isinstance(ast, expresso._ast.Subscript):
+            value = ast.slice.value
+            if isinstance(value, expresso.ast_Str):
+                return value.s
+            if isinstance(value, str):  # py39+
+                return value
+        return self.expression
+
+    def fingerprint(self):
+        fp = vaex.cache.fingerprint(self.expression, self.df.fingerprint())
+        return f'expression-{fp}'
 
     def copy(self, df=None):
         """Efficiently copies an expression.
@@ -289,6 +319,10 @@ class Expression(with_metaclass(Meta)):
     @property
     def shape(self):
         return self.df._shape_of(self)
+
+    @property
+    def ndim(self):
+        return 1 if self.dtype.is_list else len(self.df._shape_of(self))
 
     def to_arrow(self, convert_to_native=False):
         '''Convert to Apache Arrow array (will byteswap/copy if convert_to_native=True).'''
@@ -556,16 +590,30 @@ class Expression(with_metaclass(Meta)):
         '''
         expression = self
         if axis is None:
-            axis = [0]
             dtype = self.dtype
-            while dtype.is_list:
-                axis.append(axis[-1] + 1)
-                dtype = dtype.value_type
+            if dtype.is_list:
+                axis = [0]
+                while dtype.is_list:
+                    axis.append(axis[-1] + 1)
+                    dtype = dtype.value_type
+            elif self.ndim > 1:
+                axis = list(range(self.ndim))
+            else:
+                axis = [0]
         elif not isinstance(axis, list):
             axis = [axis]
             axis = list(set(axis))  # remove repeated elements
         dtype = self.dtype
-        if 1 in axis:
+        if self.ndim > 1:
+            array_axes = axis.copy()
+            if 0 in array_axes:
+                array_axes.remove(0)
+            expression = expression.array_sum(axis=array_axes)
+            for i in array_axes:
+                axis.remove(i)
+                del i
+            del array_axes
+        elif 1 in axis:
             if self.dtype.is_list:
                 expression = expression.list_sum()
                 if axis:
@@ -574,6 +622,8 @@ class Expression(with_metaclass(Meta)):
                 raise ValueError(f'axis=1 not supported for dtype={dtype}')
         if axis and axis[0] != 0:
             raise ValueError(f'Only axis 0 or 1 is supported')
+        if expression.ndim > 1:
+            raise ValueError(f'Cannot sum non-scalar (ndim={expression.ndim})')
         if axis is None or 0 in axis:
             kwargs = dict(locals())
             del kwargs['self']
@@ -842,7 +892,10 @@ def f({0}):
         slices = expression._ast_slices
         if old in slices:
             for node in slices[old]:
-                node.slice.value.s = new
+                if node.value.id == 'df' and isinstance(node.slice.value, ast.Str):
+                    node.slice.value.s = new
+                else:  # py39
+                    node.slice.value = new
         expression._expression = None  # resets the cached string representation
         return expression
 
@@ -861,15 +914,16 @@ def f({0}):
         """
         if use_hashmap:
             # easiest way to create a set is using the vaex dataframe
+            values = np.array(values, dtype=self.dtype.numpy)  # ensure that values are the same dtype as the expression (otherwise the set downcasts at the C++ level during execution)
             df_values = vaex.from_arrays(x=values)
             ordered_set = df_values._set(df_values.x)
             var = self.df.add_variable('var_isin_ordered_set', ordered_set, unique=True)
             return self.df['isin_set(%s, %s)' % (self, var)]
         else:
             if self.is_string():
-                values = vaex.column._to_string_sequence(values)
+                values = pa.array(values)
             else:
-                values = np.array(values, dtype=self.dtype)
+                values = np.array(values, dtype=self.dtype.numpy)
             var = self.df.add_variable('isin_values', values, unique=True)
             return self.df['isin(%s, %s)' % (self, var)]
 
@@ -1091,6 +1145,9 @@ class FunctionSerializablePickle(FunctionSerializable):
         self.f = f
         self.multiprocessing = multiprocessing
 
+    def __eq__(self, rhs):
+        return self.f == rhs.f
+
     def pickle(self, function):
         return pickle.dumps(function)
 
@@ -1287,7 +1344,6 @@ class Function(object):
         arg_string = ", ".join([str(k) for k in args] + ['{}={:r}'.format(name, value) for name, value in kwargs.items()])
         expression = "{}({})".format(self.name, arg_string)
         return Expression(self.dataset, expression)
-
 
 class FunctionBuiltin(object):
 

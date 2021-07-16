@@ -20,11 +20,12 @@ url = 'https://www.github.com/maartenbreddels/vaex'
 # TODO: can we do without requests and progressbar2?
 # TODO: after python2 supports frops, future and futures can also be dropped
 # TODO: would be nice to have astropy only as dep in vaex-astro
-install_requires_core = ["numpy>=1.16", "astropy>=2", "aplus", "tabulate>=0.8.3",
-                         "future>=0.15.2", "pyyaml", "progressbar2", "psutil>=1.2.1",
-                         "requests", "six", "cloudpickle", "pandas", "dask[array]",
+install_requires_core = ["numpy>=1.16", "aplus", "tabulate>=0.8.3",
+                         "future>=0.15.2", "pyyaml", "progressbar2",
+                         "requests", "six", "cloudpickle", "pandas", "dask",
                          "nest-asyncio>=1.3.3", "pyarrow>=3.0", "frozendict",
-                         "blake3"]
+                         "blake3"
+                        ]
 if sys.version_info[0] == 2:
     install_requires_core.append("futures>=2.2.0")
 install_requires_viz = ["matplotlib>=1.3.1", ]
@@ -69,7 +70,7 @@ if platform.system().lower() == 'windows':
     dll_files = ['pcre.dll', 'pcrecpp.dll', 'vcruntime140_1.dll']
 else:
     # TODO: maybe enable these flags for non-wheel/conda builds? ["-mtune=native", "-march=native"]
-    extra_compile_args = ["-std=c++11", "-mfpmath=sse", "-O3", "-funroll-loops"]
+    extra_compile_args = ["-std=c++11", "-O3", "-funroll-loops"]
     extra_compile_args.append("-g")
 if sys.platform == 'darwin':
     extra_compile_args.append("-mmacosx-version-min=10.9")
@@ -92,7 +93,7 @@ extension_strings = Extension("vaex.superstrings", [os.path.relpath(os.path.join
                                library_dirs=[
                                    os.path.join(sys.prefix, 'lib'),
                                    os.path.join(sys.prefix, 'Library', 'lib'), # windows
-                                   os.path.join(dirname, 'vendor', 'pcre', 'Library', 'lib') # windows pcre from conda-forge
+                                   os.path.join(dirname, 'vendor', 'pcre', 'Library', 'lib'), # windows pcre from conda-forge
                                ],
                                extra_compile_args=extra_compile_args,
                                libraries=['pcre', 'pcrecpp']

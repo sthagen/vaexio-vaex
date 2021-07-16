@@ -4,8 +4,15 @@ import vaex
 import vaex.ml
 import vaex.ml.datasets
 pytest.importorskip("sklearn")
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, IncrementalPCA
+from sklearn.random_projection import GaussianRandomProjection, SparseRandomProjection
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler
+
+
+def data_maker(n_rows, n_cols):
+    return {f'feat_{i}': np.random.normal(loc=np.random.uniform(-100, 100),
+                                          scale=np.random.uniform(0.5, 25),
+                                          size=n_rows) for i in range(n_cols)}
 
 
 def test_pca(df_iris):
@@ -35,6 +42,66 @@ def test_valid_sklearn_pca(df_iris):
     ds_pca = ds.ml.pca(n_components=3, features=features)
     # Compare the two approaches
     np.testing.assert_almost_equal(ds_pca.evaluate('PCA_0'), sklearn_trans[:, 0])
+
+
+def test_pca_incremental(df_iris):
+    df = df_iris
+    features = ['sepal_width', 'petal_length', 'sepal_length', 'petal_width']
+    pca = vaex.ml.PCAIncremental(features=features, n_components=2)
+    df_transformed = pca.fit_transform(df)
+    assert pca.n_samples_seen_ == 150
+    assert len(pca.eigen_values_) == 2
+    assert len(pca.explained_variance_) == 2
+    assert len(df_transformed.get_column_names()) == 7
+    assert len(df_transformed.get_column_names(regex='^PCA_')) == 2
+
+
+def test_valid_sklearn_pca_incremental(df_iris):
+    df = df_iris
+    features = ['sepal_width', 'petal_length', 'sepal_length', 'petal_width']
+    # scikit-learn
+    sk_pca = IncrementalPCA(batch_size=10)
+    sk_result = sk_pca.fit_transform(df[features].values)
+    # vaex-ml
+    vaex_pca = vaex.ml.PCAIncremental(features=features, batch_size=10)
+    df_transformed = vaex_pca.fit_transform(df)
+    # Compare the results
+    np.testing.assert_almost_equal(df_transformed.evaluate('PCA_0'), sk_result[:, 0])
+    np.testing.assert_almost_equal(df_transformed.evaluate('PCA_1'), sk_result[:, 1])
+
+
+@pytest.mark.parametrize("n_components", [5, 15, 150])
+@pytest.mark.parametrize("matrix_type", ['gaussian', 'sparse'])
+def test_random_projections(n_components, matrix_type):
+    df = vaex.from_dict(data=data_maker(n_rows=100_000, n_cols=31))
+    features = df.get_column_names()
+
+    rand_proj = df.ml.random_projections(features=features, n_components=n_components, matrix_type=matrix_type, transform=False)
+    df_trans = rand_proj.fit_transform(df)
+
+    assert np.array(rand_proj.random_matrix_).shape == (n_components, 31)
+    assert len(df_trans.get_column_names(regex='^rand')) == n_components
+
+
+@pytest.mark.parametrize("matrix_type", ['gaussian', 'sparse'])
+def test_valid_sklearn_random_projections(df_iris, matrix_type):
+    df = df_iris
+    features = df.get_column_names()[:4]
+    random_state=42
+
+    rand_proj = vaex.ml.RandomProjections(features=features, n_components=3, matrix_type=matrix_type, random_state=random_state)
+    df_trans = rand_proj.fit_transform(df)
+    result = df_trans[df_trans.get_column_names(regex='^rand*')].values
+
+    if matrix_type == 'gaussian':
+        sk_gaus = GaussianRandomProjection(n_components=3, random_state=random_state)
+        sk_trans = sk_gaus.fit_transform(df[features].values)
+
+    else:
+        sk_sparse = SparseRandomProjection(n_components=3, random_state=random_state, dense_output=True)
+        sk_trans = sk_sparse.fit_transform(df[features].values)
+
+    np.testing.assert_almost_equal(result, sk_trans)
 
 
 def test_standard_scaler(df_iris):
@@ -240,6 +307,13 @@ def test_one_hot_encoding_with_na(df_factory):
     assert df_train['y_31.0'].tolist() == [1, 0, 0, 1]
     assert df_train['y_nan'].tolist() == [0, 0, 1, 0]
 
+    assert(str(df_train.x_missing.dtype) == 'uint8')
+    assert(str(df_train.x_Michael.dtype) == 'uint8')
+    assert(str(df_train.x_Reggie.dtype) == 'uint8')
+    assert(str(df_train['y_23.0'].dtype) == 'uint8')
+    assert(str(df_train['y_31.0'].dtype) == 'uint8')
+    assert(str(df_train['y_nan'].dtype) == 'uint8')
+
     df_test = enc.transform(df_test)
     assert df_test.x_missing.tolist() == [0, 0, 1, 1]
     assert df_test.x_Michael.tolist() == [1, 0, 0, 0]
@@ -247,6 +321,13 @@ def test_one_hot_encoding_with_na(df_factory):
     assert df_test['y_23.0'].tolist() == [1, 0, 0, 0]
     assert df_test['y_31.0'].tolist() == [0, 1, 0, 0]
     assert df_test['y_nan'].tolist() == [0, 0, 1, 1]
+
+    assert(str(df_test.x_missing.dtype) == 'uint8')
+    assert(str(df_test.x_Michael.dtype) == 'uint8')
+    assert(str(df_test.x_Reggie.dtype) == 'uint8')
+    assert(str(df_test['y_23.0'].dtype) == 'uint8')
+    assert(str(df_test['y_31.0'].dtype) == 'uint8')
+    assert(str(df_test['y_nan'].dtype) == 'uint8')
 
 
 def test_maxabs_scaler(df_factory):
@@ -256,7 +337,7 @@ def test_maxabs_scaler(df_factory):
     w = np.zeros_like(x)
 
     ds = df_factory(x=x, y=y, z=z, w=w)
-    df = ds.to_pandas_df()
+    df = ds.to_pandas_df(array_type='numpy')
 
     features = ['x', 'y', 'w']
 
@@ -275,7 +356,7 @@ import sys
 import platform
 version = tuple(map(int, numpy.__version__.split('.')))
 
-@pytest.mark.skipif(platform.system().lower() != 'darwin', reason="strange ref count issue with numpy")
+@pytest.mark.skipif(platform.system().lower() == 'windows', reason="strange ref count issue with numpy")
 def test_robust_scaler(df_factory):
     x = np.array([-2.65395789, -7.97116295, -4.76729177, -0.76885033, -6.45609635])
     y = np.array([-8.9480332, -4.81582449, -3.73537263, -3.46051912,  1.35137275])
@@ -283,7 +364,7 @@ def test_robust_scaler(df_factory):
     w = np.zeros_like(x)
 
     ds = df_factory(x=x, y=y, z=z, w=w)
-    df = ds.to_pandas_df()
+    df = ds.to_pandas_df(array_type='numpy')
 
     features = ['x', 'y']
 
@@ -348,9 +429,11 @@ def test_weight_of_evidence_encoder(tmpdir, as_bool, df_factory):
 
     trans = vaex.ml.WeightOfEvidenceEncoder(target='y', features=['x'])
     df_train = trans.fit_transform(df_train)
+    np.testing.assert_almost_equal(list(trans.mappings_['x'].values()),
+                               [13.815510557964274, 1.0986122886681098, 0.0],
+                               decimal=10)
     np.testing.assert_array_almost_equal(df_train.woe_encoded_x.values,
                                          [13.815510, 13.815510, 1.098612, 1.098612, 1.098612, 1.098612, 0., 0.])
-    assert trans.mappings_ == {'x': {'a': 13.815510557964274, 'b': 1.0986122886681098, 'c': 0.0}}
 
     state_path = str(tmpdir.join('state.json'))
     df_train.state_write(state_path)
@@ -444,7 +527,7 @@ def test_groupby_transformer_serialization(df_factory):
     assert df_test.x.tolist() == ['dog', 'cat', 'dog', 'mouse']
     assert df_test.y.tolist() == [5, 5, 5, 5]
 
-@pytest.mark.skipif(platform.system().lower() != 'darwin', reason="strange ref count issue with numpy")
+@pytest.mark.skipif(platform.system().lower() == 'windows', reason="strange ref count issue with numpy")
 @pytest.mark.parametrize('strategy', ['uniform', 'quantile', 'kmeans'])
 def test_kbinsdiscretizer(tmpdir, strategy):
     df_train = vaex.from_arrays(x=[0, 2.5, 5, 7.5, 10, 12.5, 15],

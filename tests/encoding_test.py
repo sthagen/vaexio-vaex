@@ -24,8 +24,8 @@ def test_encoding():
     assert values['someblob'] == b'1234'
 
 
-def test_encoding_arrow():
-    x = pa.array(np.arange(10, dtype='f4'))
+def test_encoding_arrow(array_factory_arrow):
+    x = array_factory_arrow(np.arange(10, dtype='f4'))
     encoding = vaex.encoding.Encoding()
     data = encoding.encode('arrow-array', x)
     wiredata = vaex.encoding.serialize(data, encoding)
@@ -98,3 +98,17 @@ def test_encoding_numpy_string_objects():
     data = vaex.encoding.deserialize(wiredata, encoding)
     value = encoding.decode('ndarray', data)
     assert np.all(value == x)
+
+
+def test_encoding_dtype():
+    dtype = np.dtype('>f8')
+    encoding = vaex.encoding.Encoding()
+    data = encoding.encode('dtype', dtype)
+    wiredata = vaex.encoding.serialize(data, encoding)
+
+    encoding = vaex.encoding.Encoding()
+    data = vaex.encoding.deserialize(wiredata, encoding)
+    print(data)
+    value = encoding.decode('dtype', data)
+    assert value == dtype
+    assert value.is_numpy
