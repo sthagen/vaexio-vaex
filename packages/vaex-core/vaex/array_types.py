@@ -199,8 +199,19 @@ def numpy_dtype(x, strict=True):
         arrow_type = x.type
         from .datatype import DataType
         # dtype = DataType(arrow_type)
-        dtype = arrow_type.to_pandas_dtype()
-        dtype = np.dtype(dtype)  # turn into instance
+        if pa.types.is_timestamp(arrow_type):
+            # https://arrow.apache.org/docs/python/pandas.html#type-differences says:
+            #  'Also datetime64 is currently fixed to nanosecond resolution.'
+            # so we need to do this ourselves
+            unit = arrow_type.unit
+            dtype = np.dtype(f'datetime64[{unit}]')
+        else:
+            try:
+                dtype = arrow_type.to_pandas_dtype()
+            except NotImplementedError:
+                # assume dtype object as fallback in case arrow has no pandas dtype equivalence
+                dtype = 'O'
+            dtype = np.dtype(dtype)  # turn into instance
         if strict:
             return dtype
         else:

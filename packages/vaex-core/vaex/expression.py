@@ -1,6 +1,8 @@
 import ast
+import copy
 import os
 import base64
+import time
 import cloudpickle as pickle
 import functools
 import operator
@@ -10,6 +12,7 @@ import weakref
 
 from future.utils import with_metaclass
 import numpy as np
+import pandas as pd
 import tabulate
 import pyarrow as pa
 from vaex.datatype import DataType
@@ -196,6 +199,170 @@ class StringOperationsPandas(object):
         self.expression = expression
 
 
+class StructOperations(collections.abc.Mapping):
+    """Struct Array operations.
+
+    Usually accessed using e.g. `df.name.struct.get('field1')`
+
+    """
+
+    def __init__(self, expression):
+        self.expression = expression
+        self._array = self.expression.values
+
+    def __iter__(self):
+        for name in self.keys():
+            yield name
+
+    def __getitem__(self, key):
+        """Return struct field by either field name (string) or index position (index).
+
+        In case of ambiguous field names, a `LookupError` is raised.
+
+        """
+
+        self._assert_struct_dtype()
+        return self.get(key)
+
+    def __len__(self):
+        """Return the number of struct fields contained in struct array.
+
+        """
+
+        self._assert_struct_dtype()
+        return len(self._array.type)
+
+    def keys(self):
+        """Return all field names contained in struct array.
+
+        :returns: list of field names.
+
+        Example:
+
+        >>> import vaex
+        >>> import pyarrow as pa
+        >>> array = pa.StructArray.from_arrays(arrays=[[1,2], ["a", "b"]], names=["col1", "col2"])
+        >>> df = vaex.from_arrays(array=array)
+        >>> df
+        # 	array
+        0	{'col1': 1, 'col2': 'a'}
+        1	{'col1': 2, 'col2': 'b'}
+
+        >>> df.array.struct.keys()
+        ["col1", "col2"]
+
+        """
+
+        self._assert_struct_dtype()
+        return [field.name for field in self._array.type]
+
+    def values(self):
+        """Return all fields as vaex expressions.
+
+        :returns: list of vaex expressions corresponding to each field in struct.
+
+        Example:
+
+        >>> import vaex
+        >>> import pyarrow as pa
+        >>> array = pa.StructArray.from_arrays(arrays=[[1,2], ["a", "b"]], names=["col1", "col2"])
+        >>> df = vaex.from_arrays(array=array)
+        >>> df
+        # 	array
+        0	{'col1': 1, 'col2': 'a'}
+        1	{'col1': 2, 'col2': 'b'}
+
+        >>> df.array.struct.values()
+        [Expression = struct_get(array, 0)
+         Length: 2 dtype: int64 (expression)
+         -----------------------------------
+         0  1
+         1  2,
+         Expression = struct_get(array, 1)
+         Length: 2 dtype: string (expression)
+         ------------------------------------
+         0  a
+         1  b]
+
+        """
+
+        self._assert_struct_dtype()
+        return [self[i] for i in range(len(self))]
+
+    def items(self):
+        """Return all fields with names along with corresponding vaex expressions.
+
+        :returns: list of tuples with field names and fields as vaex expressions.
+
+        Example:
+
+        >>> import vaex
+        >>> import pyarrow as pa
+        >>> array = pa.StructArray.from_arrays(arrays=[[1,2], ["a", "b"]], names=["col1", "col2"])
+        >>> df = vaex.from_arrays(array=array)
+        >>> df
+        # 	array
+        0	{'col1': 1, 'col2': 'a'}
+        1	{'col1': 2, 'col2': 'b'}
+
+        >>> df.array.struct.items()
+        [('col1',
+          Expression = struct_get(array, 0)
+          Length: 2 dtype: int64 (expression)
+          -----------------------------------
+          0  1
+          1  2),
+         ('col2',
+          Expression = struct_get(array, 1)
+          Length: 2 dtype: string (expression)
+          ------------------------------------
+          0  a
+          1  b)]
+
+        """
+
+        self._assert_struct_dtype()
+        return list(zip(self.keys(), self.values()))
+
+    @property
+    def dtypes(self):
+        """Return all field names along with corresponding types.
+
+        :returns: a pandas series with keys as index and types as values.
+
+        Example:
+
+        >>> import vaex
+        >>> import pyarrow as pa
+        >>> array = pa.StructArray.from_arrays(arrays=[[1,2], ["a", "b"]], names=["col1", "col2"])
+        >>> df = vaex.from_arrays(array=array)
+        >>> df
+        # 	array
+        0	{'col1': 1, 'col2': 'a'}
+        1	{'col1': 2, 'col2': 'b'}
+
+        >>> df.array.struct.dtypes
+        col1     int64
+        col2    string
+        dtype: object
+
+        """
+
+        self._assert_struct_dtype()
+        dtypes = (field.type for field in self._array.type)
+        vaex_dtypes = [DataType(x) for x in dtypes]
+
+        return pd.Series(vaex_dtypes, index=self.keys())
+
+    def _assert_struct_dtype(self):
+        """Ensure that struct operations are only called on valid struct dtype.
+
+        """
+
+        from vaex.struct import assert_struct_dtype
+        assert_struct_dtype(self._array)
+
+
 class Expression(with_metaclass(Meta)):
     """Expression class"""
     def __init__(self, ds, expression, ast=None):
@@ -310,11 +477,11 @@ class Expression(with_metaclass(Meta)):
 
     @property
     def dtype(self):
-        return self.df.data_type(self.expression)
+        return self.df.data_type(self)
 
     # TODO: remove this method?
     def data_type(self, array_type=None, axis=0):
-        return self.df.data_type(self.expression, axis=axis)
+        return self.df.data_type(self, axis=axis)
 
     @property
     def shape(self):
@@ -362,8 +529,88 @@ class Expression(with_metaclass(Meta)):
         import pandas as pd
         return pd.Series(self.values)
 
-    def __getitem__(self, slice):
-        return self.ds[slice][self.expression]
+    def __getitem__(self, slicer):
+        """Provides row and optional field access (struct arrays) via bracket notation.
+
+        Examples:
+
+        >>> import vaex
+        >>> import pyarrow as pa
+        >>> array = pa.StructArray.from_arrays(arrays=[[1, 2, 3], ["a", "b", "c"]], names=["col1", "col2"])
+        >>> df = vaex.from_arrays(array=array, integer=[5, 6, 7])
+        >>> df
+        # 	array 	                    integer
+        0	{'col1': 1, 'col2': 'a'}	5
+        1	{'col1': 2, 'col2': 'b'}	6
+        2	{'col1': 3, 'col2': 'c'}	7
+
+        >>> df.integer[1:]
+        Expression = integer
+        Length: 2 dtype: int64 (column)
+        -------------------------------
+        0  6
+        1  7
+
+        >>> df.array[1:]
+        Expression = array
+        Length: 2 dtype: struct<col1: int64, col2: string> (column)
+        -----------------------------------------------------------
+        0  {'col1': 2, 'col2': 'b'}
+        1  {'col1': 3, 'col2': 'c'}
+
+        >>> df.array[:, "col1"]
+        Expression = struct_get(array, 'col1')
+        Length: 3 dtype: int64 (expression)
+        -----------------------------------
+        0  1
+        1  2
+        2  3
+
+        >>> df.array[1:, ["col1"]]
+        Expression = struct_project(array, ['col1'])
+        Length: 2 dtype: struct<col1: int64> (expression)
+        -------------------------------------------------
+        0  {'col1': 2}
+        1  {'col1': 3}
+
+        >>> df.array[1:, ["col2", "col1"]]
+        Expression = struct_project(array, ['col2', 'col1'])
+        Length: 2 dtype: struct<col2: string, col1: int64> (expression)
+        ---------------------------------------------------------------
+        0  {'col2': 'b', 'col1': 2}
+        1  {'col2': 'c', 'col1': 3}
+
+        """
+
+        if isinstance(slicer, slice):
+            indices = slicer
+            fields = None
+        elif isinstance(slicer, tuple) and len(slicer) == 2:
+            indices, fields = slicer
+        else:
+            raise NotImplementedError
+        
+        if indices != slice(None):
+            expr = self.df[indices][self.expression]
+        else:
+            expr = self
+
+        if fields is None:
+            return expr
+        elif isinstance(fields, (int, str)):
+            if self.dtype.is_struct:
+                return expr.struct.get(fields)
+            elif self.ndim == 2:
+                if not isinstance(fields, int):
+                    raise TypeError(f'Expected an integer, not {type(fields)}')
+                else:
+                    return expr.getitem(fields)
+            else:
+                raise TypeError(f'Only getting struct fields or 2d columns supported')
+        elif isinstance(fields, (tuple, list)):
+            return expr.struct.project(fields)
+        else:
+            raise TypeError("Invalid type provided. Needs to be None, str or list/tuple.")
 
     def __abs__(self):
         """Returns the absolute value of the expression"""
@@ -388,6 +635,11 @@ class Expression(with_metaclass(Meta)):
     def str_pandas(self):
         """Gives access to string operations via :py:class:`StringOperationsPandas` (using Pandas Series)"""
         return StringOperationsPandas(self)
+
+    @property
+    def struct(self):
+        """Gives access to struct operations via :py:class:`StructOperations`"""
+        return StructOperations(self)
 
     @property
     def values(self):
@@ -707,6 +959,9 @@ class Expression(with_metaclass(Meta)):
         from pandas import Series
         if axis is not None:
             raise ValueError('only axis=None is supported')
+        if dropna:
+            dropnan = True
+            dropmissing = True
 
         data_type = self.data_type()
         data_type_item = self.data_type(axis=-1)
@@ -722,7 +977,7 @@ class Expression(with_metaclass(Meta)):
         counters = [None] * self.ds.executor.thread_pool.nthreads
         def map(thread_index, i1, i2, ar):
             if counters[thread_index] is None:
-                counters[thread_index] = counter_type()
+                counters[thread_index] = counter_type(1)
             if data_type.is_list and axis is None:
                 ar = ar.values
             if data_type_item.is_string:
@@ -739,48 +994,70 @@ class Expression(with_metaclass(Meta)):
             return a+b
         self.ds.map_reduce(map, reduce, [self.expression], delay=False, progress=progress, name='value_counts', info=True, to_numpy=False)
         counters = [k for k in counters if k is not None]
-        counter0 = counters[0]
+        counter = counters[0]
         for other in counters[1:]:
-            counter0.merge(other)
-        value_counts = counter0.extract()
-        index = np.array(list(value_counts.keys()))
-        counts = np.array(list(value_counts.values()))
+            counter.merge(other)
+        if data_type_item.is_object:
+            # for dtype=object we use the old interface
+            # since we don't care about multithreading (cannot release the GIL)
+            key_values = counter.extract()
+            keys = list(key_values.keys())
+            counts = list(key_values.values())
+            if counter.has_nan and not dropnan:
+                keys = [np.nan] + keys
+                counts = [counter.nan_count] + counts
+            if counter.has_null and not dropmissing:
+                keys = [None] + keys
+                counts = [counter.null_count] + counts
+            if dropmissing and None in keys:
+                # we still can have a None in the values
+                index = keys.index(None)
+                keys.pop(index)
+                counts.pop(index)
+            counts = np.array(counts)
+            keys = np.array(keys)
+        else:
+            keys = counter.key_array()
+            counts = counter.counts()
+            if isinstance(keys, (vaex.strings.StringList32, vaex.strings.StringList64)):
+                keys = vaex.strings.to_arrow(keys)
+
+            deletes = []
+            if counter.has_nan:
+                null_offset = 1
+            else:
+                null_offset = 0
+            if dropmissing and counter.has_null:
+                deletes.append(null_offset)
+            if dropnan and counter.has_nan:
+                deletes.append(0)
+            if vaex.array_types.is_arrow_array(keys):
+                indices = np.delete(np.arange(len(keys)), deletes)
+                keys = keys.take(indices)
+            else:
+                keys = np.delete(keys, deletes)
+                if not dropmissing and counter.has_null:
+                    mask = np.zeros(len(keys), dtype=np.uint8)
+                    mask[null_offset] = 1
+                    keys = np.ma.array(keys, mask=mask)
+            counts = np.delete(counts, deletes)
 
         order = np.argsort(counts)
         if not ascending:
             order = order[::-1]
         counts = counts[order]
-        index = index[order]
-        # nan can already be present for dtype=object, remove it
-        nan_mask = index != index
-        if np.any(nan_mask):
-            index = index[~mask]
-            counts = index[~mask]
-        # nan can already be present for dtype=object, optionally remove it
-        none_mask = index == None
-        if np.any(none_mask):
-            index = index.tolist()
-            counts = counts.tolist()
-            i = index.index(None)
-            if (dropmissing or dropna):
-                del index[i]
-                del counts[i]
-            else:
-                index[i] = "missing"
-            index = np.array(index)
-            counts = np.array(counts)
+        keys = keys.take(order)
 
-        if not dropna or not dropnan or not dropmissing:
-            index = index.tolist()
+        keys = keys.tolist()
+        if None in keys:
+            index = keys.index(None)
+            keys.pop(index)
+            keys = ["missing"] + keys
             counts = counts.tolist()
-            if not (dropnan or dropna) and counter0.nan_count:
-                index = [np.nan] + index
-                counts = [counter0.nan_count] + counts
-            if not (dropmissing or dropna) and counter0.null_count:
-                index = ['missing'] + index
-                counts = [counter0.null_count] + counts
+            count_null = counts.pop(index)
+            counts = [count_null] + counts
 
-        return Series(counts, index=index)
+        return Series(counts, index=keys)
 
     @docsubst
     def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, array_type='list', delay=False):
@@ -792,7 +1069,7 @@ class Expression(with_metaclass(Meta)):
         :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         :param bool array_type: {array_type}
         """
-        return self.ds.unique(self.expression, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, array_type=array_type, axis=axis, delay=delay)
+        return self.ds.unique(self, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, array_type=array_type, axis=axis, delay=delay)
 
     def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, delay=False):
         """Counts number of unique values, i.e. `len(df.x.unique()) == df.x.nunique()`.
@@ -802,6 +1079,16 @@ class Expression(with_metaclass(Meta)):
         :param dropna: short for any of the above, (see :func:`Expression.isna`)
         :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         """
+        if delay is False and vaex.cache.is_on():
+            fp = vaex.cache.fingerprint(self.fingerprint(), dropna, dropnan, dropmissing, selection, axis)
+            key = f'nunique-{fp}'
+            value = vaex.cache.get(key, type='computed')
+            if value is None:
+                t0 = time.time()
+                value = len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis))
+                duration_wallclock = time.time() - t0
+                vaex.cache.set(key, value, type='computed', duration_wallclock=duration_wallclock)
+            return value
         return len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, delay=delay))
 
     def countna(self):
@@ -1043,6 +1330,7 @@ def f({0}):
 
         df = self.ds
         mapper_keys = list(mapper.keys())
+        mapper_values = list(mapper.values())
         try:
             mapper_nan_key_mask = np.isnan(mapper_keys)
         except TypeError:
@@ -1089,35 +1377,33 @@ def f({0}):
                 if only_has_nan:
                     pass  # we're good, the hash mapper deals with nan
                 else:
-                    raise ValueError('Missing %i values in mapper: %s' % (len(missing), missing))
+                    if missing != {None}:
+                        raise ValueError('Missing %i values in mapper: %s' % (len(missing), missing))
 
         # and these are the corresponding choices
         # note that here we map 'planned' unknown values to the default values
         # and later on in _choose, we map values not even seen in the dataframe
         # to the default_value
-        dtype = self.data_type(self.expression)
         dtype_item = self.data_type(self.expression, axis=-1)
-        if dtype_item.is_float:
-            print(nan_value)
-            values  = [np.nan, None] + [key for key in mapper if key == key and key is not None]
-            choices = [default_value, nan_value, missing_value] + [mapper[key] for key in mapper if key == key and key is not None]
+        null_count = mapper_keys.count(None)
+        nan_count = len([k for k in mapper_keys if k != k])
+        if null_count:
+            null_value = mapper_keys.index(None)
         else:
-            values  = [None] + [key for key in mapper if key is not None]
-            choices = [default_value, missing_value] + [mapper[key] for key in mapper if key is not None]
-        values = pa.array(values)
-        choices = pa.array(choices)
+            null_value = 0x7fffffff
+
+        mapper_keys = dtype_item.create_array(mapper_keys)
+        if vaex.array_types.is_string_type(dtype_item):
+            mapper_keys = _to_string_sequence(mapper_keys)
+
         from .hash import ordered_set_type_from_dtype
         ordered_set_type = ordered_set_type_from_dtype(dtype_item)
-        ordered_set = ordered_set_type()
-        if vaex.array_types.is_string_type(dtype_item):
-            values = _to_string_sequence(values)
-        else:
-            values = vaex.array_types.to_numpy(values)
-        if np.ma.isMaskedArray(values):
-            mask = np.ma.getmaskarray(values)
-            ordered_set.update(values.data, mask)
-        else:
-            ordered_set.update(values)
+        ordered_set = ordered_set_type(mapper_keys, null_value, nan_count, null_count)
+        indices = ordered_set.map_ordinal(mapper_keys)
+        mapper_values = [mapper_values[i] for i in indices]
+
+        choices = [default_value] + [mapper_values[index] for index in indices]
+        choices = pa.array(choices)
 
         key_set_name = df.add_variable('map_key_set', ordered_set, unique=True)
         choices_name = df.add_variable('map_choices', choices, unique=True)

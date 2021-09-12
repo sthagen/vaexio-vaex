@@ -66,7 +66,7 @@ class FitsBinTable(DatasetMemoryMapped):
                                         dtypecode += str(arraylength)
                                     logger.debug("column type: %r", (column.name, offset, dtype, length, column.format, column.dim))
                                     if arraylength == 1 or dtypecode[0] == "a":
-                                        ar = self._map_array(offset=offset, dtype=dtype, length=length)
+                                        ar = self._map_array(offset=offset, dtype=dtype, shape=(length,))
                                         self.add_column(column_name, ar)
                                     else:
                                         for i in range(arraylength):
@@ -170,7 +170,7 @@ def empty(filename, length, column_names, data_types, data_shapes, ucds, units, 
 			pass
 
 		def write(key, value, comment=""):
-			first_part = "{key:8}= {value:20} / ".format(key=key, value=value)
+			first_part = "{key:8}= {value:>20} / ".format(key=key, value=value)
 			f.write(first_part.encode("ascii"))
 			leftover = 80 - len(first_part)
 			f.write(("{comment:"+str(leftover) +"}").format(comment=comment).encode("ascii"))

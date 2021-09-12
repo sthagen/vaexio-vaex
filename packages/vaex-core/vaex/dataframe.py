@@ -379,7 +379,10 @@ class DataFrame(object):
             for task in self.executor.tasks:
                 print(repr(task))
         from .asyncio import just_run
-        just_run(self.execute_async())
+        if self.executor.tasks:
+            # we only run when there are tasks, since we may trigger this
+            # call in an async loop context that cannot be patched (like uvloop)
+            just_run(self.execute_async())
 
     async def execute_async(self):
         '''Async version of execute'''
@@ -455,10 +458,11 @@ class DataFrame(object):
             pass
         return self.map_reduce(map, reduce, expressions, delay=delay, progress=progress, name='nop', to_numpy=False)
 
-    def _set(self, expression, progress=False, selection=None, flatten=True, delay=False, unique_limit=None):
+    def _set(self, expression, progress=False, selection=None, flatten=True, delay=False, unique_limit=None, return_inverse=False):
         if selection is not None:
             selection = str(selection)
-        task = vaex.tasks.TaskSetCreate(self, str(expression), flatten, unique_limit=unique_limit, selection=selection)
+        expression = _ensure_string_from_expression(expression)
+        task = vaex.tasks.TaskSetCreate(self, expression, flatten, unique_limit=unique_limit, selection=selection, return_inverse=return_inverse)
         task = self.executor.schedule(task)
         return self._delay(delay, task)
 
@@ -493,7 +497,7 @@ class DataFrame(object):
         def map(thread_index, i1, i2, ar):
             index = indices.get()
             if index is None:
-                index = index_type()
+                index = index_type(1)
                 if hasattr(index, 'reserve'):
                     index.reserve(capacity_initial)
             if vaex.array_types.is_string_type(dtype):
@@ -559,11 +563,42 @@ class DataFrame(object):
                 def reduce(a, b):
                     pass
                 self.map_reduce(map, reduce, [expression], delay=delay, name='unique_return_inverse', info=True, to_numpy=False, selection=selection)
-            keys = ordered_set.keys()
-            if not dropnan and ordered_set.has_nan:
-                keys = [math.nan] + keys
-            if not dropmissing and ordered_set.has_null:
-                keys = [None] + keys
+            # ordered_set.seal()
+            # if array_type == 'python':
+            if data_type_item.is_object:
+                key_values = ordered_set.extract()
+                keys = list(key_values.keys())
+                counts = list(key_values.values())
+                if ordered_set.has_nan and not dropnan:
+                    keys = [np.nan] + keys
+                    counts = [ordered_set.nan_count] + counts
+                if ordered_set.has_null and not dropmissing:
+                    keys = [None] + keys
+                    counts = [ordered_set.null_count] + counts
+                if dropmissing and None in keys:
+                    # we still can have a None in the values
+                    index = keys.index(None)
+                    keys.pop(index)
+                    counts.pop(index)
+                counts = np.array(counts)
+                keys = np.array(keys)
+            else:
+                keys = ordered_set.key_array()
+                deletes = []
+                if dropmissing and ordered_set.has_null:
+                    deletes.append(ordered_set.null_value)
+                if dropnan and ordered_set.has_nan:
+                    deletes.append(ordered_set.nan_value)
+                if isinstance(keys, (vaex.strings.StringList32, vaex.strings.StringList64)):
+                    keys = vaex.strings.to_arrow(keys)
+                    indices = np.delete(np.arange(len(keys)), deletes)
+                    keys = keys.take(indices)
+                else:
+                    keys = np.delete(keys, deletes)
+                    if not dropmissing and ordered_set.has_null:
+                        mask = np.zeros(len(keys), dtype=np.uint8)
+                        mask[ordered_set.null_value] = 1
+                        keys = np.ma.array(keys, mask=mask)
         keys = vaex.array_types.convert(keys, array_type)
         if return_inverse:
             return keys, inverse
@@ -1544,18 +1579,26 @@ class DataFrame(object):
         waslist, [expressions, ] = vaex.utils.listify(expression)
         limits = []
         for expr in expressions:
-            limits_minmax = self.minmax(expr, selection=selection)
-            vmin, vmax = limits_minmax
-            size = 1024 * 16
-            counts = self.count(binby=expr, shape=size, limits=limits_minmax, selection=selection)
-            cumcounts = np.concatenate([[0], np.cumsum(counts)])
-            cumcounts = cumcounts / cumcounts.max()
-            # TODO: this is crude.. see the details!
-            f = (1 - percentage / 100.) / 2
-            x = np.linspace(vmin, vmax, size + 1)
-            l = np.interp([f, 1 - f], cumcounts, x)
-            limits.append(l)
-        return vaex.utils.unlistify(waslist, limits)
+            @delayed
+            def compute(limits_minmax, expr=expr):
+                @delayed
+                def compute_limits(counts):
+                    cumcounts = np.concatenate([[0], np.cumsum(counts)])
+                    cumcounts = cumcounts / cumcounts.max()
+                    # TODO: this is crude.. see the details!
+                    f = (1 - percentage / 100.) / 2
+                    x = np.linspace(vmin, vmax, size + 1)
+                    l = np.interp([f, 1 - f], cumcounts, x)
+                    return l
+                vmin, vmax = limits_minmax
+                size = 1024 * 16
+                counts = self.count(binby=expr, shape=size, limits=limits_minmax, selection=selection, delay=delay)
+                return compute_limits(counts)
+                # limits.append(l)
+            limits_minmax = self.minmax(expr, selection=selection, delay=delay)
+            limits1 = compute(limits_minmax=limits_minmax)
+            limits.append(limits1)
+        return self._delay(delay, delayed(vaex.utils.unlistify)(waslist, limits))
 
     @docsubst
     def limits(self, expression, value=None, square=False, selection=None, delay=False, shape=None):
@@ -1655,7 +1698,7 @@ class DataFrame(object):
                             elif type in ["ss", "sigmasquare"]:
                                 limits = self.limits_sigma(number, square=True)
                             elif type in ["%", "percent"]:
-                                limits = self.limits_percentage(expression, number, selection=selection, delay=False)
+                                limits = self.limits_percentage(expression, number, selection=selection, delay=True)
                             elif type in ["%s", "%square", "percentsquare"]:
                                 limits = self.limits_percentage(expression, number, selection=selection, square=True, delay=True)
                 elif value is None:
@@ -2442,9 +2485,11 @@ class DataFrame(object):
         :param bool set_filter: Set the filter from the state (default), or leave the filter as it is it.
         :param bool warn: Give warning when issues are found in the state transfer that are recoverable.
         """
-        self.description = state['description']
+        if 'description' in state:
+            self.description = state['description']
         if use_active_range:
-            self._index_start, self._index_end = state['active_range']
+            if 'active_range' in state:
+                self._index_start, self._index_end = state['active_range']
         self._length_unfiltered = self._index_end - self._index_start
         if keep_columns:
             all_columns = self.get_column_names()
@@ -2457,18 +2502,20 @@ class DataFrame(object):
                     self._rename(old, new)
                 elif warn:
                     warnings.warn(f'The state wants to rename {old} to {new}, but {new} was not found, ignoring the rename')
-        for name, value in state['functions'].items():
-            self.add_function(name, vaex.serialize.from_dict(value, trusted=trusted))
-        self.variables = state['variables']
+        if 'functions' in state:
+            for name, value in state['functions'].items():
+                self.add_function(name, vaex.serialize.from_dict(value, trusted=trusted))
+        if 'variables' in state:
+            self.variables = state['variables']
         if 'column_names' in state:
             # we clear all columns, and add them later on, since otherwise self[name] = ... will try
             # to rename the columns (which is unsupported for remote dfs)
             self.column_names = []
             self.virtual_columns = {}
-                # self._save_assign_expression(name)
             self.column_names = list(set(self.dataset) & set(state['column_names']))  # initial values not to have virtual column trigger missing column values
-            for name, value in state['virtual_columns'].items():
-                self[name] = self._expr(value)
+            if 'virtual_columns' in state:
+                for name, value in state['virtual_columns'].items():
+                    self[name] = self._expr(value)
             self.column_names = list(state['column_names'])
             if keep_columns:
                 self.column_names += list(keep_columns)
@@ -2479,22 +2526,23 @@ class DataFrame(object):
             self.virtual_columns = {}
             for name, value in state['virtual_columns'].items():
                 self[name] = self._expr(value)
-        units = {key: astropy.units.Unit(value) for key, value in state["units"].items()}
-        self.units.update(units)
-        for name, selection_dict in state['selections'].items():
-            if name == FILTER_SELECTION_NAME and not set_filter:
-                continue
-            # TODO: make selection use the vaex.serialize framework
-            if selection_dict is None:
-                selection = None
-            else:
-                selection = selections.selection_from_dict(selection_dict)
-            self.set_selection(selection, name=name)
+        if 'units' in state:
+            units = {key: astropy.units.Unit(value) for key, value in state["units"].items()}
+            self.units.update(units)
+        if 'selections' in state:
+            for name, selection_dict in state['selections'].items():
+                if name == FILTER_SELECTION_NAME and not set_filter:
+                    continue
+                # TODO: make selection use the vaex.serialize framework
+                if selection_dict is None:
+                    selection = None
+                else:
+                    selection = selections.selection_from_dict(selection_dict)
+                self.set_selection(selection, name=name)
         if self.is_local():
             for name in self.dataset:
                 if name not in self.column_names:
                     del self.columns[name]
-
 
 
     def state_write(self, file, fs_options=None, fs=None):
@@ -5860,7 +5908,8 @@ class DataFrameLocal(DataFrame):
                     # we have a mismatching virtual column, materialize it
                     for df in dfs:
                         # upgrade to a column, so Dataset's concat can concat
-                        dfs[dfs.index(df)] = df._lazy_materialize(name)
+                        if name in df.get_column_names(virtual=True, hidden=True):
+                            dfs[dfs.index(df)] = df._lazy_materialize(name)
 
         first, *tail = dfs
         # concatenate all datasets
@@ -6478,9 +6527,15 @@ class DataFrameLocal(DataFrame):
         :return:
         """
         from vaex.hdf5.writer import Writer
-        with Writer(path=path, group=group, mode=mode) as writer:
+        with Writer(path=path, group=group, mode=mode, byteorder=byteorder) as writer:
             writer.layout(self)
-            writer.write(self, chunk_size=chunk_size, progress=progress, column_count=column_count)
+            writer.write(
+                self,
+                chunk_size=chunk_size,
+                progress=progress,
+                column_count=column_count,
+                parallel=parallel,
+                export_threads=writer_threads)
 
     @docsubst
     def export_fits(self, path, progress=None):
@@ -6614,7 +6669,7 @@ class DataFrameLocal(DataFrame):
         else:
             return groupby.agg(agg)
 
-    def binby(self, by=None, agg=None):
+    def binby(self, by=None, agg=None, sort=False):
         """Return a :class:`BinBy` or :class:`DataArray` object when agg is not None
 
         The binby operation does not return a 'flat' DataFrame, instead it returns an N-d grid
@@ -6627,7 +6682,7 @@ class DataFrameLocal(DataFrame):
         :return: :class:`DataArray` or :class:`BinBy` object.
         """
         from .groupby import BinBy
-        binby = BinBy(self, by=by)
+        binby = BinBy(self, by=by, sort=sort)
         if agg is None:
             return binby
         else:

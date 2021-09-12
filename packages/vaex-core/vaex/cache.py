@@ -1,7 +1,7 @@
 '''(Currently experimental, use at own risk)
 Vaex can cache task results, such as aggregations, or the internal hashmaps used for groupby to make recurring calculations much faster, at the cost of calculating cache keys and storing/retrieving the cached values.
 
-Internally, Vaex calculates fingerprints (such as hashes of data, or file paths and mtimes) to create cache keys that are similar across processes, such that a restart of a process will most likely result in simlar hash keys.
+Internally, Vaex calculates fingerprints (such as hashes of data, or file paths and mtimes) to create cache keys that are similar across processes, such that a restart of a process will most likely result in similar hash keys.
 
 Caches can turned on globally, or used as a context manager:
 
@@ -31,31 +31,44 @@ A good library to use for in-memory caching is cachetools (https://pypi.org/proj
 >>> df = vaex.example()
 >>> vaex.cache.cache = cachetools.LRUCache(1_000_000_000)  # 1gb cache
 
+Configure using environment variables
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Especially when using the `vaex server <server.html>`_ it can be useful to turn on caching externally using enviroment variables.
+
+    $ VAEX_CACHE=disk VAEX_CACHE_DISK_SIZE_LIMIT="10GB" python -m vaex.server
+
+Will enable caching using :func:`vaex.cache.disk` and configure it to use at max 10 GB of disk space.
+
+
 '''
-import contextlib
 import functools
 from typing import MutableMapping
-import numpy
-import dask.base
 import logging
 import shutil
 import uuid
 import pickle
+import threading
+
+
+import dask.base
 import pyarrow as pa
+from filelock import FileLock
 
 import vaex.utils
-import functools
 diskcache = vaex.utils.optional_import('diskcache')
 _redis = vaex.utils.optional_import('redis')
 
-
 log = logging.getLogger('vaex.cache')
-_enable_cache_results = vaex.utils.get_env_type(bool, 'VAEX_CACHE_RESULTS', False)
-
+_cache_tasks_type = vaex.utils.get_env_type(str, 'VAEX_CACHE', None)  # disk/redis/memory_infinite
+disk_size_limit = vaex.utils.get_env_type(str, 'VAEX_CACHE_DISK_SIZE_LIMIT', '1GB')
 
 dask.base.normalize_token.register(pa.DataType, repr)
 
 cache = None
+# used for testing
+_cache_hit = 0
+_cache_miss = 0
 
 class _cleanup:
     def __init__(self, gen, result):
@@ -69,7 +82,7 @@ class _cleanup:
         log.debug('entered')
         return self._result
 
-    def __exit__(self, type, value, traceback):
+    def __exit__(self, type=None, value=None, traceback=None):
         try:
             next(self._gen)
         except StopIteration:
@@ -104,7 +117,7 @@ def memory_infinite(clear=False):
 
 
 @_with_cleanup
-def disk(clear=False, size_limit="1GB", eviction_policy='least-recently-stored'):
+def disk(clear=False, size_limit=disk_size_limit, eviction_policy='least-recently-stored'):
     '''Stored cached values using the diskcache library.
 
     The path to store the cache is: ~/.vaex/cache/diskcache
@@ -176,6 +189,21 @@ def redis(client=None):
 
 
 @_with_cleanup
+def on(type="memory_infinite", **kwargs):
+    log.debug("Set cache to %r", type)
+    if type == "memory_infinite":
+        c = memory_infinite(**kwargs)
+    elif type == "disk":
+        c = disk(**kwargs)
+    elif type == "redis":
+        c = redis(**kwargs)
+    else:
+        raise ValueError(f'Unknown type of cache {type}')
+    yield
+    c.__exit__()
+
+
+@_with_cleanup
 def off():
     '''Turns off caching, or temporary when used as context manager
 
@@ -237,19 +265,40 @@ def get(key, default=None, type=None):
     :param default: Return when cache is on, but key not in cache
     :param type: Currently unused.
     '''
+    global _cache_miss, _cache_hit
     if is_on():
-        return cache.get(key, default)
+        value = cache.get(key, default)
+        # this might not be the best way to check for a cache hit or miss
+        # but it is sufficient for testing
+        if value is default:
+            _cache_miss += 1
+        else:
+            _cache_hit += 1
+        return value
+
+
+class _ThreadLocalCallablePatch:
+    def __init__(self, original, patch):
+        self.local = threading.local()
+        self.local.patch = patch
+        self.original = original
+
+    def __call__(self, *args, **kwargs):
+        f = getattr(self.local, 'patch', self.original)
+        return f(*args, **kwargs)
+
+
+def _explain(*args):
+    raise TypeError('You have passed in an object for which we cannot determine a fingerprint')
 
 
 def fingerprint(*args, **kwargs):
     try:
-        _restore = uuid.uuid4
-        def explain(*args):
-            raise TypeError('You have passed in an object for which we cannot determine a fingerprint')
-        uuid.uuid4 = explain
+        original = uuid.uuid4
+        uuid.uuid4 = _ThreadLocalCallablePatch(original, _explain)
         return dask.base.tokenize(*args, **kwargs)
     finally:
-        uuid.uuid4 = _restore
+        uuid.uuid4 = original
 
 
 def output_file(callable=None, path_input=None, fs_options_input={}, fs_input=None, path_output=None, fs_options_output={}, fs_output=None):
@@ -276,7 +325,8 @@ def output_file(callable=None, path_input=None, fs_options_input={}, fs_input=No
 
                 if not vaex.file.exists(path_output, fs_options=fs_options_output_, fs=fs_output):
                     log.info('file %s does not exist yet, running conversion %s → %s', path_output_meta, path_input, path_output)
-                    value = callable(*args, **kwargs)
+                    with FileLock(f"{fp}.lock"):
+                        value = callable(*args, **kwargs)
                     write_fingerprint()
                     return value
 
@@ -304,5 +354,5 @@ def output_file(callable=None, path_input=None, fs_options_input={}, fs_input=No
         return wrapper2
     return wrapper1()
 
-if _enable_cache_results:
-    memory_infinite()
+if _cache_tasks_type:
+    on(_cache_tasks_type)

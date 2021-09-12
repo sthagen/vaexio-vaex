@@ -40,7 +40,8 @@ import six
 
 import vaex.dataframe
 import vaex.dataset
-from vaex.functions import register_function
+from vaex.registry import register_function
+from vaex import functions, struct
 from . import stat
 # import vaex.file
 # import vaex.export
@@ -248,7 +249,7 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
             raise IOError('Unknown error opening: {}'.format(path))
         return df
     except:
-        logging.getLogger("vaex").error("error opening %r" % path)
+        logging.getLogger("vaex").exception("error opening %r" % path)
         raise
 
 

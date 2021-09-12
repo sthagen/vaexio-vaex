@@ -1,11 +1,64 @@
-# vaex 4.4.0 (unreleased)
-## vaex-core 4.4.0 (unreleased)
+# vaex 4.5.0
+## vaex-core 4.5.0
+   * Features
+      * Protect file creation parts with lock files [#1541](https://github.com/vaexio/vaex/pull/1541)
+      * Expression.str.extract to extract parts of strings using regex to a struct [#1423](https://github.com/vaexio/vaex/pull/1423)
+   * Performance
+      * We now cache Expression.nunique() [#1565](https://github.com/vaexio/vaex/pull/1565)
+      * Hashmaps memory is shared among threads (does not scale linear with number of threads), and avoids a merge phase [#1525](https://github.com/vaexio/vaex/pull/1525)
+      * Hashmaps serialize efficiently [#1525](https://github.com/vaexio/vaex/pull/1525)
+      * Avoid falling back to eval to get the dtype [#1514](https://github.com/vaexio/vaex/pull/1514)
+
+## vaex-hdf5 0.10.0
+   * Features
+      * Write higher dimensional arrays to hdf5 files [#1563](https://github.com/vaexio/vaex/pull/1563)
+
+## vaex-ml 0.14.0
+   * Features
+      * MultiHotEncoder [#1537](https://github.com/vaexio/vaex/pull/1537)
+      * Various ML metrics [#1529](https://github.com/vaexio/vaex/pull/1529)
+
+## vaex-astro 0.9
+   Requires vaex 4.5.0 due to private API change.
+
+## vaex-server 0.6.1
+   * Fixes
+      * Missing imports (now checked in CI) [#1516](https://github.com/vaexio/vaex/pull/1516)
+
+## vaex-contrib 0.1.0
+   * Features
+      * Import from and export to Google BigQuery [#1470](https://github.com/vaexio/vaex/pull/1470)
+
+
+# vaex 4.4.0
+## vaex-core 4.4.0
    * Performance
       * Reuse filter data when slicing a dataframe [#1287](https://github.com/vaexio/vaex/pull/1287)
+      * Faster astype('str') [#1411](https://github.com/vaexio/vaex/pull/1411)
+      * Task refactor, which allows for more caching [#1433](https://github.com/vaexio/vaex/pull/1433)
    * Features
-      * df.to_records() for output to jJSON [#1364](https://github.com/vaexio/vaex/pull/1364)
+      * df.to_records() for output to JSON [#1364](https://github.com/vaexio/vaex/pull/1364)
+      * df.dt.quarter and df.dt.halfyear [#1441](https://github.com/vaexio/vaex/pull/1364)https://github.com/vaexio/vaex/pull/1441)
+      * Arrow struct support [#1447](https://github.com/vaexio/vaex/pull/1364)https://github.com/vaexio/vaex/pull/1447)
    * Fixes
       * df.concat did not copy functions  [#1287](https://github.com/vaexio/vaex/pull/1287)
+      * Dropping columns when name was invalid identifier [#1434](https://github.com/vaexio/vaex/pull/1434)
+      * Old dates wrapped due to negative ints and casting to unsigned [#1504](https://github.com/vaexio/vaex/pull/1504)
+      * Timestamp to NumPy datetime64 would ignore units [#1513](https://github.com/vaexio/vaex/pull/1513)
+      * Thread unsafety could trigger issues in Plotly dash [#1512](https://github.com/vaexio/vaex/pull/1512)
+
+## vaex-server 0.6.0
+   * Complete refactor, now using FastAPI by default [#1300](https://github.com/vaexio/vaex/pull/1300)
+
+## vaex-ml 0.13.0
+   * Tensorflow/keras support [#1510](https://github.com/vaexio/vaex/pull/1510)
+
+## vaex-hdf5 0.9.0
+   * Features
+      * Support writing/reading from custom hdf5 groups [#1439](https://github.com/vaexio/vaex/pull/1510)
+      * Support laying out an empty hdf5 file for writing [#1439](https://github.com/vaexio/vaex/pull/1510)
+   * Fixes
+      * File order close issue on Windows [#1479](https://github.com/vaexio/vaex/pull/1479)
 
 # vaex 4.3.0
 ## vaex-core 4.3.0

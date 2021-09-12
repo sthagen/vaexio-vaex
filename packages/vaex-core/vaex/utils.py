@@ -770,7 +770,7 @@ def _ensure_string_from_expression(expression):
     elif isinstance(expression, six.string_types):
         return expression
     elif isinstance(expression, vaex.expression.Expression):
-        return expression.expression
+        return expression._label
     else:
         raise ValueError('%r is not of string or Expression type, but %r' % (expression, type(expression)))
 
@@ -889,7 +889,7 @@ def find_type_from_dtype(namespace, prefix, dtype, transient=True, support_non_n
         if postfix == '>f8':
             postfix = 'float64'
         if dtype.kind == "M":
-            postfix = "uint64"
+            postfix = "int64"
         if dtype.kind == "m":
             postfix = "int64"
         # for object there is no non-native version
@@ -1053,4 +1053,13 @@ def get_env_type(type, key, default=None):
         value = default
     if value is not None:
         import ast
-        return type(ast.literal_eval(str(value)))
+        return type(ast.literal_eval(repr(value)))
+
+
+def dropnan(sequence, expect=None):
+    original_type = type(sequence)
+    sequence = list(sequence)
+    non_nan = [k for k in sequence if k == k]
+    if expect is not None:
+        assert len(sequence) - len(non_nan) == 1, "expected 1 nan value"
+    return original_type(non_nan)

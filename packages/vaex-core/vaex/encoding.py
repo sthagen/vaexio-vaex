@@ -225,7 +225,7 @@ class dtype_encoding:
         dtype = DataType(dtype)
         if dtype.is_list:
             return {'type': 'list', 'value_type': encoding.encode('dtype', dtype.value_type)}
-        dtype = DataType(dtype).internal
+        dtype = DataType(dtype)
         return str(dtype)
 
     @staticmethod
@@ -324,13 +324,16 @@ class selection_encoding:
 class ordered_set_encoding:
     @staticmethod
     def encode(encoding, obj):
-        values = list(obj.extract().items())
+        keys = obj.key_array()
+        if isinstance(keys, (vaex.strings.StringList32, vaex.strings.StringList64)):
+            keys = vaex.strings.to_arrow(keys)
+        keys = encoding.encode('array', keys)
         clsname = obj.__class__.__name__
         return {
             'class': clsname,
             'data': {
-                'values': values,
-                'count': obj.count,
+                'keys': keys,
+                'null_value': obj.null_value,
                 'nan_count': obj.nan_count,
                 'missing_count': obj.null_count
             }
@@ -341,7 +344,11 @@ class ordered_set_encoding:
     def decode(encoding, obj_spec):
         clsname = obj_spec['class']
         cls = getattr(vaex.hash, clsname)
-        value = cls(dict(obj_spec['data']['values']), obj_spec['data']['count'], obj_spec['data']['nan_count'], obj_spec['data']['missing_count'])
+        keys = encoding.decode('array', obj_spec['data']['keys'])
+        dtype = vaex.dtype_of(keys)
+        if dtype.is_string:
+            keys = vaex.strings.to_string_sequence(keys)
+        value = cls(keys, obj_spec['data']['null_value'], obj_spec['data']['nan_count'], obj_spec['data']['missing_count'])
         return value
 
 
@@ -490,7 +497,8 @@ class binary:
         json_data = json.loads(json_data)
         data = json_data['data']
         encoding.blobs = {key: blob for key, blob in zip(json_data['blob_refs'], blobs)}
-        encoding._object_specs = json_data['objects']
+        if 'objects' in json_data:  # for backwards compatibility, otherwise we might not be able to parse old msg'es
+            encoding._object_specs = json_data['objects']
         return data
 
 
