@@ -122,6 +122,8 @@ class TaskPartSetCreate(TaskPart):
         expression = str(expression)
         self.nthreads = nthreads
         self.df = df
+        # since a df is mutable, store it beforehand
+        self.df_fp = self.df.fingerprint()
         self.dtype = dtype
         self.dtype_item = dtype_item
         self.flatten = flatten
@@ -143,7 +145,8 @@ class TaskPartSetCreate(TaskPart):
         # self.dtype = self.df.data_type(str(expression))
         # self.dtype_item = self.data_type(expression, axis=-1 if flatten else 0)
         self.ordered_set_type = vaex.hash.ordered_set_type_from_dtype(dtype_item, transient)
-        self.set = None
+        # *7 is arbitrary, but we can have more maps than threads to avoid locks
+        self.set = self.ordered_set_type(self.nthreads*7)
 
     @property
     def expressions(self):
@@ -157,9 +160,7 @@ class TaskPartSetCreate(TaskPart):
 
     def process(self, thread_index, i1, i2, filter_mask, ar):
         from vaex.column import _to_string_sequence
-        if self.set is None:
-            # *7 is arbitrary, but we can have more maps than threads to avoid locks`q
-            self.set = self.ordered_set_type(self.nthreads*7)
+        self._check_row_limit()
         if self.selection:
             selection_mask = self.df.evaluate_selection_mask(self.selection, i1=i1, i2=i2, cache=True)
             ar = filter(ar, selection_mask)
@@ -175,6 +176,7 @@ class TaskPartSetCreate(TaskPart):
                 ar = ar.copy()
         chunk_size = 1024*1024
 
+        self._check_row_limit()
         if np.ma.isMaskedArray(ar):
             mask = np.ma.getmaskarray(ar)
             if self.return_inverse:
@@ -190,6 +192,9 @@ class TaskPartSetCreate(TaskPart):
                 self.set.update(ar, -1, chunk_size=chunk_size, bucket_size=chunk_size*4)
         if logger.level >= logging.DEBUG:
             logger.debug(f"set uses {sys.getsizeof(self.set):,} bytes (offset {i1:,}, length {i2-i1:,})")
+        self._check_row_limit()
+
+    def _check_row_limit(self):
         if self.unique_limit is not None:
             if len(self.set) > self.unique_limit:
                 raise vaex.RowLimitException(f'Resulting set would have >= {self.unique_limit} unique combinations')
@@ -223,6 +228,8 @@ class TaskPartSetCreate(TaskPart):
             if count > self.unique_limit:
                 raise vaex.RowLimitException(f'Resulting set has {count:,} unique combinations, which is larger than the allowed value of {self.unique_limit:,}')
         self.set = set_merged
+        fp = vaex.cache.fingerprint(self.expression, self.dtype, self.dtype_item, self.flatten, self.selection)
+        self.set.fingerprint = f'set-df-{self.df_fp}-{fp}'
 
     @classmethod
     def decode(cls, encoding, spec, df, nthreads):

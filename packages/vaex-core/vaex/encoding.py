@@ -14,6 +14,9 @@ import pyarrow as pa
 import vaex
 from .datatype import DataType
 
+import blake3
+
+
 registry = {}
 
 
@@ -335,7 +338,8 @@ class ordered_set_encoding:
                 'keys': keys,
                 'null_value': obj.null_value,
                 'nan_count': obj.nan_count,
-                'missing_count': obj.null_count
+                'missing_count': obj.null_count,
+                'fingerprint': obj.fingerprint,
             }
         }
 
@@ -348,7 +352,7 @@ class ordered_set_encoding:
         dtype = vaex.dtype_of(keys)
         if dtype.is_string:
             keys = vaex.strings.to_string_sequence(keys)
-        value = cls(keys, obj_spec['data']['null_value'], obj_spec['data']['nan_count'], obj_spec['data']['missing_count'])
+        value = cls(keys, obj_spec['data']['null_value'], obj_spec['data']['nan_count'], obj_spec['data']['missing_count'], obj_spec['data']['fingerprint'])
         return value
 
 
@@ -431,7 +435,8 @@ class Encoding:
 
     def add_blob(self, buffer):
         bytes = memoryview(buffer).tobytes()
-        blob_id = vaex.cache.fingerprint(bytes)
+        blake = blake3.blake3(bytes, multithreading=True)
+        blob_id = blake.hexdigest()
         self.blobs[blob_id] = bytes
         return f'blob:{blob_id}'
 

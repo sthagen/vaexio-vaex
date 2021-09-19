@@ -50,19 +50,6 @@ def test_set_bool():
     assert len(keys) == 2
     assert set(keys.tolist()) == {True, False}
 
-def test_set_int_multiple_maps():
-    x = np.arange(5, dtype='i4')
-    set0 = ordered_set_int32(2)
-    set0.update(x)
-    set0.seal()
-    # we're not guaranteed an order due to different hash functions on different
-    # platforms
-    values = {}
-    dicts = set0.extract()
-    for dict in dicts:
-        values.update(dict)
-    assert values == {0: 0, 2: 1, 4:2, 1:0, 3:1}
-
 
 @pytest.mark.parametrize("nan", [False, True])
 @pytest.mark.parametrize("missing", [False, True])
@@ -111,7 +98,7 @@ def test_set_float(repickle, nan, missing, nmaps):
 
     # tests extraction and constructor
     keys = oset.key_array()
-    set_copy = ordered_set_float64(keys, oset.null_value, oset.nan_count, oset.null_count)
+    set_copy = ordered_set_float64(keys, oset.null_value, oset.nan_count, oset.null_count, '')
     keys = set_copy.key_array().tolist()
     if missing:
         keys[oset.null_value] = None
@@ -175,7 +162,7 @@ def test_set_string(repickle, missing, nmaps):
 
     # tests extraction and constructor
     keys = oset.key_array()
-    set_copy = ordered_set_string(keys, oset.null_value, oset.nan_count, oset.null_count)
+    set_copy = ordered_set_string(keys, oset.null_value, oset.nan_count, oset.null_count, '')
     keys = set_copy.key_array()
     assert set(keys.tolist()) == set(keys_expected)
     ordinals = set_copy.map_ordinal(keys).tolist()

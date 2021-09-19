@@ -1085,7 +1085,7 @@ class Expression(with_metaclass(Meta)):
             value = vaex.cache.get(key, type='computed')
             if value is None:
                 t0 = time.time()
-                value = len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis))
+                value = len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, array_type=None))
                 duration_wallclock = time.time() - t0
                 vaex.cache.set(key, value, type='computed', duration_wallclock=duration_wallclock)
             return value
@@ -1398,7 +1398,8 @@ def f({0}):
 
         from .hash import ordered_set_type_from_dtype
         ordered_set_type = ordered_set_type_from_dtype(dtype_item)
-        ordered_set = ordered_set_type(mapper_keys, null_value, nan_count, null_count)
+        fingerprint = key_set.fingerprint + "-mapper"
+        ordered_set = ordered_set_type(mapper_keys, null_value, nan_count, null_count, fingerprint)
         indices = ordered_set.map_ordinal(mapper_keys)
         mapper_values = [mapper_values[i] for i in indices]
 
