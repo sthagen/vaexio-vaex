@@ -2,7 +2,10 @@ import pytest
 
 import pyarrow as pa
 import vaex
+import vaex.column
 import numpy as np
+
+from common import encoding_roundtrip
 
 
 def test_vrange():
@@ -17,6 +20,25 @@ def test_vrange():
     assert df[1:11].x.tolist() == (np.arange(1, 11.)).tolist()
     df['y'] = df.x**2
     assert df[1:11].y.tolist()== (np.arange(1, 11)**2).tolist()
+
+
+@pytest.mark.parametrize('value', [10, 'word', [1, 2]])
+def test_vconstant(value):
+    length = 100
+    vc = vaex.vconstant(value=value, length=length)
+    df = vaex.from_arrays(x=vc,
+                          y=vaex.vrange(0, length))
+
+
+    assert len(df.columns['x']) == length
+    assert df.x[:3].tolist() == [value] * 3
+    assert len(vc[:]) == 100
+    assert len(vc[10:]) == 90
+    assert len(vc[:20]) == 20
+
+    df_filter = df[df.y < 31]
+    assert len(df_filter) == 31
+    assert df_filter.x[:3].tolist() == [value] * 3
 
 
 def test_arrow_strings():
@@ -154,3 +176,21 @@ def test_column_string_trim(i1, i2):
     s_vaex = pa.array(c_copy)
     assert c_copy.tolist() == slist[i1:i1+i2]
     assert s_vaex.tolist() == slist[i1:i1+i2]
+
+
+
+def test_column_dict_encoded():
+    indices = np.array([0, 1, 2, 0], dtype='int8')
+    dictionary = ['aap', 'noot', 'mies']
+    column = vaex.column.ColumnArrowDictionaryEncoded(indices, dictionary)
+    target = pa.DictionaryArray.from_arrays(indices, dictionary)
+    assert len(column) == 4
+    assert pa.array(column).equals(target)
+    assert pa.array(column.trim(1, 4)).equals(target[1:])
+    assert pa.array(column.trim(0, 3)).equals(target[:-1])
+    assert column.nbytes == target.nbytes
+
+    column2 = encoding_roundtrip('column', column)
+    assert pa.array(column2).equals(target)
+    assert column2.fingerprint() == column.fingerprint()
+    assert target.type == column2.dtype

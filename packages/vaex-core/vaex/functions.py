@@ -142,13 +142,10 @@ def array_sum(ar, axis):
     return np.sum(ar, axis=tuple(axis))
 
 
-@register_function()
+@register_function(on_expression=False)
 def fillmissing(ar, value):
-    '''Returns an array where missing values are replaced by value.
-    See :`ismissing` for the definition of missing values.
-    '''
     dtype = vaex.dtype_of(ar)
-    if dtype == str:
+    if dtype.is_arrow:
         return pc.fill_null(ar, value)
     ar = ar if not isinstance(ar, column.Column) else ar.to_numpy()
     mask = ismissing(ar)
@@ -221,16 +218,18 @@ def ismissing(x):
             x = _to_string_sequence(x)
             mask = x.mask()
             if mask is None:
-                mask = np.zeros(x.length, dtype=np.bool)
+                mask = np.zeros(x.length, dtype=bool)
             return mask
         elif isinstance(x, np.ndarray) and x.dtype.kind in 'O':
             return x == None
         else:
-            return np.zeros(len(x), dtype=np.bool)
+            return np.zeros(len(x), dtype=bool)
 
 
 @register_function()
 def notmissing(x):
+    if isinstance(x, vaex.array_types.supported_arrow_array_types):
+        return pa.compute.invert(ismissing(x))
     return ~ismissing(x)
 
 
@@ -248,11 +247,13 @@ def isnan(x):
         else:
             return x != x
     else:
-        return np.zeros(len(x), dtype=np.bool)
+        return np.zeros(len(x), dtype=bool)
 
 
 @register_function()
 def notnan(x):
+    if isinstance(x, vaex.array_types.supported_arrow_array_types):
+        return pa.compute.invert(isnan(x))
     return ~isnan(x)
 
 
@@ -265,15 +266,28 @@ def isna(x):
 @register_function()
 def notna(x):
     """Opposite of isna"""
+    if isinstance(x, vaex.array_types.supported_arrow_array_types):
+        return pa.compute.invert(isna(x))
     return ~isna(x)
 
 
 ########## datetime operations ##########
 
+@register_function(on_expression=False)
+def scalar_datetime(datetime_str):
+    return np.datetime64(datetime_str)
+
+
+@register_function(on_expression=False)
+def scalar_timedelta(amount, unit):
+    return np.timedelta64(amount, unit)
+
 
 def _pandas_dt_fix(x):
     # see https://github.com/pandas-dev/pandas/issues/23276
     # not sure which version this is fixed in
+    if vaex.array_types.is_arrow_array(x) and isinstance(x.type, pa.lib.TimestampType):
+        return x.to_pandas()
     if not x.flags['WRITEABLE']:
         x = x.copy()
     return x
@@ -281,7 +295,8 @@ def _pandas_dt_fix(x):
 def _to_pandas_series(x):
     import pandas as pd
     # pandas seems to eager to infer dtype=object for v1.2
-    return pd.Series(_pandas_dt_fix(x), dtype=x.dtype)
+    x = _pandas_dt_fix(x)
+    return pd.Series(x, dtype=x.dtype)
 
 @register_function(scope='dt', as_property=True)
 def dt_date(x):
@@ -1726,6 +1741,13 @@ def str_replace(x, pat, repl, n=-1, flags=0, regex=False):
     """
     sl = _to_string_sequence(x).replace(pat, repl, n, flags, regex)
     return column.ColumnStringArrow.from_string_sequence(sl)
+    # TODO: we should be using arrow compute functions (since MB rewrote them in arrow)
+    # except that they don't support flags yet (case insensitive)
+    # we could invoke it when flags=0 though
+    # if regex:
+    #     return pc.replace_substring_regex(x, pattern=pat, max_replacements=None if n==-1 else n, replacement=repl)
+    # else:
+    #     return pc.replace_substring(x, pattern=pat, max_replacements=None if n==-1 else n, replacement=repl)
 
 
 @register_function(scope='str')
@@ -1922,7 +1944,7 @@ def str_rsplit(x, pattern=None, max_splits=-1):
     if pattern is None:
         return pc.utf8_split_whitespace(x, reverse=True, max_splits=max_splits)
     else:
-        return pc.split_pattern(x, reverse=True, max_splits=max_splits)
+        return pc.split_pattern(x, pattern=pattern, reverse=True, max_splits=max_splits)
 
 
 @register_function(scope='str')
@@ -2426,14 +2448,18 @@ for name in dir(scopes['str']):
 
 # expression_namespace['str_strip'] = str_strip
 
+# kept for backwards compatibility
 @register_function()
-def _ordinal_values(x, ordered_set):
-    from vaex.column import _to_string_sequence
+def _ordinal_values(x, hashmap_unique):
+    return hashmap_apply(x, hashmap_unique)
 
-    if not isinstance(x, vaex.array_types.supported_array_types) or isinstance(ordered_set, vaex.superutils.ordered_set_string):
-        # sometimes the dtype can be object, but seen as an string array
-        x = _to_string_sequence(x)
-    return ordered_set.map_ordinal(x)
+
+@register_function()
+def hashmap_apply(x, hashmap, check_missing=False):
+    '''Apply values to hashmap, if check_missing is True, missing values in the hashmap will translated to null/missing values'''
+    indices = hashmap.map(x, check_missing=check_missing)
+    return indices
+
 
 @register_function()
 def _choose(ar, choices, default=None):
@@ -2463,14 +2489,8 @@ def _map(ar, value_to_index, choices, default_value=None, use_missing=False, axi
         import vaex.arrow.utils
         ar, wrapper = vaex.arrow.utils.list_unwrap(ar)
 
-    if not isinstance(ar, vaex.array_types.supported_array_types) or isinstance(value_to_index, vaex.superutils.ordered_set_string):
-        # sometimes the dtype can be object, but seen as an string array
-        ar = _to_string_sequence(ar)
-        # -1 points to missing
-        indices = value_to_index.map_ordinal(ar) + 1
-    else:
-        ar = vaex.array_types.to_numpy(ar)
-        indices = value_to_index.map_ordinal(ar) + 1
+    ar = vaex.array_types.to_numpy(ar)
+    indices = value_to_index.map(ar) + 1
     values = choices.take(indices)
     if np.ma.isMaskedArray(ar):
         mask = np.ma.getmaskarray(ar).copy()
@@ -2495,13 +2515,33 @@ def _astype(x, dtype):
             # arrow does not support timestamp to int/float, so we use numpy
             y = x.to_numpy().astype(dtype)
             return y
+        if pa.types.is_duration(x.type):
+            # for consistency with timedelta, use numpy for this for now
+            y = x.to_numpy().astype(dtype)
+            return y
 
-        if dtype.startswith('datetime64'):  # parse dtype
-            if len(dtype) > len('datetime64'):
-                units = dtype[len('datetime64')+1:-1]
-            else:
-                units = 'ns'
-            dtype = pa.timestamp(units)
+        if (dtype.startswith('datetime64') | dtype.startswith('timedelta64')):
+            if dtype.startswith('datetime64'):  # parse dtype
+                if len(dtype) > len('datetime64'):
+                    units = dtype[len('datetime64')+1:-1]
+                else:
+                    units = 'ns'
+                if vaex.dtype_of(x) == str and units in ['m', 'h', 'D', 'W', 'M', 'Y']:
+                    # it's a slower path, but it works
+                    # using pc.strptime seems to offset by a day orso?
+                    x = np.array(x, dtype=dtype)
+                    return x.astype(dtype)
+                else:
+                    dtype = pa.timestamp(units)
+            else:  # parse dtype
+                if len(dtype) > len('timedelta64'):
+                    units = dtype[len('timedelta64')+1:-1]
+                else:
+                    units = 'ns'
+                dtype = pa.duration(units)
+
+        if dtype == 'int':  # "int" is not automatically recognized by arrow, unlike "float" for example.
+            dtype = pa.int64()
 
         y = x.cast(dtype, safe=False)
         return y
@@ -2538,19 +2578,8 @@ def _isin(x, values):
 
 
 @register_function(name='isin_set', on_expression=False)
-def _isin_set(x, set):
-    if vaex.column._is_stringy(x) or isinstance(set, vaex.superutils.ordered_set_string):
-        x = vaex.column._to_string_column(x)
-        x = _to_string_sequence(x)
-        # return x.string_sequence.isin(values)
-        return set.isin(x)
-    else:
-        if np.ma.isMaskedArray(x):
-            isin = set.isin(x.data)
-            isin[x.mask] = False
-            return isin
-        else:
-            return set.isin(x)
+def _isin_set(x, hashmap_unique):
+    return hashmap_unique.isin(x)
 
 
 @register_function()
@@ -2724,3 +2753,18 @@ def stack(arrays, strict=False):
 def getitem(ar, item):
     slicer = (slice(None), item)
     return ar.__getitem__(slicer)
+
+
+@register_function()
+def dot_product(a, b):
+    '''Compute the dot product between `a` and `b`.
+
+    :param a: A list of Expressions or a list of values (e.g. a vector)
+    :param b: A list of Expressions or a list of values (e.g. a vector)
+    :return: Vaex expression
+    '''
+    assert len(a) == len(b), 'The lenghts of `a` and `b` must be the same.'
+    result = a[0] * b[0]
+    for an, bn in zip(a[1:], b[1:]):
+        result += an * bn
+    return result

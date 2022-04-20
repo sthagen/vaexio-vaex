@@ -52,13 +52,15 @@ class hash_base : public hash_common<Derived, T, Hashmap<T, int64_t>> {
     using hasher_map = typename Base::hasher_map;
     using hasher_map_choice = typename Base::hasher_map_choice;
 
-    hash_base(int nmaps = 1) : Base(nmaps){};
+    hash_base(int nmaps = 1, int64_t limit = -1) : Base(nmaps, limit){};
     // void reserve(int64_t count_) {
     //     py::gil_scoped_release gil;
     //     for(auto map : this->maps) {
     //         map.reserve((count_ + maps.size() - 1) / maps.size());
     //     }
     // }
+    virtual key_type _get(hashmap_type &map, typename hashmap_type::key_type key) override { return key; };
+
     size_t bytes_used() const {
         size_t bytes = 0;
         for (auto map : this->maps) {
@@ -97,6 +99,9 @@ class hash_base : public hash_common<Derived, T, Hashmap<T, int64_t>> {
         if (bucket_size < chunk_size) {
             throw std::runtime_error("bucket size should be larger than chunk_size");
         }
+        if (this->limit >= 0 && return_values) {
+            throw std::runtime_error("Cannot combine limit with return_inverse");
+        }
         const bool use_offsets = return_values || (start_index != -1);
 
         py::array_t<value_type> values_array(return_values ? size : 1);
@@ -107,6 +112,8 @@ class hash_base : public hash_common<Derived, T, Hashmap<T, int64_t>> {
 
         {
             using offset_type = int32_t;
+
+            bool full = false; // if we reached the limit, we can quickly get out
 
             py::gil_scoped_release gil;
             size_t nmaps = this->maps.size();
@@ -239,10 +246,17 @@ class hash_base : public hash_common<Derived, T, Hashmap<T, int64_t>> {
             //         }
             //     }
             // }
-            for (size_t map_index = 0; map_index < nmaps; map_index++) {
-                if (buckets[map_index].size()) {
-                    const std::lock_guard<std::mutex> lock(this->maplocks[map_index]);
-                    flush_bucket(map_index);
+            if (this->limit >= 0) {
+                if (this->count() >= this->limit) {
+                    full = true;
+                }
+            }
+            if (!full) {
+                for (size_t map_index = 0; map_index < nmaps; map_index++) {
+                    if (buckets[map_index].size()) {
+                        const std::lock_guard<std::mutex> lock(this->maplocks[map_index]);
+                        flush_bucket(map_index);
+                    }
                 }
             }
             if (null_offsets.size() || nan_offsets.size()) {
@@ -423,10 +437,10 @@ class ordered_set : public hash_base<ordered_set<T2, Hashmap2>, T2, Hashmap2> {
     using typename Base::key_type;
     using typename Base::value_type;
 
-    ordered_set(int nmaps = 1) : Base(nmaps), nan_value(0x7fffffff), null_value(0x7fffffff), ordinal_code_offset_null_nan(0) {}
+    ordered_set(int nmaps = 1, int64_t limit = -1) : Base(nmaps, limit), nan_value(0x7fffffff), null_value(0x7fffffff), ordinal_code_offset_null_nan(0) {}
 
-    virtual value_type nan_index() { return nan_value; }
-    virtual value_type null_index() { return null_value; }
+    virtual value_type nan_index() const { return nan_value; }
+    virtual value_type null_index() const { return null_value; }
     template <class Bucket>
     int64_t key_offset(int64_t natural_order, int16_t map_index, Bucket &bucket, int64_t offset) {
         int64_t index = bucket.second + offset;
@@ -465,20 +479,23 @@ class ordered_set : public hash_base<ordered_set<T2, Hashmap2>, T2, Hashmap2> {
         return bucket->second;
     }
 
-    static ordered_set *create(py::array_t<key_type> keys, int64_t null_value, int64_t nan_count, int64_t null_count, std::string* fingerprint) {
+    static ordered_set *create(py::array_t<key_type> keys, int64_t null_value, int64_t nan_count, int64_t null_count, std::string *fingerprint) {
         ordered_set *set = new ordered_set(1);
-        const key_type *keys_ptr = keys.data(0);
-        size_t size = keys.size();
-        {
-            py::gil_scoped_release gil;
-            for (size_t i = 0; i < size; i++) {
-                key_type key = keys_ptr[i];
-                if (int64_t(i) == null_value) {
-                    set->update1_null();
-                } else if (custom_isnan(key)) {
-                    set->update1_nan();
-                } else {
-                    set->update1(0, key);
+        if (keys.size() > 0) {
+            set->maps[0].reserve(keys.size());
+            const key_type *keys_ptr = keys.data(0);
+            size_t size = keys.size();
+            {
+                py::gil_scoped_release gil;
+                for (size_t i = 0; i < size; i++) {
+                    key_type key = keys_ptr[i];
+                    if (int64_t(i) == null_value) {
+                        set->update1_null();
+                    } else if (custom_isnan(key)) {
+                        set->update1_nan();
+                    } else {
+                        set->update1(0, key);
+                    }
                 }
             }
         }
@@ -509,7 +526,7 @@ class ordered_set : public hash_base<ordered_set<T2, Hashmap2>, T2, Hashmap2> {
         set->null_count = null_count;
         set->nan_count = nan_count;
         set->sealed = true;
-        if(fingerprint) {
+        if (fingerprint) {
             set->fingerprint = *fingerprint;
         }
         return set;
@@ -540,6 +557,48 @@ class ordered_set : public hash_base<ordered_set<T2, Hashmap2>, T2, Hashmap2> {
         }
         return result;
     }
+    // this is the c++ interface we use in the binner
+    virtual void map_many(key_type *values, int64_t offset, int64_t length, int64_t *output) override {
+        size_t nmaps = this->maps.size();
+        auto offsets = this->offsets();
+        for (int64_t i = offset; i < offset + length; i++) {
+            const key_type &value = values[i];
+            // the caller is responsible for finding masked values
+            if (custom_isnan(value)) {
+                output[i - offset] = this->nan_value;
+                assert(this->nan_count > 0);
+            } else {
+                std::size_t hash = hasher_map_choice()(value);
+                size_t map_index = (hash % nmaps);
+                auto search = this->maps[map_index].find(value);
+                if (search == this->maps[map_index].end()) {
+                    output[i - offset] = -1;
+                } else {
+                    output[i - offset] = search->second + offsets[map_index];
+                }
+            }
+        }
+    }
+
+    virtual int64_t map_key(key_type value) {
+        // the caller is responsible for finding masked values
+        if (custom_isnan(value)) {
+            return this->nan_value;
+        } else {
+            // TODO: slow
+            auto offsets = this->offsets();
+            size_t nmaps = this->maps.size();
+            std::size_t hash = hasher_map_choice()(value);
+            size_t map_index = (hash % nmaps);
+            auto search = this->maps[map_index].find(value);
+            if (search == this->maps[map_index].end()) {
+                return -1;
+            } else {
+                return search->second + offsets[map_index];
+            }
+        }
+    }
+
     py::object map_ordinal(py::array_t<key_type> &values) {
         size_t size = this->length();
         // TODO: apply this pattern of various return types to the other set types
@@ -557,25 +616,61 @@ class ordered_set : public hash_base<ordered_set<T2, Hashmap2>, T2, Hashmap2> {
     py::array_t<OutputType> _map_ordinal(py::array_t<key_type> &values) {
         int64_t size = values.size();
         py::array_t<OutputType> result(size);
-        auto input = values.template unchecked<1>();
-        auto output = result.template mutable_unchecked<1>();
+        if (size == 0) {
+            return result;
+        }
+        // auto input = values.template unchecked<1>();
+        // auto output = result.template mutable_unchecked<1>();
+        // key_type *output
+        const key_type *input = values.data(0);
+        OutputType *output = result.mutable_data(0);
+        if (values.strides()[0] != values.itemsize()) {
+            throw std::runtime_error("stride not equal to bytesize for key values");
+        }
+        if (result.strides()[0] != result.itemsize()) {
+            throw std::runtime_error("stride not equal to bytesize for output");
+        }
         py::gil_scoped_release gil;
+
         size_t nmaps = this->maps.size();
         auto offsets = this->offsets();
-        for (int64_t i = 0; i < size; i++) {
-            const key_type &value = input(i);
-            // the caller is responsible for finding masked values
-            if (custom_isnan(value)) {
-                output(i) = this->nan_value;
-                assert(this->nan_count > 0);
-            } else {
-                std::size_t hash = hasher_map_choice()(value);
-                size_t map_index = (hash % nmaps);
-                auto search = this->maps[map_index].find(value);
-                if (search == this->maps[map_index].end()) {
-                    output(i) = -1;
+        if (nmaps == 1) {
+            auto &map0 = this->maps[0];
+            for (int64_t i = 0; i < size; i++) {
+                const key_type &value = input[i];
+                // the caller is responsible for finding masked values
+                if (custom_isnan(value)) {
+                    output[i] = this->nan_value;
+                    // TODO: the test fail here because we pass in NaN for None?
+                    // but of course only in debug mode
+                    assert(this->nan_count > 0);
                 } else {
-                    output(i) = search->second + offsets[map_index];
+                    auto search = map0.find(value);
+                    if (search == map0.end()) {
+                        output[i] = -1;
+                    } else {
+                        output[i] = search->second;
+                    }
+                }
+            }
+        } else {
+            for (int64_t i = 0; i < size; i++) {
+                const key_type &value = input[i];
+                // the caller is responsible for finding masked values
+                if (custom_isnan(value)) {
+                    output[i] = this->nan_value;
+                    // TODO: the test fail here because we pass in NaN for None?
+                    // but of course only in debug mode
+                    assert(this->nan_count > 0);
+                } else {
+                    std::size_t hash = hasher_map_choice()(value);
+                    size_t map_index = (hash % nmaps);
+                    auto search = this->maps[map_index].find(value);
+                    if (search == this->maps[map_index].end()) {
+                        output[i] = -1;
+                    } else {
+                        output[i] = search->second + offsets[map_index];
+                    }
                 }
             }
         }

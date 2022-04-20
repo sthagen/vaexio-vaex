@@ -41,6 +41,7 @@ class Mask {
                 }
                 if (count == i2) {
                     end = i;
+                    break;
                 }
                 count++;
             }
@@ -52,7 +53,6 @@ class Mask {
         //     throw std::runtime_error("offset should be smaller than length");
         // }
         int64_t counted = 0;
-        int64_t start = -1, end = -1;
         for (int64_t i = 0; i < length; i++) {
             if (mask_data[i] == 1) {
                 counted++;
@@ -104,7 +104,7 @@ class Mask {
         int64_t found = 0;
         {
             py::gil_scoped_release release;
-            for (size_t i = 0; i < length; i++) {
+            for (int64_t i = 0; i < length; i++) {
                 if (mask_data[i] == 1) {
                     ar_unsafe(found++) = i;
                 }
@@ -153,10 +153,46 @@ std::size_t hash_func(T v) {
     return h(v);
 }
 
+class TestObject {
+    public:
+    // TestObject(std::string name) : name(name) {}
+    TestObject(std::string name, py::memoryview bytes) : name(name), bytes(bytes) {}
+    ~TestObject() {
+        name = "destroyed";
+    }
+    std::string name;
+    py::memoryview bytes;
+};
+
+class TestContainer {
+    public:
+    TestContainer(std::string name) : name(name) {}
+    void add(std::shared_ptr<TestObject> member) {
+        members.push_back(member);
+    }
+    std::string name;
+    std::vector<std::shared_ptr<TestObject>> members;
+};
+
 PYBIND11_MODULE(superutils, m) {
     _import_array();
 
     m.doc() = "fast utils";
+
+    py::class_<TestObject, std::shared_ptr<TestObject>>(m, "TestObject")
+        // .def(py::init<std::string>())
+        .def(py::init([](std::string name, py::buffer bytes) {
+                return new TestObject(name, py::memoryview(bytes.request()));
+            }), py::keep_alive<1, 3>())
+        .def_property_readonly("name", [](const TestObject &test) { return test.name; })
+        .def_property_readonly("bytes", [](const TestObject &test) { return test.bytes; })
+    ;
+    py::class_<TestContainer, std::shared_ptr<TestContainer>>(m, "TestContainer")
+        .def(py::init<std::string>())
+        .def("add", &TestContainer::add)
+        .def_property_readonly("name", [](const TestContainer &test) { return test.name; })
+        .def_property_readonly("members", [](const TestContainer &test) { return test.members; })
+    ;
 
     py::class_<Mask>(m, "Mask", py::buffer_protocol())
         .def(py::init<size_t>())
@@ -192,7 +228,8 @@ PYBIND11_MODULE(superutils, m) {
     m.def("hash", hash_func<uint64_t>);
 
     vaex::init_hash_primitives_power_of_two(m);
-    vaex::init_hash_primitives_prime(m);
+    // TODO: enable again, needs refactor of parent hash_map class
+    // vaex::init_hash_primitives_prime(m);
     vaex::init_hash_string(m);
     vaex::init_hash_object(m);
 }

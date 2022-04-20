@@ -83,8 +83,6 @@ def test_state_variables(df_local_non_arrow, tmpdir):
 
     # this virtual column will add a variable (the timedelta)
     df['seconds'] = df.timedelta / np.timedelta64(1, 's')
-    assert len(df.variables) == len(variables) + 1
-    var_name = list(set(df.variables) - set(variables))[0]
 
     # an array
     df.add_variable('some_array', np.arange(10))
@@ -92,7 +90,6 @@ def test_state_variables(df_local_non_arrow, tmpdir):
     df.state_write(filename)
 
     df_copy.state_load(filename)
-    assert isinstance(df_copy.variables[var_name], np.timedelta64)
     assert df.seconds.tolist() == df_copy.seconds.tolist()
     assert df_copy.variables['dt_var'] == t_test
     assert df_copy.variables['some_array'].tolist() == df.variables['some_array'].tolist()
@@ -153,7 +150,7 @@ def test_filter_rename_column():
 
 
 def test_state_load_gcs():
-    df = vaex.ml.datasets.load_iris()
+    df = vaex.datasets.iris()
     f = vaex.file.open('gs://vaex-data/testing/test_iris_state.json', fs_options={'token': 'anon', 'cache': True})
     import io
     f = io.TextIOWrapper(f, encoding='utf8')
@@ -175,3 +172,17 @@ def test_state_drop():
     dfc.state_set(df.state_get())
     assert 'x' not in dfc
     assert 'x' not in dfc.dataset
+
+
+def test_state_virtual_column_order():
+    # renaming a column should not change the internal order, otherwise virtual
+    # columns do not resolve (it will reference an unknown column)
+    df = vaex.from_scalars(x=1)
+    df['y'] = df.x + 1
+    df['z'] = df.y + 2
+    df.rename('y', 'yy')
+    state = df.state_get()
+
+    df2 = vaex.from_scalars(x=10)
+    df2.state_set(state)
+    assert df2.z.tolist() == [13]

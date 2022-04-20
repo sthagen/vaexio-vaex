@@ -14,8 +14,6 @@ import pyarrow as pa
 import vaex
 from .datatype import DataType
 
-import blake3
-
 
 registry = {}
 
@@ -226,17 +224,32 @@ class dtype_encoding:
     @staticmethod
     def encode(encoding, dtype):
         dtype = DataType(dtype)
+        if dtype.is_arrow and dtype.is_timedelta:
+            return {'type': 'duration', 'unit': dtype.arrow.unit}
+        if dtype.is_arrow and dtype.is_datetime:
+            return {'type': 'timestamp', 'unit': dtype.arrow.unit}
         if dtype.is_list:
             return {'type': 'list', 'value_type': encoding.encode('dtype', dtype.value_type)}
+        elif dtype.is_encoded:
+            return {'type': 'dict', 'value_type': encoding.encode('dtype', dtype.value_type), 'index_type': encoding.encode('dtype', dtype.index_type), 'ordered': dtype.arrow.ordered}
         dtype = DataType(dtype)
         return str(dtype)
 
     @staticmethod
     def decode(encoding, type_spec):
         if isinstance(type_spec, dict):
-            if type_spec['type'] == 'list':
+            if type_spec['type'] == 'duration':
+                return DataType(pa.duration(type_spec['unit']))
+            elif type_spec['type'] == 'timestamp':
+                return DataType(pa.timestamp(type_spec['unit']))
+            elif type_spec['type'] == 'list':
                 sub = encoding.decode('dtype', type_spec['value_type']).arrow
                 return DataType(pa.list_(sub))
+            elif type_spec['type'] == 'dict':
+                value_type = encoding.decode('dtype', type_spec["value_type"]).arrow
+                index_type = encoding.decode('dtype', type_spec["index_type"]).arrow
+                bool_ordered = type_spec["ordered"]
+                return DataType(pa.dictionary(index_type, value_type, bool_ordered))
             else:
                 raise ValueError(f'Do not understand type {type_spec}')
         if type_spec == 'string':
@@ -298,8 +311,8 @@ class selection_encoding:
             return {'type': 'ndarray', 'data': encoding.encode('ndarray', obj)}
         elif isinstance(obj, vaex.array_types.supported_arrow_array_types):
             return {'type': 'arrow-array', 'data': encoding.encode('arrow-array', obj)}
-        elif isinstance(obj, vaex.hash.ordered_set):
-            return {'type': 'ordered-set', 'data': encoding.encode('ordered-set', obj)}
+        elif isinstance(obj, vaex.hash.HashMapUnique):
+            return {'type': 'hash-map-unique', 'data': encoding.encode('hash-map-unique', obj)}
         elif isinstance(obj, np.generic):
             return {'type': 'numpy-scalar', 'data': encoding.encode('numpy-scalar', obj)}
         elif isinstance(obj, np.integer):
@@ -321,40 +334,6 @@ class selection_encoding:
             return encoding.decode(obj_spec['type'], obj_spec['data'])
         else:
             return obj_spec
-
-
-@register("ordered-set")
-class ordered_set_encoding:
-    @staticmethod
-    def encode(encoding, obj):
-        keys = obj.key_array()
-        if isinstance(keys, (vaex.strings.StringList32, vaex.strings.StringList64)):
-            keys = vaex.strings.to_arrow(keys)
-        keys = encoding.encode('array', keys)
-        clsname = obj.__class__.__name__
-        return {
-            'class': clsname,
-            'data': {
-                'keys': keys,
-                'null_value': obj.null_value,
-                'nan_count': obj.nan_count,
-                'missing_count': obj.null_count,
-                'fingerprint': obj.fingerprint,
-            }
-        }
-
-
-    @staticmethod
-    def decode(encoding, obj_spec):
-        clsname = obj_spec['class']
-        cls = getattr(vaex.hash, clsname)
-        keys = encoding.decode('array', obj_spec['data']['keys'])
-        dtype = vaex.dtype_of(keys)
-        if dtype.is_string:
-            keys = vaex.strings.to_string_sequence(keys)
-        value = cls(keys, obj_spec['data']['null_value'], obj_spec['data']['nan_count'], obj_spec['data']['missing_count'], obj_spec['data']['fingerprint'])
-        return value
-
 
 
 class Encoding:
@@ -435,8 +414,8 @@ class Encoding:
 
     def add_blob(self, buffer):
         bytes = memoryview(buffer).tobytes()
-        blake = blake3.blake3(bytes, multithreading=True)
-        blob_id = blake.hexdigest()
+        hasher = vaex.utils.create_hasher(bytes, large_data=True)
+        blob_id = hasher.hexdigest()
         self.blobs[blob_id] = bytes
         return f'blob:{blob_id}'
 

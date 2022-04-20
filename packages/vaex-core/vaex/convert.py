@@ -1,10 +1,11 @@
-import re
 import logging
 import os
+import sys
 
 import vaex
-import vaex.file
 import vaex.cache
+import vaex.file
+import vaex.progress
 
 log = logging.getLogger('vaex.cache')
 
@@ -25,7 +26,7 @@ def _convert_name(filenames, shuffle=False, suffix=None):
         return base + ".hdf5"
 
 
-def convert(path_input, fs_options_input, fs_input, path_output, fs_options_output, fs_output, *args, **kwargs):
+def convert(path_input, fs_options_input, fs_input, path_output, fs_options_output, fs_output, progress=None, *args, **kwargs):
     @vaex.cache.output_file(
         path_input=path_input, fs_options_input=fs_options_input, fs_input=fs_input,
         path_output=path_output, fs_options_output=fs_options_output, fs_output=fs_output)
@@ -33,11 +34,11 @@ def convert(path_input, fs_options_input, fs_input, path_output, fs_options_outp
         ds = vaex.dataset.open(path_input, fs_options=fs_options_input, fs=fs_input, *args, **kwargs)
         if ds is not None:
             df = vaex.from_dataset(ds)
-            df.export(path_output, fs_options=fs_options_output, fs=fs_output)
+            df.export(path_output, fs_options=fs_options_output, fs=fs_output, progress=progress)
     cached_output(*args, **kwargs)
 
 
-def convert_csv(path_input, fs_options_input, fs_input, path_output, fs_options_output, fs_output, *args, **kwargs):
+def convert_csv(path_input, fs_options_input, fs_input, path_output, fs_options_output, fs_output, progress=None, *args, **kwargs):
     @vaex.cache.output_file(
         path_input=path_input, fs_options_input=fs_options_input, fs_input=fs_input,
         path_output=path_output, fs_options_output=fs_options_output, fs_output=fs_output)
@@ -47,11 +48,11 @@ def convert_csv(path_input, fs_options_input, fs_input, path_output, fs_options_
         if 'chunk_size' not in kwargs:
             # make it memory efficient by default
             kwargs['chunk_size'] = 5_000_000
-        _from_csv_convert_and_read(path_input, path_output=path_output, fs_options=fs_options_input, fs=fs_input, **kwargs)
+        _from_csv_convert_and_read(path_input, path_output=path_output, fs_options=fs_options_input, fs=fs_input, progress=progress, **kwargs)
     cached_output(*args, **kwargs)
 
 
-def _from_csv_convert_and_read(filename_or_buffer, path_output, chunk_size, fs_options, fs=None, copy_index=False, **kwargs):
+def _from_csv_convert_and_read(filename_or_buffer, path_output, chunk_size, fs_options, fs=None, copy_index=False, progress=None, **kwargs):
     # figure out the CSV file path
     csv_path = vaex.file.stringyfy(filename_or_buffer)
     path_output_bare, ext, _ = vaex.file.split_ext(path_output)
@@ -61,24 +62,32 @@ def _from_csv_convert_and_read(filename_or_buffer, path_output, chunk_size, fs_o
     # convert CSV chunks to separate HDF5 files
     import pandas as pd
     converted_paths = []
+    # we don't have indeterminate progress bars, so we cast it to truethy
+    progress = bool(progress) if progress is not None else False
+    if progress:
+        print("Converting csv to chunk files")
     with vaex.file.open(filename_or_buffer, fs_options=fs_options, fs=fs, for_arrow=True) as f:
         csv_reader = pd.read_csv(filename_or_buffer, chunksize=chunk_size, **kwargs)
         for i, df_pandas in enumerate(csv_reader):
             df = vaex.from_pandas(df_pandas, copy_index=copy_index)
-            chunk_name = f'{path_output_bare}_chunk_{i}.{ext}'
+            chunk_name = f'{path_output_bare}_chunk_{i}{ext}'
             df.export(chunk_name)
             converted_paths.append(chunk_name)
             log.info('saved chunk #%d to %s' % (i, chunk_name))
+            if progress:
+                print("Saved chunk #%d to %s" % (i, chunk_name))
 
     # combine chunks into one HDF5 file
     if len(converted_paths) == 1:
         # no need to merge several HDF5 files
         os.rename(converted_paths[0], path_output)
     else:
+        if progress:
+            print('Converting %d chunks into single file %s' % (len(converted_paths), path_output))
         log.info('converting %d chunks into single file %s' % (len(converted_paths), path_output))
         dfs = [vaex.open(p) for p in converted_paths]
         df_combined = vaex.concat(dfs)
-        df_combined.export(path_output)
+        df_combined.export(path_output, progress=progress)
 
         log.info('deleting %d chunk files' % len(converted_paths))
         for df, df_path in zip(dfs, converted_paths):
@@ -102,6 +111,10 @@ def main(argv):
     parser.add_argument('--sort', dest="sort", default=None)
     parser.add_argument('--fraction', "-f", dest="fraction", type=float, default=1.0, help="fraction of input dataset to export")
     parser.add_argument('--filter', dest="filter", default=None, help="filter to apply before exporting")
+    parser.add_argument('--optimize', help="run df.optimize.categorize, downcast and cast float64 to float32 before exporting (default: %(default)s)", default=False, action='store_true')
+    parser.add_argument('--categorize', help="run df.optimize.categorize before exporting (default: %(default)s)", default=False, action='store_true')
+    parser.add_argument('--downcast', help="run df.optimize.downcast before exporting (default: %(default)s)", default=False, action='store_true')
+    parser.add_argument('--downcast-float', help="Downcast float64 to float32 (default: %(default)s)", default=False, action='store_true')
     parser.add_argument("input", help="input source or file, when prefixed with @ it is assumed to be a text file with a file list (one file per line)")
     parser.add_argument("output", help="output file (ends in .hdf5)")
     parser.add_argument("columns", help="list of columns to export (or all when empty)", nargs="*")
@@ -137,10 +150,17 @@ def main(argv):
             print("exporting %d rows and %d columns" % (len(df), len(columns)))
             print("columns: " + " ".join(columns))
 
-        if args.filter:
-            df = df.filter(args.filter)
-        if args.sort:
-            df = df.sort(args.sort)
+        with vaex.progress.tree(title="export preprocess"):
+            if args.filter:
+                df = df.filter(args.filter)
+            if args.sort:
+                df = df.sort(args.sort)
+            if args.shuffle:
+                df = df.shuffle()
+            if args.optimize or args.categorize:
+                df = df.optimize.categorize()
+            if args.optimize or args.downcast:
+                df = df.optimize.downcast(float64=args.optimize or args.downcast_float)
         try:
             df.export(args.output, progress=args.progress)
             if not args.quiet:
@@ -157,3 +177,6 @@ def main(argv):
 
 
     return 0
+
+if __name__ == "__main__":
+    main(sys.argv)

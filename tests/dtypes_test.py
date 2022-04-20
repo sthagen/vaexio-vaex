@@ -1,5 +1,7 @@
 from common import *
 from vaex.datatype import DataType
+from unittest.mock import MagicMock
+
 
 def test_dtype_basics(df):
     df['new_virtual_column'] = df.x + 1
@@ -81,3 +83,36 @@ def test_dtype_nested():
     assert df.s.data_type(axis=-3) == pa.list_(pa.list_(pa.string()))
     assert df.s.data_type(axis=-2) == pa.list_(pa.string())
     assert df.s.data_type(axis=-1) == pa.string()
+
+
+def test_dtype_no_eval():
+    df = vaex.from_dict({"#": [1.1], "with space": ['should work']})
+    df._evaluate_implementation = MagicMock()
+    assert df.data_type(df['#']) == float
+    assert df.data_type(df['with space']) == str
+
+
+def test_dtype_filtered():
+    df = vaex.from_arrays(x=[None, "aap", "noot", "mies"])
+    df["y"] = df.x.str.lower()
+    dff = df.dropna()
+    assert dff.y.dtype == str
+
+
+def test_dtype_apply():
+    def func(x):
+        if x == "b":
+            clr = "blue"
+        elif x == "r":
+            clr = "red"
+        elif x == "y":
+            clr = "yellow"
+        else:
+            clr = "other"
+        return clr
+
+    x = [None, "b", None, "y", "r"]
+    df = vaex.from_arrays(x=x)
+    df = df.dropna()
+    df["y"] = df.x.apply(func)
+    assert df.y.dtype == str

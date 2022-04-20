@@ -1,3 +1,4 @@
+from unittest import mock
 from common import *
 
 
@@ -145,3 +146,49 @@ def test_arrow_evaluate(parallel):
     assert df.evaluate(df.s.as_arrow(), array_type='arrow', parallel=parallel).type == pa.string()
     assert df.evaluate(df.s.as_arrow(), array_type=None, parallel=parallel).type == pa.string()
     assert df.evaluate(df.l, parallel=parallel).type == pa.list_(l.type.value_type)
+
+
+def test_evaluate_with_selection(df_factory):
+    x = np.arange(3)
+    df = df_factory(x=x)
+    assert df.x.evaluate(selection='x>0', array_type='numpy').tolist() == [1, 2]
+    assert df.x.evaluate(selection='x>0', array_type='arrow').to_pylist() == [1, 2]
+    assert df.x.evaluate(selection='x>0', array_type='python') == [1, 2]
+
+
+@pytest.mark.parametrize("array_type", ['numpy', 'list', 'arrow'])
+def test_evaluate_chunked(df_factory, buffer_size, array_type):
+    x = np.arange(10)
+    y = x**2
+    df = df_factory(x=x)
+    # use a virtual column, since 'x' skips passing over the data
+    df['y'] = df.x ** 2
+    with buffer_size(df, 3):
+        values = df.evaluate('y', array_type=array_type)
+        assert vaex.array_types.tolist(values) == y.tolist()
+
+def test_evaluate_no_execute():
+    df = vaex.from_dict({"#": [1.1], "with space": ['should work'], "x": [1.]})
+    df['%'] = df['#'] + 1
+    with mock.patch.object(df.executor, 'execute', wraps=df.executor.execute) as method:
+        df.evaluate('x')
+        method.assert_not_called()
+        df.evaluate('df["#"]')
+        method.assert_not_called()
+        df.evaluate(df["#"])
+        method.assert_not_called()
+        df.evaluate(df["%"])
+        method.assert_called_once()
+
+
+@pytest.mark.parametrize("parallel", [True, False])
+@pytest.mark.parametrize("prefetch", [True, False])
+def test_evaluate_empty(parallel, prefetch):
+    df = vaex.from_arrays(x=[1, 2])
+    dff = df[df.x > 10]
+    assert dff.x.tolist() == []
+    assert dff.evaluate('x', parallel=parallel).tolist() == []
+    for i1, i2, chunks in dff.evaluate_iterator('x', chunk_size=10, parallel=parallel, prefetch=prefetch):
+        raise RuntimeError('unexpected')
+    for i1, i2, chunks in dff.to_arrow_table('x', chunk_size=10, parallel=parallel):
+        raise RuntimeError('unexpected')

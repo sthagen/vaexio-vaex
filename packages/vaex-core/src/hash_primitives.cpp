@@ -19,33 +19,38 @@ void bind_common(Cls &cls) {
         .def_property_readonly("nan_count", [](const Type &c) { return c.nan_count; })
         .def_property_readonly("null_count", [](const Type &c) { return c.null_count; })
         .def_property_readonly("has_nan", [](const Type &c) { return c.nan_count > 0; })
-        .def_property_readonly("has_null", [](const Type &c) { return c.null_count > 0; });
+        .def_property_readonly("has_null", [](const Type &c) { return c.null_count > 0; })
+        .def_property_readonly("null_index", [](const Type &c) { return c.null_index(); })
+        .def_property_readonly("nan_index", [](const Type &c) { return c.nan_index(); });
 }
 
 namespace vaex {
 template <class T, class M, template <typename, typename> class Hashmap>
 void init_hash_(M m, std::string name, std::string suffix) {
+    // we use a baseclass so we can pass the ordered set around
+    std::string basename = "hash_map_" + name + suffix;
+    typedef hash_map<T> BaseType;
+
+    auto BaseClass = py::class_<BaseType>(m, basename.c_str());
+
     {
         typedef counter<T, Hashmap> Type;
         std::string countername = "counter_" + name + suffix;
         auto cls = py::class_<Type>(m, countername.c_str())
-            .def(py::init<int>())
-            // .def("reserve", &Type::reserve)
-            .def("counts", &Type::counts)
-            ;
+                       .def(py::init<int>())
+                       // .def("reserve", &Type::reserve)
+                       .def("counts", &Type::counts);
         bind_common<Type>(cls);
     }
     {
         std::string ordered_setname = "ordered_set_" + name + suffix;
         typedef ordered_set<T, Hashmap> Type;
-        auto cls = py::class_<Type>(m, ordered_setname.c_str())
-                       .def(py::init<int>())
+        auto cls = py::class_<Type>(m, ordered_setname.c_str(), BaseClass)
+                       .def(py::init<int, int64_t>(), py::arg("nmaps"), py::arg("limit") = -1)
                        .def(py::init(&Type::create))
                        .def("isin", &Type::isin)
                        .def("flatten_values", &Type::flatten_values)
                        .def("map_ordinal", &Type::map_ordinal)
-                       .def_property_readonly("null_value", [](const Type &c) { return c.null_value; })
-                       .def_property_readonly("nan_value", [](const Type &c) { return c.nan_value; })
                        .def_readwrite("fingerprint", &Type::fingerprint);
         bind_common<Type>(cls);
     }

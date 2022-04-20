@@ -1,3 +1,4 @@
+from re import S
 import vaex
 import numpy as np
 from common import *
@@ -69,8 +70,7 @@ def test_correlation(df_local):
     def correlation(x, y):
         c = np.cov([x, y], bias=1)
         return c[0,1] / (c[0,0] * c[1,1])**0.5
-
-    np.testing.assert_array_almost_equal(df.correlation([["x", "y"], ["x", "x**2"]], selection=None), [correlation(x, y), correlation(x, x**2)])
+    np.testing.assert_array_almost_equal(df.correlation([["x", "y"], ["x", "x**2"]], selection=None)['correlation'].tolist(), [correlation(x, y), correlation(x, x**2)])
 
     df.select("x < 5")
     np.testing.assert_array_almost_equal(df.correlation("x", "y", selection=None), correlation(x, y))
@@ -175,9 +175,9 @@ def test_count_1d_ordinal():
     bins = 5
     binner = df._binner_ordinal('x', 5)
     agg = vaex.agg.count(edges=True)
-    tasks, result = agg.add_tasks(df, (binner,))
+    tasks, result = agg.add_tasks(df, (binner,), progress=False)
     df.execute()
-    assert result.get().tolist() == [0, 2, 1, 1, 0, 0, 1, 1]
+    assert result.get().tolist() == [1, 1, 0, 0, 1, 3, 0]
 
 
 
@@ -509,3 +509,210 @@ def test_agg_count_with_custom_name():
     df_grouped = df.groupby(df.x, sort=True).agg({'mycounts': vaex.agg.count(), 'mycounts2': 'count'})
     assert df_grouped['mycounts'].tolist() == [3, 2, 1]
     assert df_grouped['mycounts2'].tolist() == [3, 2, 1]
+
+
+def test_agg_unary():
+    x = np.arange(5)
+    df = vaex.from_arrays(x=x, g=x//4)
+    agg = -vaex.agg.sum('x')
+    assert repr(agg) == "-vaex.agg.sum('x')"
+    assert df.groupby('g', agg={'sumx': agg})['sumx'].tolist() == [-6, -4]
+
+
+def test_agg_binary():
+    x = np.arange(5)
+    df = vaex.from_arrays(x=x, y=x+1, g=x//4)
+    agg = vaex.agg.sum('x') / vaex.agg.sum('y')
+    assert repr(agg) == "(vaex.agg.sum('x') / vaex.agg.sum('y'))"
+    assert df.groupby('g', agg={'total': agg})['total'].tolist() == [6 / 10, 4 / 5]
+    agg = vaex.agg.sum('x') + 99
+    assert repr(agg) == "(vaex.agg.sum('x') + 99)"
+    assert df.groupby('g', agg={'total': agg})['total'].tolist() == [6 + 99, 4 + 99]
+    agg = 99 + vaex.agg.sum('y')
+    assert repr(agg) == "(99 + vaex.agg.sum('y'))"
+    assert df.groupby('g', agg={'total': agg})['total'].tolist() == [99 + 10, 99 + 5]
+    assert df.groupby('g', agg={'total': vaex.agg.sum('x') / 2})['total'].tolist() == [6/2, 4/2]
+    assert df.groupby('g', agg={'total': 2/vaex.agg.sum('x')})['total'].tolist() == [2/6, 2/4]
+
+
+def test_any():
+    # x  = [0, 1, 2, 3, 4]
+    # g  = [0, 0, 0, 0, 1]
+    # b1 = [0, 0, 1, 0, 0]
+    # b2 = [0, 0, 1, 0, 1]
+    x = np.arange(5)
+    df = vaex.from_arrays(x=x, y=x+1, g=x//4)
+    df['b1'] = x == 2
+    df['b2'] = (x % 2) == 0
+    assert df.groupby('g', agg={'any': vaex.agg.any('b1')})['any'].tolist() == [True, False]
+    assert df.groupby('g', agg={'any': vaex.agg.any('b2')})['any'].tolist() == [True, True]
+
+    assert df.groupby('g', agg={'any': vaex.agg.any('b1', selection=df.b1)})['any'].tolist() == [True, False]
+    assert df.groupby('g', agg={'any': vaex.agg.any('b2', selection=df.b1)})['any'].tolist() == [True, False]
+
+    assert df.groupby('g', agg={'any': vaex.agg.any(selection=df.b1)})['any'].tolist() == [True, False]
+    assert df.groupby('g', agg={'any': vaex.agg.any(selection=df.b2)})['any'].tolist() == [True, True]
+
+
+def test_all():
+    # x  = [0, 1, 2, 3, 4]
+    # g  = [0, 0, 0, 0, 1]
+    # b1 = [0, 0, 1, 0, 0]
+    # b2 = [0, 0, 1, 0, 1]
+    x = np.arange(5)
+    df = vaex.from_arrays(x=x, y=x+1, g=x//4)
+    df['b1'] = x == 2
+    df['b2'] = (x % 2) == 0
+    assert df.groupby('g', agg={'all': vaex.agg.all('b1')})['all'].tolist() == [False, False]
+    assert df.groupby('g', agg={'all': vaex.agg.all('b2')})['all'].tolist() == [False, True]
+
+    assert df.groupby('g', agg={'all': vaex.agg.all('b1', selection=df.b1)})['all'].tolist() == [False, False]
+    assert df.groupby('g', agg={'all': vaex.agg.all('b2', selection=df.b1)})['all'].tolist() == [False, False]
+
+    assert df.groupby('g', agg={'all': vaex.agg.all(selection=df.b1)})['all'].tolist() == [False, False]
+    assert df.groupby('g', agg={'all': vaex.agg.all(selection=df.b2)})['all'].tolist() == [False, True]
+
+
+def test_agg_bare():
+    df = vaex.from_arrays(x=[1, 2, 3], s=["aap", "aap", "noot"])
+
+    result = df._agg(vaex.agg.count('x'))
+    assert result == 3
+    assert result.ndim == 0
+    result = df._agg(vaex.agg.nunique('x'))
+    assert result.ndim == 0
+    assert result.item() is 3
+
+    result = df._agg(vaex.agg.count('s'))
+    assert result == 3
+    assert result.ndim == 0
+    result = df._agg(vaex.agg.nunique('s'))
+    assert result.ndim == 0
+    assert result.item() is 2
+
+
+def test_unique_large():
+    x = np.arange(1000)
+    df = vaex.from_arrays(x=x)
+    with small_buffer(df, 10):
+        assert df._agg(vaex.agg.nunique('x'))
+
+def test_unique_1d(df_factory):
+    x = [0, 0, 1, 1, 1, None, None, np.nan]
+    y = [1, 1, 1, 2, 3, 1,    2,    1]
+    df = df_factory(x=x, y=y)
+    with small_buffer(df, 10):
+        dfg = df.groupby('x', sort=True, agg=vaex.agg.nunique('y'))
+        assert dfg['x'].tolist()[:2] == [0, 1]
+        assert dfg['x'].tolist()[-1] is None
+        assert dfg['y_nunique'].tolist() == [1, 3, 1, 2]
+
+@pytest.mark.parametrize("binner1", [vaex.groupby.BinnerInteger, lambda x: vaex.groupby.Grouper(x, sort=True)])
+@pytest.mark.parametrize("binner2", [vaex.groupby.BinnerInteger, lambda x: vaex.groupby.Grouper(x, sort=True)])
+def test_unique_2d(df_factory, binner1, binner2):
+    x = [0, 0, 1, 1, 1, 2, 2, 2, 2]
+    y = [4, 5, 4, 5, 5, 4, 5, 5, 5]
+    z = [0, 0, 0, 0, 1, 0, 1, 2, 3]
+    df = df_factory(x=x, y=y, z=z)
+    df['x'] = df['x'].astype('int8')
+    df['y'] = df['y'].astype('int8')
+    with small_buffer(df, 10):
+        dfg = df.groupby([binner1(df.x), binner2(df.y)], sort=True, agg={'c': vaex.agg.nunique('z')})
+        assert dfg['x'].tolist() == [0, 0, 1, 1, 2, 2]
+        assert dfg['y'].tolist() == [4, 5, 4, 5, 4, 5]
+        assert dfg['c'].tolist() == [1, 1, 1, 2, 1, 3]
+
+
+def test_skew(df_example):
+    df = df_example
+    pandas_df = df.to_pandas_df()
+    np.testing.assert_approx_equal(df.skew("x"), pandas_df.x.skew(), significant=5)
+    np.testing.assert_approx_equal(df.skew("Lz"), pandas_df.Lz.skew(), significant=5)
+    np.testing.assert_approx_equal(df.skew("E"), pandas_df.E.skew(), significant=5)
+
+
+def test_groupby_skew(df_example):
+    df = df_example
+    pandas_df = df.to_pandas_df()
+    vaex_g = df.groupby("id", sort=True).agg({"skew": vaex.agg.skew("Lz")})
+    pandas_g = pandas_df.groupby("id", sort=True).agg(skew=("Lz", "skew"))
+    np.testing.assert_almost_equal(vaex_g["skew"].values, pandas_g["skew"].values, decimal=4)
+
+
+def test_kurtosis(df_example):
+    df = df_example
+    pandas_df = df.to_pandas_df()
+    np.testing.assert_approx_equal(df.kurtosis("x"), pandas_df.x.kurtosis(), significant=4)
+    np.testing.assert_approx_equal(df.kurtosis("Lz"), pandas_df.Lz.kurtosis(), significant=4)
+    np.testing.assert_approx_equal(df.kurtosis("E"), pandas_df.E.kurtosis(), significant=4)
+
+
+def test_groupby_kurtosis(df_example):
+    import pandas as pd
+
+    df = df_example
+    pandas_df = df.to_pandas_df()
+    vaex_g = df.groupby("id", sort=True).agg({"kurtosis": vaex.agg.kurtosis("Lz")})
+    pandas_g = pandas_df.groupby("id", sort=True).agg(kurtosis=("Lz", pd.Series.kurtosis))
+    np.testing.assert_almost_equal(vaex_g["kurtosis"].values, pandas_g["kurtosis"].values, decimal=3)
+
+@pytest.mark.parametrize("dropmissing", [False, True])
+@pytest.mark.parametrize("dropnan", [False, True])
+@pytest.mark.parametrize("by_col_has_missing", [False, True])
+def test_agg_list(dropmissing, dropnan, by_col_has_missing):
+    if by_col_has_missing:
+        special_value = None
+    else:
+        special_value = 3
+    data = {
+        'id': pa.array([1, 2, 2, 1, 1, special_value, special_value]),
+        'num': [1.1, 1.2, 1.3, 1.4, np.nan, 1.6, 1.7],
+        'food': ['cake', 'apples', 'oranges', 'meat', 'meat', 'carrots', None]}
+    df = vaex.from_dict(data)
+
+    gb = df.groupby('id').agg({'food': vaex.agg.list(df['food'], dropmissing=dropmissing),
+                               'num': vaex.agg.list(df['num'], dropnan=dropnan)
+                              })
+
+    if dropmissing:
+        assert gb.food.tolist() == [['cake', 'meat', 'meat'], ['apples', 'oranges'], ['carrots']]
+    else:
+        assert gb.food.tolist() == [['cake', 'meat', 'meat'], ['apples', 'oranges'], ['carrots', None]]
+
+    result = gb.num.tolist()
+    if dropnan:
+        assert result == [[1.1, 1.4], [1.2, 1.3], [1.6, 1.7]]
+    else:
+        assert result[1:] == [[1.2, 1.3], [1.6, 1.7]]
+        assert result[0][:2] == [1.1, 1.4]
+        assert np.isnan(result[0][2])
+
+    if by_col_has_missing:
+        assert gb.id.tolist() == [1, 2, None]
+    else:
+        assert gb.id.tolist() == [1, 2, 3]
+
+def test_agg_arrow():
+    # cover different groupers with the aggregator resulting in arrow data (e.g. a list)
+    s = ['aap', 'aap', 'noot', 'mies', None, 'mies', 'kees', 'mies', 'aap']
+    x = [0,     0,     0,      0,      0,     1,      1,     1,      2]
+    y = [1,     1,     0,      1,      0,     0,      0,     1,      1]
+    df = vaex.from_arrays(x=x, s=s, y=y)
+    dfg = df.groupby(df.s, agg={'l': vaex.agg.list(df.x)}, sort=True)
+    assert dfg.s.tolist() == ['aap', 'kees', 'mies', 'noot', None]
+    assert set(dfg.l.tolist()[0]) == {0, 2}
+
+    g = vaex.groupby.GrouperLimited(df.s, ['aap', 'kees'], other_value='other', sort=True)
+    dfg = df.groupby(g, agg={'l': vaex.agg.list(df.x)}, sort=True)
+    assert dfg.s.tolist() == ['aap', 'kees', 'other']
+    assert set(dfg.l.tolist()[0]) == {0, 2}
+
+    g = vaex.groupby.BinnerInteger(df.x, sort=True, min_value=0, max_value=2)
+    dfg = df.groupby(g, agg={'s': vaex.agg.list(df.s)}, sort=True)
+    assert dfg.x.tolist() == [0, 1, 2]
+    assert set(dfg.s.tolist()[0]) == {'mies', 'aap', 'noot', None}
+
+    df = df.ordinal_encode('s')
+    dfg = df.groupby(df.s, agg={'l': vaex.agg.list(df.x)}, sort=True)
+    assert dfg.s.tolist() == ['aap', 'kees', 'mies', 'noot', None]
+    assert set(dfg.l.tolist()[0]) == {0, 2}

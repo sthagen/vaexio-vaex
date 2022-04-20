@@ -5,8 +5,16 @@ import vaex.utils
 
 supported_arrow_array_types = (pa.Array, pa.ChunkedArray)
 supported_array_types = (np.ndarray, ) + supported_arrow_array_types
-
 string_types = [pa.string(), pa.large_string()]
+_type_names_int = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"]
+_type_names = ["float64", "float32"] + _type_names_int
+map_arrow_to_numpy = {getattr(pa, name)(): np.dtype(name) for name in _type_names}
+map_arrow_to_numpy[pa.bool_()] = np.dtype("?")
+for unit in 's ms us ns'.split():
+    map_arrow_to_numpy[pa.timestamp(unit)] = np.dtype(f"datetime64[{unit}]")
+
+for unit in 's ms us ns'.split():
+    map_arrow_to_numpy[pa.duration(unit)] = np.dtype(f"timedelta64[{unit}]")
 
 
 def full(n, value, dtype):
@@ -37,6 +45,10 @@ def filter(ar, boolean_mask):
         return ar[boolean_mask]
 
 
+def take(ar, indices):
+    return ar.take(indices)
+
+
 def slice(ar, offset, length=None):
     if offset == 0 and len(ar) == length:
         return ar
@@ -48,6 +60,28 @@ def slice(ar, offset, length=None):
         else:
             return ar[offset:]
 
+
+def shape(ar):
+    if is_arrow_array(ar):
+        return (len(ar),)
+    else:
+        return ar.shape
+
+def ndim(ar):
+    if is_arrow_array(ar):
+        return 1
+    else:
+        return ar.ndim
+
+
+def getitem(ar, item):
+    if is_arrow_array(ar):
+        assert len(item) == 1, "For arrow we only support 1 d items"
+        assert item[0].step is None, "Step not supported for arrow"
+        start, end = item[0].start, item[0].stop
+        return ar[start:end]
+    else:
+        return ar[item]
 
 def concat(arrays):
     if len(arrays) == 1:
@@ -86,7 +120,7 @@ def is_string(ar):
 
 def filter(ar, boolean_mask):
     if isinstance(ar, supported_arrow_array_types):
-        return ar.filter(pa.array(boolean_mask))
+        return ar.filter(to_arrow(boolean_mask))
     else:
         return ar[boolean_mask]
 
@@ -126,7 +160,8 @@ def to_numpy(x, strict=False):
     elif isinstance(x, np.ndarray):
         return x
     elif isinstance(x, supported_arrow_array_types):
-        if not strict and is_string(x):
+        dtype = vaex.dtype_of(x)
+        if not strict and not (dtype.is_primitive or dtype.is_temporal):
             return x
         x = vaex.arrow.convert.column_from_arrow_array(x)
         return to_numpy(x, strict=strict)
@@ -136,6 +171,9 @@ def to_numpy(x, strict=False):
 
 
 def to_arrow(x, convert_to_native=True):
+    if isinstance(x, (vaex.strings.StringList32, vaex.strings.StringList64)):
+        col = vaex.column.ColumnStringArrow.from_string_sequence(x)
+        return pa.array(col)
     if isinstance(x, supported_arrow_array_types):
         return x
     if convert_to_native and isinstance(x, np.ndarray):
@@ -151,7 +189,7 @@ def to_xarray(x):
 def convert(x, type, default_type="numpy"):
     import vaex.column
     if type == "numpy":
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple)) and len(x) > 0 and is_array(x[0]):
             return concat([convert(k, type) for k in x])
         else:
             return to_numpy(x, strict=True)
@@ -161,7 +199,7 @@ def convert(x, type, default_type="numpy"):
         else:
             return to_numpy(x, strict=False)
     elif type == "arrow":
-        if isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple)) and len(x) > 0 and is_array(x[0]):
             chunks = [convert(k, type) for k in x]
             return concat(chunks)
         else:
@@ -169,10 +207,16 @@ def convert(x, type, default_type="numpy"):
     elif type == "xarray":
         return to_xarray(x)
     elif type in ['list', 'python']:
-        try:
-            return pa.array(x).tolist()
-        except:
-            return np.array(x).tolist()
+        if isinstance(x, (list, tuple)):
+            result = []
+            for chunk in x:
+                result += convert(chunk, type, default_type=default_type)
+            return result
+        else:
+            try:
+                return pa.array(x).tolist()
+            except:
+                return np.array(x).tolist()
     elif type is None:
         if isinstance(x, (list, tuple)):
             chunks = [convert(k, type) for k in x]
@@ -274,8 +318,16 @@ def arrow_type_from_numpy_dtype(dtype):
 
 
 def numpy_dtype_from_arrow_type(arrow_type, strict=True):
-    data = pa.array([], type=arrow_type)
-    return numpy_dtype(data, strict=strict)
+    if is_string_type(arrow_type):
+        if strict:
+            return np.dtype('object')
+        else:
+            return arrow_type
+    try:
+        return map_arrow_to_numpy[arrow_type]
+    except KeyError:
+        raise NotImplementedError(f'Cannot convert {arrow_type}')
+
 
 
 def type_promote(t1, t2):
@@ -298,7 +350,8 @@ def type_promote(t1, t2):
     # TODO: so far we only use this in in code that converts to arrow
     # if we want to support numpy, we have to check it types were numpy types
     is_numerics = [pa.types.is_floating, pa.types.is_integer]
-    if any(test(t1) for test in is_numerics) and any(test(t2) for test in is_numerics):
+    if (any(test(t1) for test in is_numerics) and any(test(t2) for test in is_numerics)) \
+       or (pa.types.is_timestamp(t1) and pa.types.is_timestamp(t2)):
         # leverage numpy for type promotion
         dtype1 = numpy_dtype_from_arrow_type(t1)
         dtype2 = numpy_dtype_from_arrow_type(t2)

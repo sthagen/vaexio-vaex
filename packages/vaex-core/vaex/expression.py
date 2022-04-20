@@ -2,6 +2,8 @@ import ast
 import copy
 import os
 import base64
+import datetime
+from pydoc import doc
 import time
 import cloudpickle as pickle
 import functools
@@ -15,13 +17,14 @@ import numpy as np
 import pandas as pd
 import tabulate
 import pyarrow as pa
-from vaex.datatype import DataType
-from vaex.docstrings import docsubst
 
+import vaex.hash
+import vaex.serialize
 from vaex.utils import _ensure_strings_from_expressions, _ensure_string_from_expression
 from vaex.column import ColumnString, _to_string_sequence
 from .hash import counter_type_from_dtype
-import vaex.serialize
+from vaex.datatype import DataType
+from vaex.docstrings import docsubst
 from . import expresso
 
 
@@ -129,11 +132,19 @@ class Meta(type):
                             assert b.ds == a.ds
                             b = b.expression
                         elif isinstance(b, (np.timedelta64)):
-                            df = a.ds
-                            b = df.add_variable('var_time_delta', b, unique=True)
+                            unit, step = np.datetime_data(b.dtype)
+                            assert step == 1
+                            b = b.astype(np.uint64).item()
+                            b = f'scalar_timedelta({b}, {unit!r})'
                         elif isinstance(b, (np.datetime64)):
-                            df = a.ds
-                            b = df.add_variable('var_date_time', b, unique=True)
+                            b = f'scalar_datetime("{b}")'
+                        elif isinstance(b, np.ndarray) and b.ndim == 0 and vaex.dtype_of(b).is_datetime:
+                            b = f'scalar_datetime("{b}")'
+                        elif isinstance(b, np.ndarray) and b.ndim == 0 and vaex.dtype_of(b).is_timedelta:
+                            unit, step = np.datetime_data(b.dtype)
+                            assert step == 1
+                            b = b.astype(np.uint64).item()
+                            b = f'scalar_timedelta({b}, {unit!r})'
                         expression = '({0} {1} {2})'.format(a.expression, op['code'], b)
                     return Expression(self.ds, expression=expression)
                 attrs['__%s__' % op['name']] = f
@@ -365,8 +376,9 @@ class StructOperations(collections.abc.Mapping):
 
 class Expression(with_metaclass(Meta)):
     """Expression class"""
-    def __init__(self, ds, expression, ast=None):
-        self.ds = ds
+    def __init__(self, ds, expression, ast=None, _selection=False):
+        import vaex.dataframe
+        self.ds : vaex.dataframe.DataFrame = ds
         assert not isinstance(ds, Expression)
         if isinstance(expression, Expression):
             expression = expression.expression
@@ -376,6 +388,7 @@ class Expression(with_metaclass(Meta)):
         self._expression = expression
         self.df._expressions.append(weakref.ref(self))
         self._ast_names = None
+        self._selection = _selection  # selection have an extra scope
 
     @property
     def _label(self):
@@ -392,7 +405,7 @@ class Expression(with_metaclass(Meta)):
         return self.expression
 
     def fingerprint(self):
-        fp = vaex.cache.fingerprint(self.expression, self.df.fingerprint())
+        fp = vaex.cache.fingerprint(self.expression, self.df.fingerprint(dependencies=self.dependencies()))
         return f'expression-{fp}'
 
     def copy(self, df=None):
@@ -517,9 +530,13 @@ class Expression(with_metaclass(Meta)):
             start, stop, step = item.start, item.stop, item.step
             assert step in [None, 1]
             return self.evaluate(start, stop, parallel=False)
-        dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype.numpy)
-        dsk[name] = self
-        return da.Array(dsk, name, chunks, dtype=dtype.numpy)
+        if hasattr(da.core, "getem"):
+            dsk = da.core.getem(name, chunks, getitem=getitem, shape=self.shape, dtype=dtype.numpy)
+            dsk[name] = self
+            return da.Array(dsk, name, chunks, dtype=dtype.numpy)
+        else:
+            dsk = da.core.graph_from_arraylike(self, name=name, chunks=chunks, getitem=getitem, shape=self.shape, dtype=dtype.numpy)
+            return da.Array(dsk, name, chunks, dtype=dtype.numpy)
 
     def to_pandas_series(self):
         """Return a pandas.Series representation of the expression.
@@ -589,7 +606,7 @@ class Expression(with_metaclass(Meta)):
             indices, fields = slicer
         else:
             raise NotImplementedError
-        
+
         if indices != slice(None):
             expr = self.df[indices][self.expression]
         else:
@@ -667,6 +684,10 @@ class Expression(with_metaclass(Meta)):
         expr = expresso.translate(self.ast, translate)
         return Expression(self.ds, expr)
 
+    def dependencies(self):
+        '''Get all dependencies of this expression, including ourselves'''
+        return self.variables(ourself=True)
+
     def variables(self, ourself=False, expand_virtual=True, include_virtual=True):
         """Return a set of variables this expression depends on.
 
@@ -679,6 +700,10 @@ class Expression(with_metaclass(Meta)):
         """
         variables = set()
         def record(varname):
+            # always do this for selection
+            if self._selection and self.df.has_selection(varname):
+                selection = self.df.get_selection(varname)
+                variables.update(selection.dependencies(self.df))
             # do this recursively for virtual columns
             if varname in self.ds.virtual_columns and varname not in variables:
                 if (include_virtual and (varname != self.expression)) or (varname == self.expression and ourself):
@@ -907,6 +932,20 @@ class Expression(with_metaclass(Meta)):
         kwargs['expression'] = self.expression
         return self.ds.var(**kwargs)
 
+    def skew(self, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
+        '''Shortcut for df.skew(expression, ...), see `DataFrame.skew`'''
+        kwargs = dict(locals())
+        del kwargs['self']
+        kwargs['expression'] = self.expression
+        return self.df.skew(**kwargs)
+
+    def kurtosis(self, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
+        '''Shortcut for df.kurtosis(expression, ...), see `DataFrame.kurtosis`'''
+        kwargs = dict(locals())
+        del kwargs['self']
+        kwargs['expression'] = self.expression
+        return self.df.kurtosis(**kwargs)
+
     def minmax(self, binby=[], limits=None, shape=default_shape, selection=False, delay=False, progress=None):
         '''Shortcut for ds.minmax(expression, ...), see `Dataset.minmax`'''
         kwargs = dict(locals())
@@ -942,6 +981,7 @@ class Expression(with_metaclass(Meta)):
         """Alias to df.is_masked(expression)"""
         return self.ds.is_masked(self.expression)
 
+    @docsubst
     def value_counts(self, dropna=False, dropnan=False, dropmissing=False, ascending=False, progress=False, axis=None):
         """Computes counts of unique values.
 
@@ -949,10 +989,11 @@ class Expression(with_metaclass(Meta)):
           * If the expression/column is not categorical, it will be converted on the fly
           * dropna is False by default, it is True by default in pandas
 
-        :param dropna: when True, it will not report the NA (see :func:`Expression.isna`)
-        :param dropnan: when True, it will not report the nans(see :func:`Expression.isnan`)
-        :param dropmissing: when True, it will not report the missing values (see :func:`Expression.ismissing`)
+        :param dropna: {dropna}
+        :param dropnan: {dropnan}
+        :param dropmissing: {dropmissing}
         :param ascending: when False (default) it will report the most frequent occuring item first
+        :param progress: {progress}
         :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
         :returns: Pandas series containing the counts
         """
@@ -975,11 +1016,17 @@ class Expression(with_metaclass(Meta)):
 
         counter_type = counter_type_from_dtype(data_type_item, transient)
         counters = [None] * self.ds.executor.thread_pool.nthreads
-        def map(thread_index, i1, i2, ar):
+        def map(thread_index, i1, i2, selection_masks, blocks):
+            ar = blocks[0]
+            if len(ar) == 0:
+                return 0
             if counters[thread_index] is None:
                 counters[thread_index] = counter_type(1)
             if data_type.is_list and axis is None:
-                ar = ar.values
+                try:
+                    ar = ar.values
+                except AttributeError:  # pyarrow ChunkedArray
+                    ar = ar.combine_chunks().values
             if data_type_item.is_string:
                 ar = _to_string_sequence(ar)
             else:
@@ -992,7 +1039,8 @@ class Expression(with_metaclass(Meta)):
             return 0
         def reduce(a, b):
             return a+b
-        self.ds.map_reduce(map, reduce, [self.expression], delay=False, progress=progress, name='value_counts', info=True, to_numpy=False)
+        progressbar = vaex.utils.progressbars(progress, title="value counts")
+        self.ds.map_reduce(map, reduce, [self.expression], delay=False, progress=progressbar, name='value_counts', info=True, to_numpy=False)
         counters = [k for k in counters if k is not None]
         counter = counters[0]
         for other in counters[1:]:
@@ -1028,9 +1076,9 @@ class Expression(with_metaclass(Meta)):
             else:
                 null_offset = 0
             if dropmissing and counter.has_null:
-                deletes.append(null_offset)
+                deletes.append(counter.null_index)
             if dropnan and counter.has_nan:
-                deletes.append(0)
+                deletes.append(counter.nan_index)
             if vaex.array_types.is_arrow_array(keys):
                 indices = np.delete(np.arange(len(keys)), deletes)
                 keys = keys.take(indices)
@@ -1060,36 +1108,47 @@ class Expression(with_metaclass(Meta)):
         return Series(counts, index=keys)
 
     @docsubst
-    def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, array_type='list', delay=False):
+    def unique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, limit=None, limit_raise=True, array_type='list', progress=None, delay=False):
         """Returns all unique values.
 
-        :param dropmissing: do not count missing values
-        :param dropnan: do not count nan values
-        :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        :param dropna: {dropna}
+        :param dropnan: {dropnan}
+        :param dropmissing: {dropmissing}
+        :param selection: {selection}
         :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
+        :param int limit: {limit}
+        :param bool limit_raise: {limit_raise}
         :param bool array_type: {array_type}
+        :param progress: {progress}
+        :param bool delay: {delay}
         """
-        return self.ds.unique(self, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, array_type=array_type, axis=axis, delay=delay)
+        return self.ds.unique(self, dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, array_type=array_type, axis=axis, limit=limit, limit_raise=limit_raise, progress=progress, delay=delay)
 
-    def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, delay=False):
+    @docsubst
+    def nunique(self, dropna=False, dropnan=False, dropmissing=False, selection=None, axis=None, limit=None, limit_raise=True, progress=None, delay=False):
         """Counts number of unique values, i.e. `len(df.x.unique()) == df.x.nunique()`.
 
-        :param dropmissing: do not count missing values
-        :param dropnan: do not count nan values
-        :param dropna: short for any of the above, (see :func:`Expression.isna`)
+        :param dropna: {dropna}
+        :param dropnan: {dropnan}
+        :param dropmissing: {dropmissing}
+        :param selection: {selection}
         :param bool axis: Axis over which to determine the unique elements (None will flatten arrays or lists)
+        :param int limit: {limit}
+        :param bool limit_raise: {limit_raise}
+        :param progress: {progress}
+        :param bool delay: {delay}
         """
-        if delay is False and vaex.cache.is_on():
-            fp = vaex.cache.fingerprint(self.fingerprint(), dropna, dropnan, dropmissing, selection, axis)
-            key = f'nunique-{fp}'
-            value = vaex.cache.get(key, type='computed')
-            if value is None:
-                t0 = time.time()
-                value = len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, array_type=None))
-                duration_wallclock = time.time() - t0
-                vaex.cache.set(key, value, type='computed', duration_wallclock=duration_wallclock)
-            return value
-        return len(self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, delay=delay))
+        def key_function():
+            fp = vaex.cache.fingerprint(self.fingerprint(), dropna, dropnan, dropmissing, selection, axis, limit)
+            return f'nunique-{fp}'
+        @vaex.cache._memoize(key_function=key_function, delay=delay)
+        def f():
+            value = self.unique(dropna=dropna, dropnan=dropnan, dropmissing=dropmissing, selection=selection, axis=axis, limit=limit, limit_raise=limit_raise, array_type=None, progress=progress, delay=delay)
+            if delay:
+                return value.then(len)
+            else:
+                return len(value)
+        return f()
 
     def countna(self):
         """Returns the number of Not Availiable (N/A) values in the expression.
@@ -1112,10 +1171,36 @@ class Expression(with_metaclass(Meta)):
     # it now also misses the docstring, reconsider how the the meta class auto
     # adds this method
     def fillna(self, value, fill_nan=True, fill_masked=True):
-        return self.ds.func.fillna(self, value=value, fill_nan=fill_nan, fill_masked=fill_masked)
+        expression = self._upcast_for(value)
+        return self.ds.func.fillna(expression, value=value, fill_nan=fill_nan, fill_masked=fill_masked)
+
+    def _upcast_for(self, value):
+        # make sure the dtype is compatible with value
+        expression = self
+        dtype = self.dtype
+
+        if dtype == int:
+            required_dtype = vaex.utils.required_dtype_for_int(value, signed=dtype.is_signed)
+            if required_dtype.itemsize > dtype.numpy.itemsize:
+                expression = self.astype(str(required_dtype))
+        return expression
+
+    def fillmissing(self, value):
+        '''Returns an array where missing values are replaced by value.
+
+        See :`ismissing` for the definition of missing values.
+        '''
+        expression = self._upcast_for(value)
+        return self.df.func.fillmissing(expression, value=value)
 
     def clip(self, lower=None, upper=None):
         return self.ds.func.clip(self, lower, upper)
+
+    def jit_metal(self, verbose=False):
+        from .metal import FunctionSerializableMetal
+        f = FunctionSerializableMetal.build(self.expression, df=self.ds, verbose=verbose, compile=self.ds.is_local())
+        function = self.ds.add_function('_jit', f, unique=True)
+        return function(*f.arguments)
 
     def jit_numba(self, verbose=False):
         f = FunctionSerializableNumba.build(self.expression, df=self.ds, verbose=verbose, compile=self.ds.is_local())
@@ -1199,6 +1284,15 @@ def f({0}):
         :param use_hashmap: use a hashmap or not (especially faster when values contains many elements)
         :return: :class:`Expression` with the lazy expression.
         """
+        if self.df.is_category(self) and self.df._future_behaviour:
+            labels = self.df.category_labels(self.expression)
+            indices = []
+            for value in values:
+                if value not in labels:
+                    raise ValueError(f'Value {value} not present in {labels}')
+                indices.append(labels.index(value))
+            return self.index_values().isin(indices, use_hashmap=use_hashmap)
+
         if use_hashmap:
             # easiest way to create a set is using the vaex dataframe
             values = np.array(values, dtype=self.dtype.numpy)  # ensure that values are the same dtype as the expression (otherwise the set downcasts at the C++ level during execution)
@@ -1356,7 +1450,7 @@ def f({0}):
             raise ValueError('only axis=None is supported')
         # we map the keys to a ordinal values [0, N-1] using the set
         key_set = df._set(self.expression, flatten=axis is None)
-        found_keys = key_set.keys()
+        found_keys = vaex.array_types.tolist(key_set.keys())
 
         # we want all possible values to be converted
         # so mapper's key should be a superset of the keys found
@@ -1385,33 +1479,21 @@ def f({0}):
         # and later on in _choose, we map values not even seen in the dataframe
         # to the default_value
         dtype_item = self.data_type(self.expression, axis=-1)
-        null_count = mapper_keys.count(None)
-        nan_count = len([k for k in mapper_keys if k != k])
-        if null_count:
-            null_value = mapper_keys.index(None)
-        else:
-            null_value = 0x7fffffff
-
         mapper_keys = dtype_item.create_array(mapper_keys)
-        if vaex.array_types.is_string_type(dtype_item):
-            mapper_keys = _to_string_sequence(mapper_keys)
-
-        from .hash import ordered_set_type_from_dtype
-        ordered_set_type = ordered_set_type_from_dtype(dtype_item)
         fingerprint = key_set.fingerprint + "-mapper"
-        ordered_set = ordered_set_type(mapper_keys, null_value, nan_count, null_count, fingerprint)
-        indices = ordered_set.map_ordinal(mapper_keys)
+        hash_map_unique = vaex.hash.HashMapUnique.from_keys(mapper_keys, fingerprint=fingerprint, dtype=dtype_item)
+        indices = hash_map_unique.map(mapper_keys)
         mapper_values = [mapper_values[i] for i in indices]
 
         choices = [default_value] + [mapper_values[index] for index in indices]
         choices = pa.array(choices)
 
-        key_set_name = df.add_variable('map_key_set', ordered_set, unique=True)
+        key_hash_map_unique_name = df.add_variable('map_key_hash_map_unique', hash_map_unique, unique=True)
         choices_name = df.add_variable('map_choices', choices, unique=True)
         if allow_missing:
-            expr = '_map({}, {}, {}, use_missing={!r}, axis={!r})'.format(self, key_set_name, choices_name, use_masked_array, axis)
+            expr = '_map({}, {}, {}, use_missing={!r}, axis={!r})'.format(self, key_hash_map_unique_name, choices_name, use_masked_array, axis)
         else:
-            expr = '_map({}, {}, {}, axis={!r})'.format(self, key_set_name, choices_name, axis)
+            expr = '_map({}, {}, {}, axis={!r})'.format(self, key_hash_map_unique_name, choices_name, axis)
         return Expression(df, expr)
 
     @property

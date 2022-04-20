@@ -238,6 +238,8 @@ def test_concat_unaligned_schema(arrow):
     df = df1.concat(df2)
     assert df.x.tolist() == [1, 2, None, None]
     assert df.y.tolist() == [None, None, 'd', 'e']
+    assert df.is_masked('x')
+    assert df.is_masked('y')
     # always 'upcast' to Arrow arrays
     # # rationale: Arrow will use use less memory, numpy has no efficient way to represent all missing data
     assert df.x.data_type() == pa.float32()
@@ -280,3 +282,13 @@ def test_concat_strict(df_factory):
     df2 = df_factory(x=[3, None, 4])
     df = vaex.concat([df1, df2], resolver='strict')
     assert df.x.tolist() == [1, 2, 3, None, 4]
+
+
+def test_concat_timestamp():
+    df1 = pa.Table.from_arrays([pa.array(['2020-01-31', '2020-01-31']).cast('timestamp[us]')], names=['ts'])
+    df2 = pa.Table.from_arrays([pa.array(['2020-12-31', '2020-12-31']).cast('timestamp[ns]')], names=['ts'])
+    df1_vx = vaex.from_arrow_table(df1)
+    df2_vx = vaex.from_arrow_table(df2)
+    df = vaex.concat([df1_vx, df2_vx])
+    assert df.ts.tolist() == df1['ts'].to_pylist() + df2['ts'].to_pylist()
+    assert df.ts.dtype.internal == pa.timestamp('ns')

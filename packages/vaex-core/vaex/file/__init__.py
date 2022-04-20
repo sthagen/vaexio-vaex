@@ -25,11 +25,12 @@ class FileProxy:
 
     The dup is needed since a file is stateful, and needs to be duplicated in threads
     '''
-    def __init__(self, file, name, dup):
+    def __init__(self, file, name, dup, auto_close=True):
         self.file = file
         self.name = name
         self.dup = dup
         self.closed = False
+        self.auto_close = auto_close
 
     def __iter__(self):
         raise NotImplementedError('This is just for looking like a file object to Pandas')
@@ -57,7 +58,8 @@ class FileProxy:
         return self
 
     def __exit__(self, *args):
-        self.file.close()
+        if self.auto_close:
+            self.file.close()
 
     def readable(self):
         return True
@@ -254,9 +256,44 @@ def fingerprint(path, fs_options={}, fs=None):
     return vaex.cache.fingerprint(('file', (path, mtime, size)))
 
 
+def size(path, fs_options={}, fs=None):
+    """Gives the file size in bytes
+
+    >>> size(os.path.expanduser('~/.vaex/data/helmi-dezeeuw-2000-FeH-v2.hdf5'))  # doctest: +SKIP
+    135323168
+
+    >>> size('s3://vaex/taxi/nyc_taxi_2015_mini.parquet', fs_options={'anon': True})
+    9820562
+    """
+    fs, path = parse(path, fs_options, fs=fs)
+    path = stringyfy(path)
+    if fs is None:
+        return os.path.getsize(path)
+    else:
+        info = fs.get_file_info([path])[0]
+        return info.size
+
 def open(path, mode='rb', fs_options={}, fs=None, for_arrow=False, mmap=False, encoding="utf8"):
+    '''Return a file like object, also accepts cloud based paths.
+
+    If path is a file-like object already, it will be wrapped in a new file like object that will not
+    close the original file.
+    This makes is easier to write code like:
+
+        def myfync(f_or_path):
+            with vaex.file.open(f_or_path) as f:
+                f.write(...)
+
+    Without closing the file when called with an open file.
+    '''
     if is_file_object(path):
-        return path
+        if hasattr(path, 'name'):
+            name = path.name
+        else:
+            name = 'unkown name'
+        def dup():
+            raise RuntimeError('Cannot duplicate this file handle')
+        return FileProxy(path, name=name, dup=dup, auto_close=False)
     fs, path = parse(path, fs_options=fs_options, fs=fs, for_arrow=for_arrow)
     if fs is None:
         path = stringyfy(path)
@@ -306,7 +343,12 @@ def _make_argument_optional(f, **defaults):
         for name, value in defaults.items():
             if name in params and name not in kwargs:
                 kwargs[name] = value
-        return f(*args, **kwargs)
+        try:
+            return f(*args, **kwargs)
+        except TypeError:
+            # fallback, just pass all args
+            return f(*args, **kwargs, **defaults)
+
     return wrapper
 
 

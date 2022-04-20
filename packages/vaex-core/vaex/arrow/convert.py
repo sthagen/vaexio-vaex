@@ -2,6 +2,7 @@
 
 We eventually like to get rid of this, and upstream all to pyarrow.
 """
+from typing import Union
 import pyarrow
 import pyarrow as pa
 import numpy as np
@@ -129,7 +130,7 @@ def numpy_array_from_arrow_array(arrow_array):
     else:
         array = np.frombuffer(data_buffer, dtype, len(arrow_array) + offset)[offset:]
 
-    if bitmap_buffer is not None:
+    if bitmap_buffer is not None and arrow_array.null_count > 0:
         bitmap = np.frombuffer(bitmap_buffer, np.uint8, len(bitmap_buffer))
         mask = numpy_mask_from_arrow_mask(bitmap, len(arrow_array) + offset)[offset:]
         array = np.ma.MaskedArray(array, mask=mask)
@@ -300,3 +301,24 @@ def same_type(*arrays):
         else:
             raise NotImplementedError
     return arrays
+
+
+def list_from_arrays(offsets, values) -> Union[pa.LargeListArray, pa.ListArray]:
+    import vaex
+    import vaex.array_types
+    values_arrow = vaex.array_types.to_arrow(values)
+    dtype_offsets = vaex.dtype_of(offsets)
+    dtype_values = vaex.dtype_of(values_arrow)
+    if dtype_offsets.is_integer:
+        if dtype_offsets.numpy.itemsize == 4:
+            arrow_type = pa.list_(dtype_values.arrow)
+        elif dtype_offsets.numpy.itemsize == 8:
+            arrow_type = pa.large_list(dtype_values.arrow)
+        else:
+            raise TypeError('Indices should be int32 or int64, not {dtype_offsets}')
+    else:
+        raise TypeError('Indices should be integer type, not {dtype_offsets}')
+
+    null_buffer = None
+    offsets_buffer = pa.py_buffer(offsets)
+    return pa.Array.from_buffers(arrow_type, len(offsets) - 1, [null_buffer, offsets_buffer], offset=0, children=[values_arrow])

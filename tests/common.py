@@ -28,6 +28,17 @@ scheme = 'ws'
 HERE = Path(__file__).parent
 
 
+def encoding_roundtrip(name, obj):
+    # encoding and decode
+    encoding = vaex.encoding.Encoding()
+    data = encoding.encode(name, obj)
+    blob = vaex.encoding.serialize(data, encoding)
+
+    encoding = vaex.encoding.Encoding()
+    data = vaex.encoding.deserialize(blob, encoding)
+    return encoding.decode(name, data)
+
+
 class CallbackCounter(object):
     def __init__(self, return_value=None):
         self.counter = 0
@@ -64,8 +75,10 @@ def buffer_size():
 def webserver_tornado():
     webserver = vaex.server.tornado_server.WebServer(datasets=[], port=test_port, cache_byte_size=0)
     webserver.serve_threaded()
-    yield webserver
-    webserver.stop_serving()
+    try:
+        yield webserver
+    finally:
+        webserver.stop_serving()
 
 
 @pytest.fixture(scope='session')
@@ -85,9 +98,9 @@ else:
 
 
 @pytest.fixture(scope='session', params=webservers)
-def webserver(request, webserver_fastapi, webserver_tornado, df_server, df_example, df_server_huge):
+def webserver(request, webserver_fastapi, webserver_tornado, df_server, df_server_huge):
     webserver = locals()[request.param]
-    df_example = df_example.copy()
+    df_example = vaex.example()
     df = df_server.copy()
     df = df.materialize('z')  # in the fastapi we drop the state
     df.drop('obj', inplace=True)
@@ -357,7 +370,7 @@ def create_base_ds():
     obj[2:12] = np.ma.MaskedArray(data=obj_data, mask=obj_mask, dtype='object')
     columns["obj"] = obj #, dtype=np.dtype('O')
 
-    booleans = np.ones(21, dtype=np.bool)
+    booleans = np.ones(21, dtype=bool)
     booleans[[4, 6, 8, 14, 16, 19]] = False
     columns["bool"] = booleans
 

@@ -8,11 +8,12 @@ import numpy as np
 import pyarrow as pa
 
 import vaex
+import vaex.utils
 import vaex.cache
 from .array_types import supported_array_types, supported_arrow_array_types, string_types, is_string_type
 
-on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
-if not on_rtd:
+
+if vaex.utils.has_c_extension:
     import vaex.strings
 
 logger = logging.getLogger("vaex.column")
@@ -62,10 +63,54 @@ class ColumnVirtualRange(Column):
 
     def __getitem__(self,  slice):
         start, stop, step = slice.start, slice.stop, slice.step
+        if start is None:
+            start = self.start
+        if stop is None:
+            stop = self.stop
+        if step is None:
+            step = self.step
         return np.arange(self.start + start, self.start + stop, step, dtype=self.dtype)
 
     def trim(self, i1, i2):
         return ColumnVirtualRange(self.start + i1 * self.step, self.start + i2 * self.step, self.step, self.dtype)
+
+
+class ColumnVirtualConstant(Column):
+    def __init__(self, value, length, dtype=None, chunk_size=1024):
+        self.value = value
+        self.length = length
+        self.dtype = self._get_dtype(dtype)
+        self.chunk_size = chunk_size
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, item):
+        template = pa.array([self.value] * self.chunk_size, type=self.dtype.arrow)
+        n_chunks = (self.length + self.chunk_size - 1) // self.chunk_size
+        if item.step not in [None, 1]:
+            raise ValueError('step can only be 1')
+        start, stop, step = item.start, item.stop, item.step
+        start = start or 0
+        stop = stop or len(self)
+        assert step in [None, 1]
+        item = slice(start, stop, step)
+        ar = pa.chunked_array([template] * n_chunks)[item]
+        return ar
+
+    def _fingerprint(self):
+        fp = vaex.cache.fingerprint(self.value, self.length, self.dtype, self.chunk_size)
+        return f'column-vconstant-{fp}'
+
+    def _get_dtype(self, dtype):
+        if dtype is None:
+            return vaex.datatype.DataType(pa.array([self.value]).type)
+        else:
+            return vaex.datatype.DataType(dtype)
+
+    def trim(self, i1, i2):
+        length = i2 - i1
+        return ColumnVirtualConstant(value=self.value, length=length)
 
 
 class ColumnMaskedNumpy(Column):
@@ -186,6 +231,56 @@ class ColumnArrowLazyCast(Column):
             # this seem to be the only way to convert mixed str and nan to include nulls
             return pa.Array.from_pandas(self.ar[slice], type=self.type.arrow)
         return pa.array(self.ar[slice], type=self.type.arrow)
+
+
+@register
+class ColumnArrowDictionaryEncoded(Column):
+    snake_name = "dictionary_encoded"
+    """Wraps an array like object and cast it lazily to arrow dict encoded"""
+    def __init__(self, indices, dictionary):
+        self.indices = indices  # should be column like
+        self.dictionary = vaex.array_types.to_arrow(dictionary)  # lets do this once for performance
+
+    def encode(self, encoding):
+        return {
+            'indices': encoding.encode('array', self.indices),
+            'dictionary': encoding.encode('array', self.dictionary),
+        }
+
+    @classmethod
+    def decode(cls, encoding, spec):
+        return cls(encoding.decode('array', spec['indices']),
+                   encoding.decode('array', spec['dictionary']))
+
+    def __arrow_array__(self, type=None):
+        return self[:]
+
+    def _fingerprint(self):
+        hash1 = vaex.dataset.hash_array_data(self.indices)
+        hash2 = vaex.dataset.hash_array_data(self.dictionary)
+        fp = vaex.cache.fingerprint(hash1, hash2)
+        return f'column-arrow-{self.snake_name}-{fp}'
+
+    @property
+    def nbytes(self):
+        # consistent with arrow
+        if int(pa.__version__.split(".")[0]) >= 7:
+            return self.indices.nbytes + self.dictionary.nbytes
+        else:
+            return self.indices.nbytes
+
+    @property
+    def dtype(self):
+        return self[0:0].type
+
+    def __len__(self):
+        return len(self.indices)
+
+    def trim(self, i1, i2):
+        return type(self)(self.indices[i1:i2], self.dictionary)
+
+    def __getitem__(self, slice):
+        return pa.DictionaryArray.from_arrays(self.indices[slice], self.dictionary)
 
 
 class ColumnIndexed(Column):
@@ -492,6 +587,8 @@ def _is_stringy(x):
 
 
 def _to_string_sequence(x, force=True):
+    if isinstance(x, pa.DictionaryArray):
+        x = x.dictionary.take(x.indices)  # equivalent to PyArrow 5.0.0's dictionary_decode() but backwards compatible
     if isinstance(x, pa.ChunkedArray):
         # turn into pa.Array, TODO: do we want this, this may result in a big mem copy
         table = pa.Table.from_arrays([x], ["single"])
@@ -529,6 +626,8 @@ def _to_string_sequence(x, force=True):
                 return vaex.strings.StringList64(bytes, indices, length, 0, null_bitmap, 0)
             else:
                 ValueError('unsupported dtype ' +str(x.dtype))
+    elif isinstance(x, (vaex.superstrings.StringList32, vaex.superstrings.StringList64)):
+        return x
     elif isinstance(x, (list, type)):
         return _to_string_sequence(np.array(x))
     else:

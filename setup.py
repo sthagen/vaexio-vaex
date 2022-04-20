@@ -6,6 +6,7 @@ import os
 import sys
 import contextlib
 
+
 @contextlib.contextmanager
 def cwd(path):
     curdir = os.getcwd()
@@ -17,7 +18,8 @@ def cwd(path):
 
 # inspired by https://blog.shazam.com/python-microlibs-5be9461ad979
 
-packages = ['vaex-core', 'vaex-viz', 'vaex-hdf5', 'vaex-server', 'vaex-astro', 'vaex-ui', 'vaex-jupyter', 'vaex-ml', 'vaex-meta', 'vaex-graphql', 'vaex-contrib']
+
+packages = ['vaex-core', 'vaex-viz', 'vaex-hdf5', 'vaex-server', 'vaex-astro', 'vaex-jupyter', 'vaex-ml', 'vaex-meta', 'vaex-graphql', 'vaex-contrib']
 on_rtd = os.environ.get('READTHEDOCS', None) == 'True'
 
 
@@ -46,6 +48,7 @@ class DevelopCmd(develop):
                             os.remove(name)
                         os.symlink(rel_source, name)
 
+
 class InstallCmd(install):
     """ Add custom steps for the install command """
     def run(self):
@@ -56,6 +59,7 @@ class InstallCmd(install):
             with cwd(os.path.join('packages', package)):
                 os.system('python -m pip install --upgrade .')
 
+
 setup(
     name='vaex-meta',
     version="0.1.0",
@@ -63,9 +67,26 @@ setup(
     classifiers=[
         'Private :: Do Not Upload to pypi server',
     ],
+    packages=[],
     install_requires=[
         'pip',
     ],
+    extras_require={
+        'dev': [
+            'pytest',
+            'gcsfs',
+            's3fs',
+            'graphviz',
+            'myst_parser',
+            'rich',
+            # For generating the documentation
+            'sphinx',
+            'nbsphinx',
+            'sphinx_gallery',
+            'sphinx_sitemap',
+            'sphinx_book_theme',
+        ]
+    },
     cmdclass={
         'install': InstallCmd,
         'develop': DevelopCmd,

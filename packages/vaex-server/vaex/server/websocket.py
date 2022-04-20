@@ -62,7 +62,7 @@ class WebSocketHandler:
                 nonlocal last_progress
 
                 async def send_progress():
-                    vaex.asyncio.check_patch_tornado()  # during testing asyncio might be patched
+                    vaex.asyncio.check_patch_tornado() # during testing asyncio might be patched
                     nonlocal last_progress
                     logger.debug("progress: %r", f)
                     last_progress = f
@@ -72,7 +72,9 @@ class WebSocketHandler:
                 # but never send old or same values
                 if (last_progress is None or (f - last_progress) > 0.05 or f == 1.0) and (last_progress is None or f > last_progress):
                     def wrapper():
-                        progress_futures.append(asyncio.create_task(send_progress()))
+                        # see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+                        # TODO: replace after we drop 36 support progress_futures.append(asyncio.create_task(send_progress()))
+                        progress_futures.append(asyncio.ensure_future(send_progress()))
                     ioloop.call_soon_threadsafe(wrapper)
                 return True
 
@@ -89,6 +91,7 @@ class WebSocketHandler:
                 tasks = encoding.decode_list('task', msg['tasks'], df=df)
                 self._msg_id_to_tasks[msg_id] = tasks  # keep a reference for cancelling
                 try:
+                    # TODO: this assumes all tasks succeed, but we also support 1 failing
                     results = await self.service.execute(df, tasks, progress=progress)
                 finally:
                     del self._msg_id_to_tasks[msg_id]

@@ -159,3 +159,43 @@ def test_non_ns_units():
     dates = np.array([date1, date2], dtype='M8[ms]')
     df = vaex.from_arrays(dates=pa.array(dates))
     assert np.all(df.dates.to_numpy() == dates)
+
+def test_datetime_operations_after_astype(df_factory):
+    df = df_factory(x=[
+        '2009-10-12T03:31:00',
+        '2016-02-11T10:17:34',
+        '2015-11-12T11:34:22',
+    ])
+    df['x_dt'] = df.x.astype('datetime64')
+    df['x_hour'] = df.x_dt.dt.hour
+    assert df.x_hour.tolist() == [3, 10, 11]
+
+
+def test_no_change_fingerprint():
+    # before this would introduce a variable into the dataframe, thus mutate it
+    x = np.array(['2019-01-04T21:23:00', '2019-02-04T05:00:10'], dtype=np.datetime64)
+    sample_date = np.datetime64('2019-03-15')
+    df = vaex.from_arrays(x=x)
+    fp = df.fingerprint()
+
+    answer = df.x > sample_date
+    assert df.fingerprint() == fp
+
+def test_datetime_filtering(df_factory):
+    x = ['2020-05-01', '2021-10-01', '2022-01-01']
+    df = df_factory(x=x)
+    df['x_dt'] = df.x.astype('datetime64')
+    max_date = df.x_dt.max()
+    cond = df.x_dt < max_date
+    assert cond.tolist() == [True, True, False]
+
+
+    max_date = df.x_dt.max()
+    df['x_td'] = df.x_dt - max_date
+    cond = df.x_td < np.timedelta64(0)
+    assert cond.tolist() == [True, True, False]
+
+    # it seems there are two types of scalars... ?
+    as_scalar = df['x_td'].max()
+    cond = df.x_td < as_scalar
+    assert cond.tolist() == [True, True, False]

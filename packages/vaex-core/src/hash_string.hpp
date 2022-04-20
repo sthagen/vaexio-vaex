@@ -25,6 +25,7 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
     using Base = hash_common<Derived, T, hashmap<T, int64_t>>;
     using hashmap_type = typename Base::hashmap_type;
     using key_type = typename Base::key_type;
+    using key_view_type = V;
     using value_type = typename Base::value_type;
 
     using storage_type = A;
@@ -34,7 +35,17 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
     // using hasher_map = typename Base::hasher_map;
     using hasher_map_choice = typename Base::hasher_map_choice;
 
-    hash_base(int nmaps = 1) : Base(nmaps){};
+    hash_base(int nmaps = 1, int64_t limit = -1) : Base(nmaps, limit), string_arrays(0) {
+        for (int i = 0; i < nmaps; i++) {
+            string_arrays.emplace_back(std::make_shared<StringList64>());
+            StringList64 *strings = string_arrays[i].get();
+            // equal_to<string_ref>& eq = this->maps[i].key_eq();
+            this->maps[i].m_ht.strings_equals = strings;
+            this->maps[i].m_ht.strings_hash = strings;
+        }
+    };
+
+    virtual std::string _get(hashmap_type &map, typename hashmap_type::key_type key) override { return map.m_ht.strings_equals->get(key.index); };
 
     size_t bytes_used() const {
         int64_t buffer_size = 0; // collect buffer size
@@ -53,6 +64,9 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
         if (bucket_size < chunk_size) {
             throw std::runtime_error("bucket size should be larger than chunk_size");
         }
+        if (this->limit >= 0 && return_values) {
+            throw std::runtime_error("Cannot combine limit with return_inverse");
+        }
         int64_t size = strings->length;
 
         // for strings we always use offsets, we don't copy the data
@@ -66,6 +80,8 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
 
         {
             using offset_type = int32_t;
+
+            bool full = false; // if we reached the limit, we can quickly get out
 
             py::gil_scoped_release gil;
             size_t nmaps = this->maps.size();
@@ -85,7 +101,7 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
                 int64_t i = 0;
                 for (offset_type offset : offsets[bucket_index]) {
                     // key_type key = keys[offset];
-                    key_type key = strings->get(offset);
+                    string_view key = strings->view(offset);
                     auto search = map.find(key);
                     auto end = map.end();
                     auto key_offset = offsets[bucket_index][i];
@@ -109,14 +125,14 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
                 int64_t i2 = std::min(size, (chunk + 1) * chunk_size);
 
                 for (int64_t i = i1; i < i2; i++) {
-                    auto value = strings->get(i);
+                    auto value = strings->view(i);
                     hashes[i - i1] = hasher_map_choice()(value);
                 }
                 for (int64_t i = i1; i < i2; i++) {
                     if (strings->is_null(i)) {
                         null_offsets.push_back(i);
                     } else {
-                        // key_type_view value = strings->get(i);
+                        // key_type_view value = strings->view(i);
                         std::size_t hash = hashes[i - i1];
                         // std::size_t hash = hasher_map_choice()(value);
                         size_t map_index = (hash % nmaps);
@@ -124,10 +140,17 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
                     }
                 }
             }
-            for (size_t map_index = 0; map_index < nmaps; map_index++) {
-                if (offsets[map_index].size()) {
-                    const std::lock_guard<std::mutex> lock(this->maplocks[map_index]);
-                    flush_bucket(map_index);
+            if (this->limit >= 0) {
+                if (this->count() >= this->limit) {
+                    full = true;
+                }
+            }
+            if (!full) {
+                for (size_t map_index = 0; map_index < nmaps; map_index++) {
+                    if (offsets[map_index].size()) {
+                        const std::lock_guard<std::mutex> lock(this->maplocks[map_index]);
+                        flush_bucket(map_index);
+                    }
                 }
             }
             if (null_offsets.size()) {
@@ -154,88 +177,84 @@ class hash_base : public hash_common<Derived, T, hashmap<T, int64_t>> {
             return py::none();
         }
     }
-    StringSequenceBase *key_array() {
-        size_t size = this->length();
-        py::gil_scoped_release gil;
-
-        // first get the lenghts
-        std::vector<int64_t> lengths(size);
-        int64_t buffer_length = 0;
-        auto offsets = this->offsets();
-        size_t map_index = 0;
-        int64_t natural_order = 0;
-        for (auto &map : this->maps) {
-            for (auto el : map) {
-                storage_type storage_value = el.first;
-                key_type value = *((key_type *)(&storage_value));
-                int64_t index = static_cast<Derived &>(*this).key_offset(natural_order++, map_index, el, offsets[map_index]);
-                lengths[index] = value.length();
-                buffer_length += lengths[index];
+    std::shared_ptr<StringList64> key_array() {
+        int nmaps = this->maps.size();
+        if (nmaps == 1) {
+            return string_arrays[0];
+        } else {
+            // std::vector<int64_t> lengths(size);
+            size_t total_length = 0;
+            size_t byte_length = 0;
+            for (int i = 0; i < nmaps; i++) {
+                total_length += string_arrays[i]->length;
+                byte_length += string_arrays[i]->indices[string_arrays[i]->length];
             }
-            map_index += 1;
-        }
-        if (this->null_count) {
-            lengths[this->null_index()] = 0;
-        }
-        StringList64 *sl = new StringList64(buffer_length, size);
-        sl->indices[0] = 0;
-        // and translate to offsets
-        std::partial_sum(lengths.begin(), lengths.end(), sl->indices + 1);
-
-        if (this->null_count) {
-            sl->add_null_bitmap();
-            sl->set_null(this->null_index());
-        }
-
-        // and put in the string buffer
-        natural_order = 0;
-        map_index = 0;
-        for (auto &map : this->maps) {
-            for (auto el : map) {
-                storage_type storage_value = el.first;
-                key_type str = *((key_type *)(&storage_value));
-                int64_t index = static_cast<Derived &>(*this).key_offset(natural_order++, map_index, el, offsets[map_index]);
-                std::copy(str.begin(), str.end(), sl->bytes + sl->indices[index]);
+            std::shared_ptr<StringList64> result = std::make_shared<StringList64>(byte_length, total_length);
+            StringList64 *sl = result.get();
+            sl->indices[0] = 0;
+            int64_t indices_offset = 0;
+            int64_t byte_offset = 0;
+            for (int i = 0; i < nmaps; i++) {
+                int64_t byte_size = string_arrays[i]->indices[string_arrays[i]->length];
+                std::copy(string_arrays[i]->bytes, string_arrays[i]->bytes + byte_size, sl->bytes + byte_offset);
+                int64_t length = string_arrays[i]->length;
+                std::transform(string_arrays[i]->indices + 1, string_arrays[i]->indices + 1 + length, sl->indices + indices_offset + 1, [&](int64_t i) { return i + byte_offset; });
+                byte_offset += byte_size;
+                indices_offset += length;
             }
-            map_index += 1;
+            if (this->null_count) {
+                sl->ensure_null_bitmap();
+                sl->set_null(this->null_index());
+            }
+            return result;
         }
-        return sl;
     }
 
-    std::vector<std::map<key_type, value_type>> extract() {
-        std::vector<std::map<key_type, value_type>> map_vector;
+    std::vector<std::map<std::string, value_type>> extract() {
+        std::vector<std::map<std::string, value_type>> map_vector;
+        int i = 0;
         for (auto &map : this->maps) {
-            std::map<key_type, value_type> m;
+            std::map<std::string, value_type> m;
+            auto strings = string_arrays[i++];
             for (auto &el : map) {
-                key_type value = el.first;
+                string_view view = strings->view(el.first.index);
+                std::string value(view);
                 m[value] = el.second;
             }
             map_vector.push_back(std::move(m));
         }
         return map_vector;
     }
+    std::vector<std::shared_ptr<StringList64>> string_arrays;
 };
 
-template <class T = string, class A = T, class V = string_view>
+template <class T = string_ref, class A = T, class V = string_ref>
 class counter : public hash_base<counter<T, A>, T, A, V>, public counter_mixin<T, A, counter<T, A>> {
   public:
     using Base = hash_base<counter<T, A>, T, A, V>;
     using typename Base::hashmap_type;
     using typename Base::key_type;
+    using typename Base::key_type_view;
     using typename Base::storage_type;
     using typename Base::storage_type_view;
     using typename Base::value_type;
 
-    counter(int nmaps = 1) : Base(nmaps) {}
+    counter(int nmaps = 1) : Base(nmaps), null_value(0x7fffffff) {}
 
     template <class Bucket>
     int64_t key_offset(int64_t natural_order, int16_t map_index, Bucket &bucket, int64_t map_offset) {
         return natural_order + (this->null_count > 0 ? 1 : 0);
     }
-    virtual value_type nan_index() { return -1; }
-    virtual value_type null_index() { return 0; }
+    virtual value_type nan_index() const { return -1; }
+    virtual value_type null_index() const { return null_value; }
 
     value_type add_null(int64_t index) {
+        // we only add it the first time
+        if (this->null_count == 1) {
+            null_value = this->maps[0].size();
+            auto &string_array = this->string_arrays[0];
+            string_array->push_null();
+        }
         // parent already counts this
         return this->null_count;
     }
@@ -245,13 +264,16 @@ class counter : public hash_base<counter<T, A>, T, A, V>, public counter_mixin<T
     }
     int64_t value_null() { return this->null_count; }
     int64_t value_nan() { return this->nan_count; }
-    value_type add_new(int16_t map_index, key_type &value, int64_t index) {
+    value_type add_new(int16_t map_index, string_view key, int64_t index) {
         auto &map = this->maps[map_index];
-        map.emplace(value, 1);
+        auto &string_array = this->string_arrays[map_index];
+        string_array->push(key);
+        string_ref persistent_value(string_array->length - 1);
+        map.emplace(persistent_value, 1);
         return 1;
     }
     template <class Bucket>
-    value_type add_existing(Bucket &bucket, int16_t map_index, key_type &value, int64_t index) {
+    value_type add_existing(Bucket &bucket, int16_t map_index, string_view key, int64_t index) {
         set_second(bucket, bucket->second + 1);
         return bucket->second;
     }
@@ -265,16 +287,16 @@ class counter : public hash_base<counter<T, A>, T, A, V>, public counter_mixin<T
         // TODO: can be parallel due to non-overlapping maps
         for (auto &map : this->maps) {
             for (auto &el : map) {
-                // key_type key = el.first;
+                key_type key = el.first;
                 value_type value = el.second;
-                int64_t index = key_offset(natural_order++, map_index, el, offsets[map_index]);
-                output(index) = value;
+                output(key.index) = value;
             }
-            map_index += 1;
+            // map_index += 1;
         }
-        if (this->nan_count) {
-            output(this->nan_index()) = this->nan_count;
-        }
+        // no nans possible
+        // if (this->nan_count) {
+        //     output(this->nan_index()) = this->nan_count;
+        // }
         if (this->null_count) {
             output(this->null_index()) = this->null_count;
         }
@@ -287,37 +309,47 @@ class counter : public hash_base<counter<T, A>, T, A, V>, public counter_mixin<T
         }
 
         for (size_t i = 0; i < this->maps.size(); i++) {
+            auto &strings = other.string_arrays[i];
             for (auto &elem : other.maps[i]) {
-                const key_type &value = elem.first;
-                auto search = this->maps[i].find(value);
+                const key_type &ref = elem.first;
+                string_view key = strings->view(ref.index);
+                auto search = this->maps[i].find(key);
                 auto end = this->maps[i].end();
                 if (search == end) {
-                    this->maps[i].emplace(elem);
+                    this->add_new(i, key, 0);
                 } else {
                     set_second(search, search->second + elem.second);
                 }
             }
         }
-        this->nan_count += other.nan_count;
-        this->null_count += other.null_count;
+        if (other.null_count) {
+            this->update1_null();
+            this->null_count += other.null_count - 1;
+        } else {
+            this->null_count += other.null_count;
+        }
+        // no nans
+        // this->nan_count += other.nan_count;
     }
+    value_type null_value;
 };
 
-template <class T = string, class V = string>
+template <class T = string_ref, class V = string_ref>
 class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
   public:
     using Base = hash_base<ordered_set<T>, T, T, V>;
     using typename Base::hasher_map_choice;
     using typename Base::hashmap_type;
     using typename Base::key_type;
+    using typename Base::key_type_view;
     using typename Base::storage_type;
     using typename Base::storage_type_view;
     using typename Base::value_type;
 
-    ordered_set(int nmaps = 1) : Base(nmaps), null_value(0x7fffffff), ordinal_code_offset_null(0) {}
+    ordered_set(int nmaps = 1, int64_t limit = -1) : Base(nmaps, limit), null_value(0x7fffffff), ordinal_code_offset_null(0) {}
 
-    virtual value_type nan_index() { return -1; }
-    virtual value_type null_index() { return null_value; }
+    virtual value_type nan_index() const { return -1; }
+    virtual value_type null_index() const { return null_value; }
 
     template <class Bucket>
     int64_t key_offset(int64_t natural_order, int16_t map_index, Bucket &bucket, int64_t offset) {
@@ -325,45 +357,58 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
         return index;
     }
     value_type add_null(int64_t index) {
-        // first time we add it
+        // we only add it the first time
         if (this->null_count == 1) {
             null_value = this->maps[0].size();
+            auto &string_array = this->string_arrays[0];
+            string_array->push_null();
             ordinal_code_offset_null++;
         }
         return null_value;
     }
 
-    value_type add_new(int16_t map_index, storage_type_view &storage_value, int64_t index) {
+    value_type add_new(int16_t map_index, string_view storage_value, int64_t index) {
         auto &map = this->maps[map_index];
         value_type ordinal_code = map.size();
         if (map_index == 0) {
             ordinal_code += ordinal_code_offset_null;
         }
-        map.emplace(storage_value, ordinal_code);
+        auto &string_array = this->string_arrays[map_index];
+        string_array->push(storage_value);
+        // storage_type_view persistent_value = string_array->end();
+        string_ref persistent_value(string_array->length - 1);
+        map.emplace(persistent_value, ordinal_code);
         return ordinal_code;
     }
 
     template <class Bucket>
-    value_type add_existing(Bucket &bucket, int16_t map_index, storage_type_view &storage_view_value, int64_t index) {
+    value_type add_existing(Bucket &bucket, int16_t map_index, string_view storage_view_value, int64_t index) {
         return bucket->second;
     }
 
     template <class SL>
-    static ordered_set *create(SL *keys, int64_t null_value, int64_t nan_count, int64_t null_count, std::string* fingerprint) {
+    static ordered_set *create(std::shared_ptr<SL> keys, int64_t null_value, int64_t nan_count, int64_t null_count, std::string *fingerprint) {
         ordered_set *set = new ordered_set(1);
+        set->maps[0].m_ht.strings_equals = keys.get();
+        set->maps[0].m_ht.strings_hash = keys.get();
+        set->string_arrays[0] = keys;
         {
             size_t size = keys->length;
+            set->maps[0].reserve(size);
             py::gil_scoped_release gil;
             for (size_t i = 0; i < size; i++) {
                 if (keys->is_null(i)) {
+                    set->null_count++;
+                    set->null_value = i;
+                    set->ordinal_code_offset_null = 1;
                     set->update1_null();
                 } else {
-                    key_type key = keys->get(i);
-                    set->update1(0, key, 0);
+                    string_ref ref(i);
+                    set->maps[0].emplace(ref, i);
                 }
             }
         }
-        if (set->count() != keys->length) {
+        if (set->count() != (int64_t)keys->length) {
             throw std::runtime_error(std::string("key array of length ") + std::to_string(keys->length) + " does not match expected length of " + std::to_string(set->count()));
         }
         if (nan_count == 0) {
@@ -390,7 +435,7 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
         set->null_count = null_count;
         set->nan_count = nan_count;
         set->sealed = true;
-        if(fingerprint) {
+        if (fingerprint) {
             set->fingerprint = *fingerprint;
         }
         return set;
@@ -407,7 +452,7 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
                 if (strings->is_null(i)) {
                     output(i) = this->null_count > 0;
                 } else {
-                    const storage_type_view &value = strings->get(i);
+                    const string_view &value = strings->view(i);
                     std::size_t hash = hasher_map_choice()(value);
                     size_t map_index = (hash % nmaps);
                     auto search = this->maps[map_index].find(value);
@@ -421,7 +466,7 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
             }
         } else {
             for (int64_t i = 0; i < size; i++) {
-                const storage_type_view &value = strings->get(i);
+                const string_view &value = strings->view(i);
                 std::size_t hash = hasher_map_choice()(value);
                 size_t map_index = (hash % nmaps);
                 auto search = this->maps[map_index].find(value);
@@ -435,6 +480,61 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
         }
         return result;
     }
+
+    virtual void map_many(StringSequence *strings, int64_t offset, int64_t length, int64_t *output) override {
+        // int64_t size = strings->length;
+        size_t nmaps = this->maps.size();
+        auto offsets = this->offsets();
+
+        // split slow and fast path
+        if (strings->has_null()) {
+            for (int64_t i = offset; i < offset + length; i++) {
+                if (strings->is_null(i)) {
+                    output[i - offset] = this->null_value;
+                    assert(this->null_count > 0);
+                } else {
+                    const string_view &key = strings->view(i);
+                    size_t hash = hasher_map_choice()(key);
+                    size_t map_index = (hash % nmaps);
+                    auto search = this->maps[map_index].find(key, hash);
+                    auto end = this->maps[map_index].end();
+                    if (search == end) {
+                        output[i - offset] = -1;
+                    } else {
+                        output[i - offset] = search->second + offsets[map_index];
+                    }
+                }
+            }
+
+        } else {
+            for (int64_t i = offset; i < offset + length; i++) {
+                const string_view &key = strings->view(i);
+                std::size_t hash = hasher_map_choice()(key);
+                size_t map_index = (hash % nmaps);
+                auto search = this->maps[map_index].find(key, hash);
+                auto end = this->maps[map_index].end();
+                if (search == end) {
+                    output[i - offset] = -1;
+                } else {
+                    output[i - offset] = search->second + offsets[map_index];
+                }
+            }
+        }
+    };
+    virtual int64_t map_key(string_ref key) {
+        size_t nmaps = this->maps.size();
+        auto offsets = this->offsets();
+        size_t hash = hasher_map_choice()(key);
+        size_t map_index = (hash % nmaps);
+        auto search = this->maps[map_index].find(key);
+        auto end = this->maps[map_index].end();
+        if (search == end) {
+            return -1;
+        } else {
+            return search->second + offsets[map_index];
+        }
+    }
+
     py::object map_ordinal(StringSequence *strings) {
         size_t size = this->length();
         if (size < (1u << 7u)) {
@@ -451,20 +551,69 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
     py::array_t<OutputType> _map_ordinal(StringSequence *strings) {
         int64_t size = strings->length;
         py::array_t<OutputType> result(size);
+        if (size == 0) {
+            return result;
+        }
         auto output = result.template mutable_unchecked<1>();
         py::gil_scoped_release gil;
         size_t nmaps = this->maps.size();
         auto offsets = this->offsets();
 
-        // split slow and fast path
-        if (strings->has_null()) {
-            for (int64_t i = 0; i < size; i++) {
-                if (strings->is_null(i)) {
-                    output(i) = this->null_value;
-                    assert(this->null_count > 0);
-                } else {
-                    const storage_type_view &key = strings->get(i);
-                    size_t hash = hasher_map_choice()(key);
+        if (nmaps == 1) {
+            auto &map0 = this->maps[0];
+            // split slow and fast path
+            if (strings->has_null()) {
+                for (int64_t i = 0; i < size; i++) {
+                    if (strings->is_null(i)) {
+                        output(i) = this->null_value;
+                        assert(this->null_count > 0);
+                    } else {
+                        const string_view &key = strings->view(i);
+                        auto search = map0.find(key);
+                        auto end = map0.end();
+                        if (search == end) {
+                            output(i) = -1;
+                        } else {
+                            output(i) = search->second;
+                        }
+                    }
+                }
+            } else {
+                for (int64_t i = 0; i < size; i++) {
+                    const string_view &key = strings->view(i);
+                    auto search = map0.find(key);
+                    auto end = map0.end();
+                    if (search == end) {
+                        output(i) = -1;
+                    } else {
+                        output(i) = search->second;
+                    }
+                }
+            }
+        } else {
+            // split slow and fast path
+            if (strings->has_null()) {
+                for (int64_t i = 0; i < size; i++) {
+                    if (strings->is_null(i)) {
+                        output(i) = this->null_value;
+                        assert(this->null_count > 0);
+                    } else {
+                        const string_view &key = strings->view(i);
+                        size_t hash = hasher_map_choice()(key);
+                        size_t map_index = (hash % nmaps);
+                        auto search = this->maps[map_index].find(key, hash);
+                        auto end = this->maps[map_index].end();
+                        if (search == end) {
+                            output(i) = -1;
+                        } else {
+                            output(i) = search->second + offsets[map_index];
+                        }
+                    }
+                }
+            } else {
+                for (int64_t i = 0; i < size; i++) {
+                    const string_view &key = strings->view(i);
+                    std::size_t hash = hasher_map_choice()(key);
                     size_t map_index = (hash % nmaps);
                     auto search = this->maps[map_index].find(key, hash);
                     auto end = this->maps[map_index].end();
@@ -473,19 +622,6 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
                     } else {
                         output(i) = search->second + offsets[map_index];
                     }
-                }
-            }
-        } else {
-            for (int64_t i = 0; i < size; i++) {
-                const storage_type_view &key = strings->get(i);
-                std::size_t hash = hasher_map_choice()(key);
-                size_t map_index = (hash % nmaps);
-                auto search = this->maps[map_index].find(key, hash);
-                auto end = this->maps[map_index].end();
-                if (search == end) {
-                    output(i) = -1;
-                } else {
-                    output(i) = search->second + offsets[map_index];
                 }
             }
         }
@@ -503,20 +639,28 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
         }
         py::gil_scoped_release gil;
         for (auto &other : others) {
+            if (other->null_count) {
+                // TODO: ugly, see add_null
+                auto save = this->null_count;
+                this->null_count = 1;
+                this->add_null(this->maps[0].size());
+                this->null_count = save;
+                this->null_count += other->null_count;
+            }
             for (size_t i = 0; i < this->maps.size(); i++) {
+                auto strings = other->string_arrays[i];
                 for (auto &elem : other->maps[i]) {
-                    const key_type &value = elem.first;
-                    auto search = this->maps[i].find(value);
+                    const key_type &ref = elem.first;
+                    string_view key = strings->view(ref.index);
+                    auto search = this->maps[i].find(key);
                     auto end = this->maps[i].end();
                     if (search == end) {
-                        this->maps[i].emplace(value, this->maps[i].size());
+                        this->add_new(i, key, this->maps[i].size());
                     } else {
                     }
                 }
                 other->maps[i].clear();
             }
-            this->nan_count += other->nan_count;
-            this->null_count += other->null_count;
         }
     }
 
@@ -524,7 +668,7 @@ class ordered_set : public hash_base<ordered_set<T>, T, T, V> {
     value_type ordinal_code_offset_null;
 };
 
-template <class T = string, class V = string>
+template <class T = string_ref, class V = string_ref>
 class index_hash : public hash_base<index_hash<T>, T, T, V> {
   public:
     using Base = hash_base<index_hash<T>, T, T, V>;
@@ -537,7 +681,16 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
     typedef hashmap<key_type, std::vector<int64_t>> overflow_type;
 
     // TODO: might be better to use a node based hasmap, we don't want to move large vectors
-    index_hash(int nmaps) : Base(nmaps), overflows(nmaps), has_duplicates(false) {}
+    index_hash(int nmaps, int64_t limit = -1) : Base(nmaps, limit), overflows(nmaps), has_duplicates(false) {
+        for (int i = 0; i < nmaps; i++) {
+            // string_arrays_overflow.emplace_back(std::make_shared<StringList64>());
+            // for each key in overflow, it should be present in the main string array
+            StringList64 *strings = this->string_arrays[i].get();
+            // equal_to<string_ref>& eq = this->maps[i].key_eq();
+            overflows[i].m_ht.strings_equals = strings;
+            overflows[i].m_ht.strings_hash = strings;
+        }
+    }
 
     int64_t length() const {
         int64_t c = this->count();
@@ -554,24 +707,28 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
     int64_t key_offset(int64_t natural_order, int16_t map_index, Bucket &bucket, int64_t map_offset) {
         return natural_order + (this->null_count > 0 ? 1 : 0);
     }
-    virtual value_type nan_index() { return -1; }
-    virtual value_type null_index() { return 0; }
+    virtual value_type nan_index() const { return -1; }
+    virtual value_type null_index() const { return 0; }
 
     value_type add_null(int64_t index) {
         this->null_value = index;
         return index;
     }
 
-    value_type add_new(int16_t map_index, storage_type_view &storage_value, int64_t index) {
+    value_type add_new(int16_t map_index, string_view key, int64_t index) {
         auto &map = this->maps[map_index];
-        map.emplace(storage_value, index);
+        auto &string_array = this->string_arrays[map_index];
+        string_array->push(key);
+        string_ref persistent_value(string_array->length - 1);
+        map.emplace(persistent_value, index);
         return index;
     }
 
     template <class Bucket>
-    value_type add_existing(Bucket &position, int16_t map_index, storage_type_view &storage_view_value, int64_t index) {
-        // we found a duplicate
-        overflows[map_index][position->first].push_back(index);
+    value_type add_existing(Bucket &position, int16_t map_index, string_view key, int64_t index) {
+        // we found a duplicate, add it to overflow
+        auto &overflow = overflows[map_index];
+        overflow[position->first].push_back(index);
         has_duplicates = true;
         return index;
     }
@@ -597,7 +754,7 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
                     output(i) = null_value;
                     assert(this->null_count > 0);
                 } else {
-                    const storage_type_view &key = strings->get(i);
+                    const string_view &key = strings->view(i);
                     std::size_t hash = hasher_map_choice()(key);
                     size_t map_index = (hash % nmaps);
                     auto search = this->maps[map_index].find(key);
@@ -612,7 +769,7 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
             }
         } else {
             for (int64_t i = 0; i < size; i++) {
-                const storage_type_view &key = strings->get(i);
+                const string_view &key = strings->view(i);
                 std::size_t hash = hasher_map_choice()(key);
                 size_t map_index = (hash % nmaps);
                 auto search = this->maps[map_index].find(key);
@@ -640,7 +797,7 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
                 for (size_t i = 0; i < strings->length; i++) {
                     if (strings->is_null(i)) {
                     } else {
-                        const storage_type_view &key = strings->get(i);
+                        const string_view &key = strings->view(i);
                         std::size_t hash = hasher_map_choice()(key);
                         size_t map_index = (hash % nmaps);
                         auto search = this->overflows[map_index].find(key);
@@ -654,7 +811,7 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
                 }
             } else {
                 for (size_t i = 0; i < strings->length; i++) {
-                    const storage_type_view &key = strings->get(i);
+                    const string_view &key = strings->view(i);
                     std::size_t hash = hasher_map_choice()(key);
                     size_t map_index = (hash % nmaps);
                     auto search = this->overflows[map_index].find(key);
@@ -689,20 +846,24 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
     py::object extract() {
         py::dict m;
         int16_t map_index = 0;
+        int i = 0;
         for (auto &map : this->maps) {
+            auto strings = this->string_arrays[i++];
             for (auto &el : map) {
                 key_type key = el.first;
                 value_type value = el.second;
+                string_view key_view = strings->view(el.first.index);
+                std::string str(key_view);
                 // if multiple found, we add a list
-                if (overflows[map_index].count(el.first)) {
+                if (overflows[map_index].count(key_view)) {
                     py::list l;
                     l.append(value);
-                    for (value_type v : overflows[map_index][key]) {
+                    for (value_type v : overflows[map_index].find(key_view)->second) {
                         l.append(v);
                     }
-                    m[key.c_str()] = l;
+                    m[str.c_str()] = l;
                 } else {
-                    m[key.c_str()] = value;
+                    m[str.c_str()] = value;
                 }
             }
             map_index++;
@@ -716,38 +877,48 @@ class index_hash : public hash_base<index_hash<T>, T, T, V> {
             throw std::runtime_error("cannot merge with an unequal maps");
         }
 
+        // first, merge the primary maps
         for (size_t i = 0; i < this->maps.size(); i++) {
             for (auto &elem : other.maps[i]) {
-                const key_type &key = elem.first;
+                // we get a string_view, since we want to find the key in another
+                // hashmap
+                string_view key = other.string_arrays[i]->view(elem.first.index);
                 auto search = this->maps[i].find(key);
                 auto end = this->maps[i].end();
+                // if not found, we simply add it to the normal map
                 if (search == end) {
-                    this->maps[i].emplace(key, elem.second);
+                    this->add_new(i, key, elem.second);
                 } else {
-                    // if already in, add it to the multimap
-                    overflows[i][elem.first].push_back(elem.second);
+                    // if already in, add it to the overflow
+                    this->add_existing(search, i, key, elem.second);
                 }
             }
         }
         this->nan_count += other.nan_count;
         this->null_count += other.null_count;
+        // now we merge the overflow
         for (size_t i = 0; i < this->maps.size(); i++) {
+            auto &string_array_other = other.string_arrays[i];
             for (auto el : other.overflows[i]) {
                 std::vector<int64_t> &source = el.second;
 
-                const key_type &key = el.first;
+                const key_type &key_ref = el.first;
+                string_view key = string_array_other->view(key_ref.index);
+
                 auto search = this->maps[i].find(key);
                 auto end = this->maps[i].end();
                 if (search == end) {
                     // we have a duplicate that is not in the current map, so we insert the first element
-                    this->maps[i].emplace(key, source[0]);
+                    this->add_new(i, key, source[0]);
                     if (source.size() > 1) {
-                        std::vector<int64_t> &target = this->overflows[i][key];
+                        // the rest can go into overflow
+                        const key_type key_ref_this(this->string_arrays[i]->length - 1);
+                        std::vector<int64_t> &target = this->overflows[i][key_ref_this];
                         target.insert(target.end(), source.begin() + 1, source.end());
                     }
                 } else {
                     // easy case, just merge the vectors
-                    std::vector<int64_t> &target = this->overflows[i][key];
+                    std::vector<int64_t> &target = this->overflows[i][search->first];
                     target.insert(target.end(), source.begin(), source.end());
                 }
             }

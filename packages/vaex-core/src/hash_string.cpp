@@ -64,10 +64,17 @@ void bind_common(Cls &cls) {
         .def_property_readonly("nan_count", [](const Type &c) { return c.nan_count; })
         .def_property_readonly("null_count", [](const Type &c) { return c.null_count; })
         .def_property_readonly("has_nan", [](const Type &c) { return c.nan_count > 0; })
-        .def_property_readonly("has_null", [](const Type &c) { return c.null_count > 0; });
+        .def_property_readonly("has_null", [](const Type &c) { return c.null_count > 0; })
+        .def_property_readonly("null_index", [](const Type &c) { return c.null_index(); })
+        .def_property_readonly("nan_index", [](const Type &c) { return c.nan_index(); });
 }
 
 void init_hash_string(py::module &m) {
+    // we use a baseclass so we can pass the ordered set around
+    std::string basename = "hash_map_string";
+    typedef hash_map<std::string> BaseType;
+    auto BaseClass = py::class_<BaseType>(m, basename.c_str());
+
     {
         typedef counter<> Type;
         std::string countername = "counter_string";
@@ -77,14 +84,16 @@ void init_hash_string(py::module &m) {
     {
         std::string ordered_setname = "ordered_set_string";
         typedef ordered_set<> Type;
-        auto cls = py::class_<Type>(m, ordered_setname.c_str())
-                       .def(py::init<int>())
-                       .def(py::init(&Type::create<StringList32>))
-                       .def(py::init(&Type::create<StringList64>))
+        auto cls = py::class_<Type>(m, ordered_setname.c_str(), BaseClass)
+                       .def(py::init<int, int64_t>(), py::arg("nmaps"), py::arg("limit") = -1)
+                       // for now we only support StringList64
+                       //.def(py::init(&Type::create<StringList32>))
+                       // this needs a keepalive, for some reason the shared_ptr doesn't
+                       // keep hold of the memory of the stringlist
+                       .def(py::init(&Type::create<StringList64>), py::keep_alive<1, 2>())
                        .def("isin", &Type::isin)
                        .def("flatten_values", &Type::flatten_values)
                        .def("map_ordinal", &Type::map_ordinal)
-                       .def_property_readonly("null_value", [](const Type &c) { return c.null_value; })
                        .def_readwrite("fingerprint", &Type::fingerprint);
         bind_common<Type>(cls);
     }

@@ -283,6 +283,13 @@ def test_string_replace(dfs, pattern, replacement, n):
     assert dfs.s.str.replace(pattern, replacement, n).tolist() == dfs.s.str_pandas.replace(pattern, replacement, n).tolist()
 
 
+def test_string_replace_empty():
+    x = ['', '', 'please']
+    df = vaex.from_arrays(x=x,)
+    x =  df.x.str.replace(pat = r'^\s*$', repl = 'empty', regex = True)
+    assert x.tolist() == ['empty', 'empty', 'please']
+
+
 @pytest.mark.parametrize("pattern", ["v", " "])
 @pytest.mark.parametrize("replacement", ["?", unicode_compat("VæX")])
 @pytest.mark.parametrize("flags", [0, int(re.IGNORECASE)])
@@ -494,6 +501,12 @@ def test_string_split():
     df = vaex.from_arrays(s=["aap noot  mies", None, "kees", ""])
     assert df.s.str.split().tolist() == [["aap", "noot", "mies"], None, ["kees"], [""]]
     assert df.s.str.split(max_splits=1).tolist() == [["aap", "noot  mies"], None, ["kees"], [""]]
+
+
+def test_string_rsplit():
+    df = vaex.from_arrays(s=["aap noot  mies", None, "kees", ""])
+    assert df.s.str.rsplit(pattern='noot').tolist() == [['aap ', '  mies'], None, ['kees'], ['']]
+    assert df.s.str.rsplit(pattern='noot', max_splits=1).tolist() == [['aap ', '  mies'], None, ['kees'], ['']]
 
 
 def test_string_split_upper():

@@ -1,10 +1,11 @@
-from __future__ import absolute_import
 import json
-import numpy as np
-import datetime
 import re
-import vaex.hash
+
+import numpy as np
 import pyarrow as pa
+
+import vaex
+from vaex.encoding import Encoding
 
 
 serializers = []
@@ -115,6 +116,7 @@ class ArrowSerializer:
 class OrdererSetSerializer:
     @staticmethod
     def can_encode(obj):
+        import vaex.hash
         return isinstance(obj, vaex.hash.ordered_set)
 
     @staticmethod
@@ -123,14 +125,14 @@ class OrdererSetSerializer:
         keys = obj.keys()
         clsname = obj.__class__.__name__
         return {
-            'type': clsname,
-            'data': {
-                'keys': keys,
-                'null_value': obj.null_value,
-                'nan_count': obj.nan_count,
-                'missing_count': obj.null_count,
-                'fingerprint': obj.fingerprint,
-            }
+            "type": clsname,
+            "data": {
+                "keys": keys,
+                "null_index": obj.null_index,
+                "nan_count": obj.nan_count,
+                "missing_count": obj.null_count,
+                "fingerprint": obj.fingerprint,
+            },
         }
 
     @staticmethod
@@ -140,12 +142,43 @@ class OrdererSetSerializer:
     @staticmethod
     def decode(data):
         clsname = data['type']
+        import vaex.hash
         cls = getattr(vaex.hash, clsname)
         keys = data['data']['keys']
         if "string" in clsname:
             keys = vaex.strings.to_string_sequence(keys)
-        value = cls(keys, data['data']['null_value'], data['data']['nan_count'], data['data']['missing_count'], data['data']['fingerprint'])
+        value = cls(keys, data["data"]["null_index"], data["data"]["nan_count"], data["data"]["missing_count"], data["data"]["fingerprint"])
         return value
+
+
+
+
+@register
+class HashMapUniqueSerializer:
+    @staticmethod
+    def can_encode(obj):
+        import vaex.hash
+        return isinstance(obj, vaex.hash.HashMapUnique)
+
+    @staticmethod
+    def encode(obj):
+        encoding = vaex.encoding.Encoding()
+        data = encoding.encode('hash-map-unique', obj)
+        wiredata = vaex.encoding.inline.serialize(data, encoding)
+        return {'type': 'hash-map-unique', 'data': wiredata}
+
+    @staticmethod
+    def can_decode(data):
+        return data.get('type', '') == 'hash-map-unique'
+
+    @staticmethod
+    def decode(data):
+        wiredata = data['data']
+        encoding = vaex.encoding.Encoding()
+        data = vaex.encoding.inline.deserialize(wiredata, encoding)
+        obj = encoding.decode('hash-map-unique', data)
+        return obj
+
 
 
 def encode(obj):

@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import pandas as pd
 import platform
+import hashlib
 
 
 DATA_PATH = Path(__file__).parent
@@ -106,6 +107,20 @@ def test_export_open_hdf5(ds_local):
     ds_opened = vaex.open(filename)
     assert list(ds) == list(ds_opened)
 
+def test_export_concat_missing_cols_hdf5(tmpdir):
+    df1 = vaex.from_arrays(x=[1, 2, 3], s=['x1', 'x2', 'x3'], y=[10, 20, 30])
+    df2 = vaex.from_arrays(x=[4, 5, 6])
+
+    df = vaex.concat([df1, df2])
+
+    filename = tempfile.mktemp(suffix='.hdf5')
+    df.export_hdf5(filename)
+
+    df_opened = vaex.open(filename)
+    assert df_opened.x.tolist() == [1, 2, 3, 4, 5, 6]
+    assert df_opened.y.tolist() == [10, 20, 30, None, None, None]
+    assert df_opened.s.tolist() == ['x1', 'x2', 'x3', None, None, None]
+
 def test_export_open_csv(ds_local, tmpdir):
     df = ds_local
     path = str(tmpdir.join('test.csv'))
@@ -142,8 +157,8 @@ def test_export_string_mask(tmpdir):
 
 def test_export_unicode_column_name_hdf5(tmpdir):
     # prepare many columns for multithreaded export
-    src_dict = {"あ": [1, 2, 3], "a": [1, 2, 3], "b": [1, 2, 3], 
-            "c": [1, 2, 3], "d": [1, 2, 3], "a1": [1, 2, 3], 
+    src_dict = {"あ": [1, 2, 3], "a": [1, 2, 3], "b": [1, 2, 3],
+            "c": [1, 2, 3], "d": [1, 2, 3], "a1": [1, 2, 3],
             "b2": [1, 2, 3], "c3": [1, 2, 3], "d4": [1, 2, 3]}
     path = str(tmpdir.join('test.hdf5'))
     df = vaex.from_dict(src_dict)
@@ -202,6 +217,50 @@ def test_multi_file_naive_read_convert_export(tmpdir, dtypes):
 def test_export_csv(df_local, tmpdir):
     df = df_local
     path = str(tmpdir.join('test.csv'))
-    df.export_csv(path)
+    df.export_csv(path, index=False)
 
     assert '123456' in vaex.open(path)
+
+
+@pytest.mark.parametrize("dtypes", [{}, {'name': np.object, 'age': 'Int64', 'weight': np.float}])
+def test_export_generates_same_hdf5_shasum(tmpdir, dtypes):
+    current_dir = os.path.dirname(__file__)
+
+    path1 = '/data/sample_1.csv'
+
+    pdf1 = pd.read_csv(current_dir + path1, dtype=dtypes)
+    vdf1 = vaex.from_pandas(pdf1)
+    output_path1 = str(tmpdir.join('sample_1.hdf5'))
+    vdf1.export_hdf5(output_path1)
+
+    shasum1 = hashlib.sha1()
+    with open(output_path1, 'rb') as f:
+        while True:
+            data = f.read(65536)
+            if not data:
+                break
+            shasum1.update(data)
+
+    vdf2 = vaex.from_pandas(pdf1)
+    output_path2 = str(tmpdir.join('sample_2.hdf5'))
+    vdf2.export_hdf5(output_path2)
+
+    shasum2 = hashlib.sha1()
+    with open(output_path2, 'rb') as f:
+        while True:
+            data = f.read(65536)
+            if not data:
+                break
+            shasum2.update(data)
+
+    assert shasum1.hexdigest() == shasum2.hexdigest()
+
+
+def test_export_json(tmpdir, df_filtered):
+    df = df_filtered
+    path = tmpdir / 'test.json'
+    df.export_json(path)
+    df2 = vaex.from_json(path, orient='records')
+    # for column in df.get_column_names():
+    for column in ['x', 'name']:
+        assert df[column].tolist() == df2[column].tolist()

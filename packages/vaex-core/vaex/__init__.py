@@ -21,25 +21,31 @@ Or connecting to a remove server:
 
 A few strong features of vaex are:
 
- * Performance: works with huge tabular data, process over a billion (> 10\\ :sup:`9`\\ ) rows/second.
- * Expression system / Virtual columns: compute on the fly, without wasting ram.
- * Memory efficient: no memory copies when doing filtering/selections/subsets.
- * Visualization: directly supported, a one-liner is often enough.
- * User friendly API: you will only need to deal with a DataFrame object, and tab completion + docstring will help you out: `ds.mean<tab>`, feels very similar to Pandas.
- * Very fast statistics on N dimensional grids such as histograms, running mean, heatmaps.
+- Performance: works with huge tabular data, process over a billion (> 10\\ :sup:`9`\\ ) rows/second.
+- Expression system / Virtual columns: compute on the fly, without wasting ram.
+- Memory efficient: no memory copies when doing filtering/selections/subsets.
+- Visualization: directly supported, a one-liner is often enough.
+- User friendly API: you will only need to deal with a DataFrame object, and tab completion + docstring will help you out: `ds.mean<tab>`, feels very similar to Pandas.
+- Very fast statistics on N dimensional grids such as histograms, running mean, heatmaps.
 
 
 Follow the tutorial at https://docs.vaex.io/en/latest/tutorial.html to learn how to use vaex.
 
 """  # -*- coding: utf-8 -*-
-from __future__ import print_function
-import glob
-import re
-from numpy.lib.function_base import copy
-import six
+import logging as root_logging
+import os
+import pkg_resources
+from typing import Dict, List
+from urllib.parse import urlparse, parse_qs
+
+# first configure logging, which also imports vaex.settings
+import vaex.logging
+# import this to be explicit
+import vaex.settings
 
 import vaex.dataframe
 import vaex.dataset
+from vaex.docstrings import docsubst
 from vaex.registry import register_function
 from vaex import functions, struct
 from . import stat
@@ -49,15 +55,11 @@ from .delayed import delayed
 from .groupby import *
 from . import agg
 import vaex.datasets
-# import vaex.plot
-# from vaex.dataframe import DataFrame
-# del ServerRest, DataFrame
 
-import vaex.settings
-import logging
-import pkg_resources
-import os
-from functools import reduce
+
+
+
+import vaex.progress
 
 try:
     from . import version
@@ -66,6 +68,8 @@ except:
     print("version file not found, please run git/hooks/post-commit or git/hooks/post-checkout and/or install them as hooks (see git/README)", file=sys.stderr)
     raise
 
+logger = root_logging.getLogger('vaex')
+DEBUG_MODE = os.environ.get('VAEX_DEBUG', '')
 __version__ = version.get_versions()
 
 
@@ -93,7 +97,8 @@ def app(*args, **kwargs):
     return vaex.ui.main.VaexApp()
 
 
-def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kwargs):
+@docsubst
+def open(path, convert=False, progress=None, shuffle=False, fs_options={}, fs=None, *args, **kwargs):
     """Open a DataFrame from file given by path.
 
     Example:
@@ -104,6 +109,7 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
     :param str or list path: local or absolute path to file, or glob string, or list of paths
     :param convert: Uses `dataframe.export` when convert is a path. If True, ``convert=path+'.hdf5'``
                     The conversion is skipped if the input file or conversion argument did not change.
+    :param progress: (_Only applies when convert is not False_) {progress}
     :param bool shuffle: shuffle converted DataFrame or not
     :param dict fs_options: Extra arguments passed to an optional file system if needed:
         * Amazon AWS S3
@@ -138,9 +144,9 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
 
     Examples:
 
-    >>> df = vaex.open('s3://vaex/taxi/yellow_taxi_2015_f32s.hdf5', fs_options={'anonymous': True})
+    >>> df = vaex.open('s3://vaex/taxi/yellow_taxi_2015_f32s.hdf5', fs_options={{'anonymous': True}})
     >>> df = vaex.open('s3://vaex/taxi/yellow_taxi_2015_f32s.hdf5?anon=true')
-    >>> df = vaex.open('s3://mybucket/path/to/file.hdf5', fs_options={'access_key': my_key, 'secret_key': my_secret_key})
+    >>> df = vaex.open('s3://mybucket/path/to/file.hdf5', fs_options={{'access_key': my_key, 'secret_key': my_secret_key}})
     >>> df = vaex.open(f's3://mybucket/path/to/file.hdf5?access_key={{my_key}}&secret_key={{my_secret_key}}')
     >>> df = vaex.open('s3://mybucket/path/to/file.hdf5?profile=myproject')
 
@@ -154,7 +160,7 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
 
     Examples:
 
-    >>> df = vaex.open('gs://vaex-data/airlines/us_airline_data_1988_2019.hdf5', fs_options={'token': None})
+    >>> df = vaex.open('gs://vaex-data/airlines/us_airline_data_1988_2019.hdf5', fs_options={{'token': None}})
     >>> df = vaex.open('gs://vaex-data/airlines/us_airline_data_1988_2019.hdf5?token=anon')
     >>> df = vaex.open('gs://vaex-data/testing/xys.hdf5?token=anon&cache=False')
     """
@@ -212,12 +218,13 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
             # # naked_path, _ = vaex.file.split_options(path, fs_options)
             _, ext, _ = vaex.file.split_ext(path)
             if ext == '.csv':  # special case for csv
-                return vaex.from_csv(path, fs_options=fs_options, fs=fs, convert=convert, **kwargs)
+                return vaex.from_csv(path, fs_options=fs_options, fs=fs, convert=convert, progress=progress, **kwargs)
             if convert:
                 path_output = convert if isinstance(convert, str) else filename_hdf5
                 vaex.convert.convert(
                     path_input=path, fs_options_input=fs_options, fs_input=fs,
                     path_output=path_output, fs_options_output=fs_options, fs_output=fs,
+                    progress=progress,
                     *args, **kwargs
                 )
                 ds = vaex.dataset.open(path_output, fs_options=fs_options, fs=fs, **kwargs)
@@ -237,19 +244,19 @@ def open(path, convert=False, shuffle=False, fs_options={}, fs=None, *args, **kw
             else:
                 dfs = []
                 for filename in filenames:
-                    dfs.append(vaex.open(filename, convert=bool(convert), shuffle=shuffle, **kwargs))
+                    dfs.append(vaex.open(filename, fs_options=fs_options, fs=fs, convert=bool(convert), shuffle=shuffle, **kwargs))
                 df = vaex.concat(dfs)
                 if convert:
                     if shuffle:
                         df = df.shuffle()
-                    df.export_hdf5(filename_hdf5)
+                    df.export_hdf5(filename_hdf5, progress=progress)
                     df = vaex.open(filename_hdf5)
 
         if df is None:
             raise IOError('Unknown error opening: {}'.format(path))
         return df
     except:
-        logging.getLogger("vaex").exception("error opening %r" % path)
+        logger.exception("error opening %r" % path)
         raise
 
 
@@ -327,7 +334,7 @@ def from_items(*items):
     return from_dict(dict(items))
 
 
-def from_arrays(**arrays):
+def from_arrays(**arrays) -> vaex.dataframe.DataFrameLocal:
     """Create an in memory DataFrame from numpy arrays.
 
     Example
@@ -499,7 +506,32 @@ def from_json(path_or_buffer, orient=None, precise_float=False, lines=False, cop
                        copy_index=copy_index)
 
 
-def from_csv(filename_or_buffer, copy_index=False, chunk_size=None, convert=False, fs_options={}, fs=None, **kwargs):
+@docsubst
+def from_records(records : List[Dict], array_type="arrow", defaults={}) -> vaex.dataframe.DataFrame:
+    '''Create a dataframe from a list of dict.
+
+    .. warning:: This is for convenience only, for performance pass arrays to :func:`from_arrays` for instance.
+
+    :param str array_type: {array_type}
+    :param dict defaults: default values if a record has a missing entry
+    '''
+    arrays = dict()
+    for i, record in enumerate(records):
+        for name, value in record.items():
+            if name not in arrays:
+                # prepend None's
+                arrays[name] = [defaults.get(name)] * i
+            arrays[name].append(value)
+        for name in arrays:
+            if name not in record:
+                # missing values get replaced
+                arrays[name].append(defaults.get(name))
+    arrays = {k: vaex.array_types.convert(v, array_type) for k, v in arrays.items()}
+    return vaex.from_dict(arrays)
+
+
+@docsubst
+def from_csv(filename_or_buffer, copy_index=False, chunk_size=None, convert=False, fs_options={}, fs=None, progress=None, **kwargs):
     """
     Read a CSV file as a DataFrame, and optionally convert to an hdf5 file.
 
@@ -511,13 +543,14 @@ def from_csv(filename_or_buffer, copy_index=False, chunk_size=None, convert=Fals
         >>> import vaex
         >>> for i, df in enumerate(vaex.from_csv('taxi.csv', chunk_size=100_000)):
         >>>     df = df[df.passenger_count < 6]
-        >>>     df.export_hdf5(f'taxi_{i:02}.hdf5')
+        >>>     df.export_hdf5(f'taxi_{{i:02}}.hdf5')
 
     :param bool or str convert: convert files to an hdf5 file for optimization, can also be a path. The CSV
         file will be read in chunks: either using the provided chunk_size argument, or a default size. Each chunk will
         be saved as a separate hdf5 file, then all of them will be combined into one hdf5 file. So for a big CSV file
         you will need at least double of extra space on the disk. Default chunk_size for converting is 5 million rows,
         which corresponds to around 1Gb memory on an example of NYC Taxi dataset.
+    :param progress: (_Only applies when convert is not False_) {progress}
     :param kwargs: extra keyword arguments, currently passed to Pandas read_csv function, but the implementation might
         change in future versions.
     :returns: DataFrame
@@ -536,6 +569,7 @@ def from_csv(filename_or_buffer, copy_index=False, chunk_size=None, convert=Fals
             path_output=path_output, fs_options_output=fs_options, fs_output=fs,
             chunk_size=chunk_size,
             copy_index=copy_index,
+            progress=progress,
             **kwargs
         )
         return open(path_output, fs_options=fs_options, fs=fs)
@@ -559,13 +593,7 @@ def read_csv(filepath_or_buffer, **kwargs):
     '''Alias to from_csv.'''
     return from_csv(filepath_or_buffer, **kwargs)
 
-aliases = vaex.settings.main.auto_store_dict("aliases")
-
-# py2/p3 compatibility
-try:
-    from urllib.parse import urlparse, parse_qs
-except ImportError:
-    from urlparse import urlparse, parse_qs
+aliases = vaex.settings.aliases
 
 
 def connect(url, **kwargs):
@@ -578,76 +606,46 @@ def connect(url, **kwargs):
     from vaex.server import connect
     return connect(url, **kwargs)
 
-
 def example():
-    """Returns an example DataFrame which comes with vaex for testing/learning purposes.
+    '''Result of an N-body simulation of the accretion of 33 satellite galaxies into a Milky Way dark matter halo.
+
+    Data was greated by Helmi & de Zeeuw 2000.
+    The data contains the position (x, y, z), velocitie (vx, vy, vz), the energy (E),
+    the angular momentum (L, Lz) and iron content (FeH) of the particles.
 
     :rtype: DataFrame
-    """
-    return vaex.datasets.helmi_de_zeeuw_10percent.fetch()
+    '''
+    return vaex.datasets.helmi_simulation_data()
 
 
-def zeldovich(dim=2, N=256, n=-2.5, t=None, scale=1, seed=None):
-    """Creates a zeldovich DataFrame.
-    """
-    import vaex.file
-    return vaex.file.other.Zeldovich(dim=dim, N=N, n=n, t=t, scale=scale)
 
-
-# create named logger, for all loglevels
-logger = logging.getLogger('vaex')
-logger.setLevel(logging.DEBUG)
-
-# create console handler and accept all loglevels
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-
-# create formatter
-formatter = logging.Formatter('%(levelname)s:%(threadName)s:%(name)s:%(message)s')
-
-# add formatter to console handler
-ch.setFormatter(formatter)
-
-# add console handler to logger
-logger.addHandler(ch)
-
+# there are kept for backwards compatibility
+# TODO: remove in vaex v5?
 
 def set_log_level_debug(loggers=["vaex"]):
     """set log level to debug"""
-    for logger in loggers:
-        logging.getLogger(logger).setLevel(logging.DEBUG)
+    vaex.logging.set_log_level_debug(loggers)
 
 
-def set_log_level_info():
+def set_log_level_info(loggers=["vaex"]):
     """set log level to info"""
-    logging.getLogger("vaex").setLevel(logging.INFO)
+    vaex.logging.set_log_level_info(loggers)
 
 
-def set_log_level_warning():
+def set_log_level_warning(loggers=["vaex"]):
     """set log level to warning"""
-    logging.getLogger("vaex").setLevel(logging.WARNING)
+    vaex.logging.set_log_level_warning(loggers)
 
 
-def set_log_level_exception():
-    """set log level to exception"""
-    logging.getLogger("vaex").setLevel(logging.ERROR)
+def set_log_level_exception(loggers=["vaex"]):
+    """set log level to exception/error"""
+    vaex.logging.set_log_level_error(loggers)
 
 
 def set_log_level_off():
     """Disabled logging"""
-    logging.getLogger('vaex').removeHandler(ch)
-    logging.getLogger('vaex').addHandler(logging.NullHandler())
+    vaex.logging.set_log_level_off()
 
-
-DEBUG_MODE = os.environ.get('VAEX_DEBUG', '')
-if DEBUG_MODE:
-    set_log_level_warning()
-    if DEBUG_MODE.startswith('vaex'):
-        set_log_level_debug(DEBUG_MODE.split(","))
-    else:
-        set_log_level_debug()
-else:
-    set_log_level_warning()
 
 import_script = os.path.expanduser("~/.vaex/vaex_import.py")
 if os.path.exists(import_script):
@@ -773,9 +771,26 @@ def concat(dfs, resolver='flexible') -> vaex.dataframe.DataFrame:
     return df.concat(*tail, resolver=resolver)
 
 def vrange(start, stop, step=1, dtype='f8'):
-    """Creates a virtual column which is the equivalent of numpy.arange, but uses 0 memory"""
+    """Creates a virtual column which is the equivalent of numpy.arange, but uses 0 memory
+
+    :param int start: Start of interval. The interval includes this value.
+    :param int stop: End of interval. The interval does not include this value,
+    :param int step: Spacing between values.
+    :dtype: The preferred dtype for the column.
+    """
     from .column import ColumnVirtualRange
     return ColumnVirtualRange(start, stop, step, dtype)
+
+def vconstant(value, length, dtype=None, chunk_size=1024):
+    """Creates a virtual column with constant values, which uses 0 memory.
+
+    :param value: The value with which to fill the column
+    :param length: The length of the column, i.e. the number of rows it should contain.
+    :param dtype: The preferred dtype for the column.
+    :param chunk_size: Could be used to optimize the performance (evaluation) of this column.
+    """
+    from .column import ColumnVirtualConstant
+    return ColumnVirtualConstant(value=value, length=length, dtype=dtype, chunk_size=chunk_size)
 
 def string_column(strings):
     import pyarrow as pa
@@ -786,9 +801,11 @@ def dtype(type):
     '''Creates a Vaex DataType based on a NumPy or Arrow type'''
     return vaex.datatype.DataType(type)
 
-def dtype_of(ar):
+def dtype_of(ar) -> vaex.datatype.DataType:
     '''Creates a Vaex DataType from a NumPy or Arrow array'''
-    if vaex.array_types.is_arrow_array(ar):
+    if isinstance(ar, vaex.dataset.Column):
+        return dtype(ar.dtype)
+    elif vaex.array_types.is_arrow_array(ar):
         return dtype(ar.type)
     elif vaex.array_types.is_numpy_array(ar) or isinstance(ar, vaex.column.supported_column_types):
         return dtype(ar.dtype)
