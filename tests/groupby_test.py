@@ -744,3 +744,31 @@ def test_row_limit_sparse():
     df = vaex.from_arrays(x=x, y=y)
     with pytest.raises(vaex.RowLimitException, match='.* would have >= 11 unique combinations.*'):
         df.groupby(['x', 'y'], assume_sparse=False, row_limit=11)
+
+
+def test_describe_agg():
+    df = vaex.datasets.titanic()
+    res = df.groupby('pclass').describe(['age', df.sex])
+    assert res.shape == (3, 9)
+    assert res.get_column_names() == ['pclass',
+                                      'age_count',
+                                      'age_count_na',
+                                      'age_mean',
+                                      'age_std',
+                                      'age_min',
+                                      'age_max',
+                                      'sex_count',
+                                      'sex_count_na']
+    assert res.age_count_na.tolist() == [39, 16, 208]
+    assert res.age_max.tolist() == [80, 70, 74]
+
+    # make it work without args
+    res = df.groupby().describe(['age', df.sex])
+
+
+def test_groupby_empty(df_factory):
+    df = df_factory(x=[1, 2, 2, 3, 3, 4], s=["aap", "aap", "aap", "noot", "noot", "mies"])
+    dfg = df.groupby(agg={"count": vaex.agg.count(), "first_x": vaex.agg.first("x"), "s": vaex.agg.list("s")})
+    assert dfg["count"].tolist() == [6]
+    assert dfg["first_x"].tolist() == [1]
+    assert dfg["s"].tolist() == [df.s.tolist()]
