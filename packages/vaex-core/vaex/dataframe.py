@@ -3512,9 +3512,8 @@ class DataFrame(object):
             raise ValueError('only scipy.sparse.csr_matrix is supported')
 
     def _save_assign_expression(self, name, expression=None):
-        obj = getattr(self, name, None)
         # it's ok to set it if it does not exist, or we overwrite an older expression
-        if obj is None or isinstance(obj, Expression):
+        if not hasattr(self, name) or isinstance(getattr(self, name), Expression):
             if expression is None:
                 expression = name
             if isinstance(expression, str):
@@ -4393,7 +4392,7 @@ class DataFrame(object):
             # we're gonna copy the mask from our parent
             parent_mask = self._selection_masks[FILTER_SELECTION_NAME].view(self._index_start, self._index_end)
             mask = df._selection_masks[FILTER_SELECTION_NAME]
-            np.copyto(np.asarray(mask), np.asarray(parent_mask))
+            np.copyto(np.asarray(mask)[df._index_start : df._index_end], np.asarray(parent_mask))
             selection = df.get_selection(FILTER_SELECTION_NAME)
             if not mask.is_dirty():
                 df._cached_filtered_length = mask.count()
@@ -5396,6 +5395,10 @@ class DataFrame(object):
             if stop < 0:
                 stop = len(self)+stop
             stop = min(stop, len(self))
+            if start >= stop:  # empty slice
+                df = self.trim()
+                df.set_active_range(start, max(start, stop))
+                return df.trim()
             assert step in [None, 1]
             if self.filtered:
                 self._fill_filter_mask()
@@ -6032,7 +6035,7 @@ class DataFrameLocal(DataFrame):
             dataset_columns = list(dataset_columns)
             dataset_columns.sort()
             dataset = self.dataset.project(*dataset_columns)
-            df = vaex.from_dataset(dataset)
+            df : DataFrame = vaex.from_dataset(dataset)
 
             # and reconstruct the rest (virtual columns and variables)
             other = {k for k in required if k not in self.dataset}

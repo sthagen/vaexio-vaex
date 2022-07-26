@@ -334,3 +334,28 @@ def assert_dataframe_equal(dfo: DataFrameObject, df: vaex.dataframe.DataFrame):
     assert dfo.column_names() == list(df.get_column_names())
     for col in df.get_column_names():
         assert_column_equal(dfo.get_column_by_name(col), df[col])
+
+
+def test_smoke_get_buffers_for_numpy_column_with_duplicate_categorical_values():
+    # See https://github.com/vaexio/vaex/issues/2122
+    df = vaex.from_items(("x", np.array([1, 1])))
+    df = df.categorize("x")
+    interchange_df = df.__dataframe__()
+    interchange_col = interchange_df.get_column_by_name("x")
+    buffers = interchange_col.get_buffers()
+    assert buffers['data'][0]._x.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        np.array([float("nan")]),
+        np.ma.MaskedArray(data=np.array([42]), mask=np.array([1])),
+    ]
+)
+def test_null_count(df_factory, x):
+    df = df_factory(x=x)
+    interchange_df = df.__dataframe__()
+    interchange_col = interchange_df.get_column_by_name("x")
+    assert isinstance(interchange_col.null_count, int)
+    assert interchange_col.null_count == 1

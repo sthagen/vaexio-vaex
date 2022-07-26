@@ -497,7 +497,11 @@ class _VaexColumn:
         """
         Number of null elements. Should always be known.
         """
-        return self._col.countmissing()
+        # Whilst vaex-proper does not treat all NA values as null (i.e. NaNs),
+        # the interchange protocol does, meaning we have to break away from vaex
+        # semantics here and return a count of all NA values.
+        # See https://github.com/vaexio/vaex/issues/2120
+        return self._col.countna()
 
     @property
     def metadata(self) -> Dict[str, Any]:
@@ -595,12 +599,11 @@ class _VaexColumn:
                 dtype = self._dtype_from_vaexdtype(self._col.index_values().dtype)
             else:
                 codes = self._col.values
-                # In case of Vaex categorize - if codes are equal to labels
-                labels = self._col.df.category_labels(self._col)
-                if self._col.values[0] in labels:
-                    for i in self._col.values:
-                        codes[np.where(codes == i)] = np.where(labels == i)
-                buffer = _VaexBuffer(self._col.values)
+                indices = self._col
+                offset = self._col.df.category_offset(self._col)
+                if offset:
+                    indices -= offset
+                buffer = _VaexBuffer(indices.to_numpy())
                 dtype = self._dtype_from_vaexdtype(self._col.dtype)
         elif self.dtype[0] == _k.STRING:
             bitmap_buffer, offsets, string_bytes = self._col.evaluate().buffers()
