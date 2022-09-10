@@ -4481,9 +4481,12 @@ class DataFrame(object):
         :rtype: DataFrame
         '''
         df = self.trim()
-        if df.filtered:
-            df._push_down_filter()
-            df._invalidate_caches()
+        with self._state_lock:
+            # df.filtered gets changed in push_down_filter so use a lock
+            # to make it thread safe
+            if df.filtered:
+                df._push_down_filter()
+                df._invalidate_caches()
         return df
 
     def _push_down_filter(self):
@@ -5370,6 +5373,7 @@ class DataFrame(object):
         """
         if isinstance(item, int):
             names = self.get_column_names()
+            item = item % len(self)
             return [self.evaluate(name, item, item+1, array_type='python')[0] for name in names]
         elif isinstance(item, six.string_types):
             if hasattr(self, item) and isinstance(getattr(self, item), Expression):
