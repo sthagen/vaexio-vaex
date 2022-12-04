@@ -4483,7 +4483,8 @@ class DataFrame(object):
         df = self.trim()
         with self._state_lock:
             if len(df) == 0 and len(self.virtual_columns):
-                raise ValueError("Cannot extract a DataFrame with virtual columns when there are 0 rows. See https://github.com/vaexio/vaex/issues/2232 for more information.\n\tWorkaround suggestion: df = df.extract() if len(df) else df")
+                logger.warn("Cannot extract a DataFrame with virtual columns when there are 0 rows. See https://github.com/vaexio/vaex/issues/2232 for more information.\n\tReturning df")
+                return df
             # df.filtered gets changed in push_down_filter so use a lock
             # to make it thread safe
             if df.filtered:
@@ -4707,6 +4708,9 @@ class DataFrame(object):
         :param str or expression or list of str/expressions by: expression to sort by.
         :param bool or list of bools ascending: ascending (default, True) or descending (False).
         '''
+
+        if len(self) == 0:
+            return self.copy()
         self = self.trim()
         # Ensure "by" is in the proper format
         by = vaex.utils._ensure_list(by)
@@ -4725,6 +4729,7 @@ class DataFrame(object):
         # if we don't cast to int64, we get uint64 scalars, which when adding numbers to will auto case to float (numpy)
         indices = vaex.array_types.to_numpy(indices).astype('int64')
         return self.take(indices)
+
 
     @docsubst
     def diff(self, periods=1, column=None, fill_value=None, trim=False, inplace=False, reverse=False):
