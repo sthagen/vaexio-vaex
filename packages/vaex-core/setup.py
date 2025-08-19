@@ -23,38 +23,37 @@ author_email = "maartenbreddels@gmail.com"
 license = "MIT"
 version = version.__version__
 url = "https://www.github.com/maartenbreddels/vaex"
-# TODO: after python2 supports frops, future and futures can also be dropped
-setup_requires = ["numpy~=1.17"]
+setup_requires = ["numpy~=2.0"] # see vaex-core pyproject.toml
 install_requires_core = [
-    "numpy~=1.17",
     "aplus",
-    "tabulate>=0.8.3",
-    "dask!=2022.4.0,<2024.9",  # fingerprinting in no longer deterministic as of 2024.9.0
-    "future>=0.15.2",
-    "pyyaml",
-    "six",
-    "cloudpickle",
-    "pandas>=1.0,<3",
-    "nest_asyncio>=1.3.3",
-    "pyarrow>=5.0.0",
-    "frozendict!=2.2.0",
     "blake3",
+    "cloudpickle",
+    "dask!=2022.4.0,<2024.9",  # fingerprinting in no longer deterministic as of 2024.9.0
     "filelock",
+    "frozendict!=2.2.0",
+    "future",
+    "nest_asyncio>=1.3.3",
+    "numpy>=1.19.3,<3", # 1.19.3 is the first version with 3.9 wheels
+    "pandas>=1.0,<3",
+    "pyarrow>=5.0.0",
     "pydantic>=1.8.0",
+    "pyyaml",
     "rich",
+    "six",
+    "tabulate>=0.8.3",
 ]
 extras_require_core = {
     "all": [
-        "gcsfs>=0.6.2",
-        "s3fs",
-        "ipyvolume",
+        "aplus",
         "diskcache",
         "fsspec",
+        "gcsfs>=0.6.2",
+        "graphviz",
         "h5py",
         "httpx",
-        "aplus",
+        "ipyvolume",
         "psutil",
-        "graphviz",
+        "s3fs",
     ],
 }
 
@@ -100,7 +99,8 @@ class get_pybind_include(object):
 USE_ABSL = False
 USE_TSL = True
 
-define_macros = []
+define_macros=[('NPY_NO_DEPRECATED_API', 'NPY_1_7_API_VERSION')]
+np_define_macros=[('NPY_NO_DEPRECATED_API', 'NPY_1_7_API_VERSION')]
 if USE_ABSL:
     define_macros += [("VAEX_USE_ABSL", None)]
 if USE_TSL:
@@ -113,7 +113,7 @@ if platform.system().lower() == "windows":
 else:
     # TODO: maybe enable these flags for non-wheel/conda builds? ["-mtune=native", "-march=native"]
     extra_compile_args = [
-        "-std=c++11",
+        "-std=c++17",
         "-O3",
         "-funroll-loops",
         "-Werror=return-type",
@@ -137,6 +137,8 @@ extension_vaexfast = Extension(
     [os.path.relpath(os.path.join(dirname, "src/vaexfast.cpp"))],
     include_dirs=[get_numpy_include()],
     extra_compile_args=extra_compile_args,
+    define_macros=np_define_macros,
+
 )
 extension_strings = Extension(
     "vaex.superstrings",
@@ -165,6 +167,7 @@ extension_strings = Extension(
     ],
     extra_compile_args=extra_compile_args,
     libraries=["pcre", "pcrecpp"],
+    define_macros=np_define_macros,
 )
 extension_superutils = Extension(
     "vaex.superutils",
@@ -271,9 +274,10 @@ setup(
     if not use_skbuild
     else [],
     zip_safe=False,
-    python_requires=">=3.8,<3.13",  # 3.13 needs numpy 2.1 support ref https://github.com/vaexio/vaex/pull/2434
+    # 3.9 is the oldest python version that the new numpy build system supports
+    # ref https://github.com/scipy/oldest-supported-numpy/pull/86
+    python_requires=">=3.9,<3.13",
     classifiers=[
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
